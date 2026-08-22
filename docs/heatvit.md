@@ -4039,6 +4039,81 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/task_checkpoint.ps1 
   含 `regression_summary.txt`、`e2e_summary.json`、`ip_audit.txt`；
   三份交付文档齐备。
 
+## 13. 阶段 6：真实 DeiT-T 权重与 ImageNet 精度验证（P2）
+
+> **状态：计划已裁定，执行中。** 本阶段验证「量化 + 剪枝」的真实精度，
+> 并用真实权重对 RTL 做端到端逐位仿真。历史五阶段（合成权重）的验收
+> 结论与结果记录不受本阶段影响。
+
+### 13.1 资源裁定
+
+| 资源 | 位置 | 裁定 |
+| --- | --- | --- |
+| DeiT-T 官方 checkpoint | `~/.cache/torch/hub/checkpoints/deit_tiny_patch16_224-a1311bcf.pth` | 使用（timm 官方，ImageNet Top-1 72.2%） |
+| ImageNet-1k 数据集 | `D:\SEU_Liubo\prj\HeatViT\data\imagenet`（train 1,281,167 / val 50,000） | 复用（校准、Selector 训练、最终评测） |
+| HeatViT Python 复现 | `D:\SEU_Liubo\prj\HeatViT`（DeiT-S 版：MHTS Selector、Gumbel-Softmax 训练、dyadic 量化 PTQ 框架，基线 80.418%） | 代码借鉴；**权重不复用**（DeiT-S 384/6 头/带 dist token，与本工程 DeiT-T 192/3 头不匹配） |
+| 运行环境 | 本工程 `.venv-torch`（torch cu128 + timm；与黄金模型 `.venv` 隔离） | 新建；GPU RTX 5060 8GB |
+
+### 13.2 交付阶段
+
+- **P2-A 环境与数据**：`.venv-torch` 就绪；官方 checkpoint 复现 72.2% 基线；
+  数据路径验证（train/val 各 1000 类）。
+- **P2-B 定点量化仿真器（torch，快速迭代）**：镜像本工程数值契约的
+  DeiT-T 伪量化模型——int8 每张量 **2 的幂静态尺度**（scale_exp ∈
+  [-32,31]）、Q8.16 GELU/Softmax 近似、Q0.16 Selector、LayerNorm 两遍
+  定点序列；权重对称量化 + 激活尺度校准（校准子集，最终以整数黄金模型
+  复核）。产出每张量尺度表与逐单元消融。
+- **P2-C Selector 训练**：冻结量化主干，按第一部分 §12 锁定结构训练三个
+  Selector（block 4/7/10），Gumbel-Softmax + 保留率正则，目标 Token 数
+  197→88→45→32（论文 DeiT-T 口径）；训练语义对齐 RTL（keep-score ≥ 0.5
+  阈值、CLS 旁路、单 Package Token），不采用复现项目的 top-k 推理规则。
+- **P2-D RTL 导出与逐位验证**：量化张量 → 权重区 `.mem` + 每张量尺度表 →
+  198 条描述符 + 黄金检查点 → 真实图像 XSim 逐位通过（无回压 + 一轮
+  回压）。
+- **P2-E 汇总**：float / 量化全模型 / 量化剪枝 Top-1 对比表（对照论文
+  72.2% 基线），更新本文第五部分附录与 README，提交推送。
+
+### 13.3 集成面裁定（真实权重需要每张量尺度）
+
+现状：黄金模型与描述符生成器使用**统一尺度**（`config/heatvit_t.json`
+`synthetic_scale_exp`：权重 -7、gamma -6、激活 -7 等；`tools/
+generate_descriptors.py` 的 `SCALES` 字典）。真实权重各张量幅度差异大，
+必须每张量 `scale_exp`。RTL 描述符本就携带每张量 src/dst 尺度字段，
+**无需改 RTL**。
+
+改动面（P2-D 执行）：
+
+1. `verification/heatvit_ref/transformer.py`：`PatchParams`/`BlockParams`/
+   `MhsaParams`/`FfnParams` 增加每张量尺度字段（wqkv/wproj/w1/w2、
+   LN gamma/beta、各 op 激活尺度）；`model.py` 的 `_layer_norm_rows` 与
+   `selector.py` 参数同步；`nonlinear.py` 的 `layernorm` 已按参数接收尺度，
+   仅改调用点。
+2. `tools/generate_descriptors.py`：`SCALES` 字典改为加载每张量尺度表
+   （新 JSON，P2-B 产出），各序列构建器改查表；内存布局不变（形状固定）。
+3. 新增 `tools/p2/export_real_weights.py`：量化 DeiT-T 张量 → 满足第四部分
+   §2 权重表的 `HeatViTParams`；新增 `tools/p2/preprocess_image.py`：
+   真实图像 resize(256)→center crop(224)→normalize→int8 量化（输入尺度
+   静态）。`tools/generate_e2e_vectors.py` 的 `serialize_weights` 已通用，
+   不改。
+4. 验收：真实权重向量跑 `-Suite all` 全绿（描述符校验、manifest hash、
+   18 检查点 + 1000 Logit 逐位一致）；Selector 剪枝分布满足「每 Selector
+   至少保留 1、剪除 2」，否则按 `weights.py` 的 `calibrate_selector`
+   校准 keep/drop 偏置。
+
+### 13.4 精度预期（诚实口径）
+
+float DeiT-T 72.2%（官方）；本工程「每张量 2 的幂 int8 + 近似非线性」的
+量化全模型预计 69–71%；剪枝后目标贴近量化全模型（论文剪枝损失约
+0.3%）。最终交付完整消融表，**不承诺复现论文 71.9%**。
+
+### 13.5 与既有约束的关系
+
+- 黄金模型「量化后纯整数」纪律不变；torch 只用于量化前转换、Selector
+  训练与快速仿真，不进入黄金模型。
+- 非目标「不实现 QAT」暂维持：P2-B 为纯 PTQ。
+- 本文第四部分权重表与第五部分结果对应合成权重；真实权重结果以新增
+  附录记录，不覆盖历史结果。
+
 # 第三部分：仿真与验证指南
 
 本节说明如何从零复现全部仿真验证（环境变量、向量生成、回归命令、日志
