@@ -1,0 +1,9 @@
+# Normalize line endings; keep sources LF on Windows
+* text=auto
+*.sv    text eol=lf
+*.v     text eol=lf
+*.py    text eol=lf
+*.md    text eol=lf
+*.mem   text eol=lf
+*.json  text eol=lf
+*.ps1   text eol=lf

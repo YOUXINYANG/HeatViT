@@ -1,0 +1,179 @@
+{
+  "suite": "unit",
+  "case": "selector",
+  "seed": 20260815,
+  "generator": "tools/generate_selector_vectors.py",
+  "warning_bits": {
+    "head_den_zero": 1,
+    "package_den_zero": 2
+  },
+  "cases": {
+    "keep_all": {
+      "tokens": 8,
+      "candidates": 7,
+      "input_package_present": 0,
+      "next_token_count": 8,
+      "next_package_present": 0,
+      "warning_flags": 0
+    },
+    "prune_all": {
+      "tokens": 8,
+      "candidates": 7,
+      "input_package_present": 0,
+      "next_token_count": 2,
+      "next_package_present": 1,
+      "warning_flags": 0
+    },
+    "mixed": {
+      "tokens": 12,
+      "candidates": 11,
+      "input_package_present": 0,
+      "next_token_count": 8,
+      "next_package_present": 1,
+      "warning_flags": 0
+    },
+    "threshold_eq": {
+      "tokens": 6,
+      "candidates": 5,
+      "input_package_present": 0,
+      "next_token_count": 5,
+      "next_package_present": 1,
+      "warning_flags": 0
+    },
+    "incoming_package": {
+      "tokens": 8,
+      "candidates": 7,
+      "input_package_present": 1,
+      "next_token_count": 4,
+      "next_package_present": 1,
+      "warning_flags": 0
+    },
+    "zero_den": {
+      "tokens": 6,
+      "candidates": 5,
+      "input_package_present": 0,
+      "next_token_count": 2,
+      "next_package_present": 1,
+      "warning_flags": 2,
+      "fuse_candidates": 4,
+      "fuse_warn_bits": [
+        0,
+        1,
+        0,
+        0
+      ]
+    }
+  },
+  "files": [
+    {
+      "path": "incoming_package\\output.mem",
+      "bytes": 1608,
+      "sha256": "36cc54c6cf31dd1ec5ba3fde0b451848fdbf45ea5ed419a71c1b494353992526"
+    },
+    {
+      "path": "incoming_package\\scores.mem",
+      "bytes": 54,
+      "sha256": "4b00f364279a9f76c2305c60858226068216ece71f4c1a08ef3c361a38e64a30"
+    },
+    {
+      "path": "incoming_package\\tokens.mem",
+      "bytes": 3240,
+      "sha256": "fa695995afb8d7749f79df56a180afda8e5171ecbe432fee1b92657f2ac71a87"
+    },
+    {
+      "path": "keep_all\\output.mem",
+      "bytes": 3240,
+      "sha256": "fa695995afb8d7749f79df56a180afda8e5171ecbe432fee1b92657f2ac71a87"
+    },
+    {
+      "path": "keep_all\\scores.mem",
+      "bytes": 56,
+      "sha256": "44178e80d432177cd7a232f3a5e068f9c67c74922869b12a408a1919dfe9ce04"
+    },
+    {
+      "path": "keep_all\\tokens.mem",
+      "bytes": 3240,
+      "sha256": "fa695995afb8d7749f79df56a180afda8e5171ecbe432fee1b92657f2ac71a87"
+    },
+    {
+      "path": "mixed\\output.mem",
+      "bytes": 3240,
+      "sha256": "bb3b1eab92e32f217afc1a6b6c925c17ba942b14221d24cb23c1a94c8c24fc25"
+    },
+    {
+      "path": "mixed\\scores.mem",
+      "bytes": 77,
+      "sha256": "50cb26d9c1b258ce194ed5edfbcc116e433e76827998d91671f3bab6f9c6e0d6"
+    },
+    {
+      "path": "mixed\\tokens.mem",
+      "bytes": 4872,
+      "sha256": "f4e273a4b6995df05d390463f295b37bbb674f4a87e8d5e05e7d21b5862b6edd"
+    },
+    {
+      "path": "prune_all\\output.mem",
+      "bytes": 816,
+      "sha256": "6a3fa2654e904eb175d91eddde10865073b820e1857f11e7ff54807c93d88e6c"
+    },
+    {
+      "path": "prune_all\\scores.mem",
+      "bytes": 53,
+      "sha256": "67961950858ade4b944650040c27291031e234d98f846bcc984bad40958ca152"
+    },
+    {
+      "path": "prune_all\\tokens.mem",
+      "bytes": 3240,
+      "sha256": "fa695995afb8d7749f79df56a180afda8e5171ecbe432fee1b92657f2ac71a87"
+    },
+    {
+      "path": "threshold_eq\\output.mem",
+      "bytes": 2040,
+      "sha256": "775f4334eaefade4bd0e2db7516b249a936787190c950c70a0513b2b23979aac"
+    },
+    {
+      "path": "threshold_eq\\scores.mem",
+      "bytes": 43,
+      "sha256": "1be3007378121d56e7531229049e10012b38b4138cbcdd546941c55af439ef93"
+    },
+    {
+      "path": "threshold_eq\\tokens.mem",
+      "bytes": 2448,
+      "sha256": "ba4b1d2decf74a464ff69837fb6546dc288d91aeddc7bae8c25184a0260ef526"
+    },
+    {
+      "path": "zero_den\\fuse_expected.mem",
+      "bytes": 25,
+      "sha256": "b071127b66015db155aa0e8ec377e291ae6b67cec84f2e49d2d52b56485eada0"
+    },
+    {
+      "path": "zero_den\\fuse_scores.mem",
+      "bytes": 71,
+      "sha256": "20760286b851eccd5b5a4185c5d83ff017bfe93dee7c82c025645eaaa4ed4e72"
+    },
+    {
+      "path": "zero_den\\fuse_warn.mem",
+      "bytes": 17,
+      "sha256": "6f31294709a11146ddec7d12e4d4627a85d5cc2102ae3a24bb6808d5e5d20211"
+    },
+    {
+      "path": "zero_den\\fuse_weights.mem",
+      "bytes": 52,
+      "sha256": "9320d7bc8ed9bc2972a238e668d8f9f2a4010b2ea3560246f5faaab349142d8f"
+    },
+    {
+      "path": "zero_den\\output.mem",
+      "bytes": 816,
+      "sha256": "b5840c578dfc6478c257c96d0309f2fb20ab84b436b22ac56ec7b022352de30c"
+    },
+    {
+      "path": "zero_den\\scores.mem",
+      "bytes": 21,
+      "sha256": "4361b02c1a33c70ec9a3a269cb553d3cc17ba74f259543ef29a1742714e9aab7"
+    },
+    {
+      "path": "zero_den\\tokens.mem",
+      "bytes": 2448,
+      "sha256": "ba4b1d2decf74a464ff69837fb6546dc288d91aeddc7bae8c25184a0260ef526"
+    }
+  ]
+}

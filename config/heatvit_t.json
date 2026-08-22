@@ -1,0 +1,29 @@
+{
+  "seed": 20260815,
+  "image": [224, 224, 3],
+  "patch": 16,
+  "tokens": 197,
+  "embed_dim": 192,
+  "heads": 3,
+  "head_dim": 64,
+  "blocks": 12,
+  "ffn_dim": 768,
+  "classes": 1000,
+  "selector_before_blocks": [4, 7, 10],
+  "gemm_tile": {"heads": 3, "input": 8, "output": 8},
+  "gelu_q16": {"a": -18927, "b": -115933, "delta": 32768, "inv_sqrt2": 46341},
+  "exp_q16": {"ln2": 45426, "quad": 23495, "offset": 88670, "constant": 22544},
+  "softmax_delta_q16": {"attention": 32768, "selector": 65536},
+  "layernorm_epsilon_q32": 4295,
+  "synthetic_scale_exp": {
+    "input": -7,
+    "activation": -7,
+    "weight": -7,
+    "cls_position_beta": -7,
+    "gamma": -6,
+    "q8_16": -16,
+    "attention_uq0_8": -8,
+    "selector_q0_16": -16,
+    "logit": -14
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "suite": "softmax",
+  "seed": 20260815,
+  "generator": "tools/generate_unit_vectors.py",
+  "files": [
+    {
+      "name": "softmax.mem",
+      "width_bits": 57,
+      "records": 25552,
+      "header_words": 1,
+      "sha256": "e44471f071ae0c83ce8ae9d9472691b1facdc657ffae51fbb49c411d5d39c10f"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "suite": "divsqrt",
+  "seed": 20260815,
+  "generator": "tools/generate_unit_vectors.py",
+  "files": [
+    {
+      "name": "udiv.mem",
+      "width_bits": 256,
+      "records": 1031,
+      "header_words": 1,
+      "sha256": "4ff2cec507fa935b23dfb48a3570df35b21ab7ee9b27418b8d450c77cf290a52"
+    },
+    {
+      "name": "isqrt.mem",
+      "width_bits": 128,
+      "records": 1036,
+      "header_words": 1,
+      "sha256": "272620a8b0da9ba2a020d82b6b4e1e447007c6ad34769c9aad25f377b1d5e828"
+    }
+  ]
+}

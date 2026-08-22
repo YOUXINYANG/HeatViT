@@ -1,0 +1,13 @@
+{
+  "suite": "fixed",
+  "seed": 20260815,
+  "generator": "tools/generate_unit_vectors.py",
+  "files": [
+    {
+      "name": "requant.mem",
+      "width_bits": 68,
+      "records": 137,
+      "sha256": "42d62f5c81f88897ec48c90c3f255f89487db38ff46a55936c69708387f507d0"
+    }
+  ]
+}

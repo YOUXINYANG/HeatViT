@@ -1,0 +1,14 @@
+{
+  "suite": "nonlinear",
+  "seed": 20260815,
+  "generator": "tools/generate_unit_vectors.py",
+  "files": [
+    {
+      "name": "nonlinear.mem",
+      "width_bits": 65,
+      "records": 1061,
+      "header_words": 1,
+      "sha256": "315ee9a33153e933899ef4ce5c38761835cc0278fee6ad956add5ae6828acb44"
+    }
+  ]
+}

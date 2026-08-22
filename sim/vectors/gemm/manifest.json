@@ -1,0 +1,409 @@
+{
+  "suite": "gemm",
+  "seed": 20260815,
+  "generator": "tools/generate_gemm_vectors.py",
+  "files": [
+    {
+      "name": "mac_bank.mem",
+      "width_bits": 64,
+      "records": 1400,
+      "header_words": 1,
+      "cases": 40,
+      "sha256": "9774831f82c92e332d25d3da47b9b85e874fba1beccbb7c0189034edca65c97f"
+    },
+    {
+      "name": "mini_a.mem",
+      "width_bits": 64,
+      "records": 1,
+      "sha256": "61f96ac99dcae5191297b1e3721837f0a4d806b8e546e29347074456e593efe9",
+      "tensor": "A",
+      "bytes": 8
+    },
+    {
+      "name": "mini_w.mem",
+      "width_bits": 64,
+      "records": 1,
+      "sha256": "f2b37a86e0f241ea77546da4d91553bceaec4b682e480d90efc8032f6b0a1dbe",
+      "tensor": "B+bias",
+      "bytes": 8
+    },
+    {
+      "name": "mini_dst_init.mem",
+      "width_bits": 64,
+      "records": 1,
+      "sha256": "e7299ab2a6fdc20a71c07d8bd2b90304953e66e092c4b7517d8ace2731e700ec",
+      "tensor": "dst_init"
+    },
+    {
+      "name": "mini_expected.mem",
+      "width_bits": 64,
+      "records": 1,
+      "sha256": "5371382656af93703a7e93a4b8c6a5cd803d037d9ecfdbe7aeced7c448cdad19",
+      "tensor": "dst_expected"
+    },
+    {
+      "name": "ordinary_a.mem",
+      "width_bits": 64,
+      "records": 5,
+      "sha256": "592d2e4b349efedad29a64134082fb19e7c677582b7616117a1222409648899b",
+      "tensor": "A",
+      "bytes": 40
+    },
+    {
+      "name": "ordinary_w.mem",
+      "width_bits": 64,
+      "records": 6,
+      "sha256": "796202b3b1c53f229635213ef67736a7366d85d881e1c6d7d2af804201835e68",
+      "tensor": "B+bias",
+      "bytes": 48
+    },
+    {
+      "name": "ordinary_dst_init.mem",
+      "width_bits": 64,
+      "records": 8,
+      "sha256": "7fa4c60c82bb0bf7b80d3c2c0c23f9f353d36a9260c207e214fcd59e4525132a",
+      "tensor": "dst_init"
+    },
+    {
+      "name": "ordinary_expected.mem",
+      "width_bits": 64,
+      "records": 8,
+      "sha256": "859ffd57427716031f46f92120ddfdfbe7a5c4a59ead1656c80a0d3b340eac61",
+      "tensor": "dst_expected"
+    },
+    {
+      "name": "full_a.mem",
+      "width_bits": 64,
+      "records": 8,
+      "sha256": "7e58fb8d12b50683761f291d955d6bf774ef0cee93504f65507646caea04836d",
+      "tensor": "A",
+      "bytes": 64
+    },
+    {
+      "name": "full_w.mem",
+      "width_bits": 64,
+      "records": 24,
+      "sha256": "b81204b4003e0b10a4abcf2821774db1b97f45904423c3a9d3b2c461931ab358",
+      "tensor": "B+bias",
+      "bytes": 192
+    },
+    {
+      "name": "full_dst_init.mem",
+      "width_bits": 64,
+      "records": 24,
+      "sha256": "d67462df38aecc106d3c69192ca954f4fe5c2370859833936a490ad99fa1e237",
+      "tensor": "dst_init"
+    },
+    {
+      "name": "full_expected.mem",
+      "width_bits": 64,
+      "records": 24,
+      "sha256": "172aaf7fb4f283d3b51a8cc5e2f985d6f7c503e9a5ed58d511a3d1601be051a4",
+      "tensor": "dst_expected"
+    },
+    {
+      "name": "tail_a.mem",
+      "width_bits": 64,
+      "records": 20,
+      "sha256": "3757b842d4ae946e30fa7b458e5612599cc601c926675454e34b99aec42befb0",
+      "tensor": "A",
+      "bytes": 160
+    },
+    {
+      "name": "tail_w.mem",
+      "width_bits": 64,
+      "records": 67,
+      "sha256": "9cd74ff056e1ce834cf9a6d8d62c1382fb1cb3edd4fa18301dd5cb7fe3c97fa0",
+      "tensor": "B+bias",
+      "bytes": 536
+    },
+    {
+      "name": "tail_dst_init.mem",
+      "width_bits": 64,
+      "records": 113,
+      "sha256": "e0e83691cb173e78e3e663ba0812718f05950c90aea0a7142a3d44e0082723a4",
+      "tensor": "dst_init"
+    },
+    {
+      "name": "tail_expected.mem",
+      "width_bits": 64,
+      "records": 113,
+      "sha256": "0853ab8bf8b30133d23ce17f917187fc02f5b9a7a95b5f04e48900cc0ae421d1",
+      "tensor": "dst_expected"
+    },
+    {
+      "name": "large_a.mem",
+      "width_bits": 64,
+      "records": 4728,
+      "sha256": "b5aa5149f11c3bd2322256d05eb92ab25c3151177768a66463646fe32d376da0",
+      "tensor": "A",
+      "bytes": 37824
+    },
+    {
+      "name": "large_w.mem",
+      "width_bits": 64,
+      "records": 4608,
+      "sha256": "4d097d830069df1877b527f234c0aeba246990994f92f4fe9829ff66b7432772",
+      "tensor": "B+bias",
+      "bytes": 36864
+    },
+    {
+      "name": "large_dst_init.mem",
+      "width_bits": 64,
+      "records": 4728,
+      "sha256": "e33fe2ff62db7f35cec804dfcf7b50c6b14366fc5bba8483c0dc8867800b18f4",
+      "tensor": "dst_init"
+    },
+    {
+      "name": "large_expected.mem",
+      "width_bits": 64,
+      "records": 4728,
+      "sha256": "e3e478d9e4be9f55307fc8ff5c512be1590e3ee11bcf39f176464d1aeb81b8ea",
+      "tensor": "dst_expected"
+    },
+    {
+      "name": "head_a.mem",
+      "width_bits": 64,
+      "records": 24,
+      "sha256": "139d6f48ad2f4e80cd51fb175cc38ae0056f57ea3199a4f909be947b689a59d8",
+      "tensor": "A",
+      "bytes": 192
+    },
+    {
+      "name": "head_w.mem",
+      "width_bits": 64,
+      "records": 192,
+      "sha256": "e3c563787903258972953a1bdd3727818394c14d832b63e26ac5c6b0502c1362",
+      "tensor": "B+bias",
+      "bytes": 1536
+    },
+    {
+      "name": "head_dst_init.mem",
+      "width_bits": 64,
+      "records": 192,
+      "sha256": "6b34067617832c97ea02cfb85cc510fe0798bf38dd11bf43261eede8202b6b79",
+      "tensor": "dst_init"
+    },
+    {
+      "name": "head_expected.mem",
+      "width_bits": 64,
+      "records": 192,
+      "sha256": "e574bf4224338c39eacd022a80dbbaf3866e98e509bc0044a2268f5396e7f523",
+      "tensor": "dst_expected"
+    },
+    {
+      "name": "transpose_a.mem",
+      "width_bits": 64,
+      "records": 64,
+      "sha256": "6308f6c25dda15f5fde3835506962a05e6cc8122a26e5c14921a24bc5408e66a",
+      "tensor": "A",
+      "bytes": 512
+    },
+    {
+      "name": "transpose_w.mem",
+      "width_bits": 64,
+      "records": 64,
+      "sha256": "caaaede16e7a87c43a6f5ee46d447916e4102edd97c2a453ee1a9fd8e898a0b6",
+      "tensor": "B+bias",
+      "bytes": 512
+    },
+    {
+      "name": "transpose_dst_init.mem",
+      "width_bits": 64,
+      "records": 8,
+      "sha256": "7fa4c60c82bb0bf7b80d3c2c0c23f9f353d36a9260c207e214fcd59e4525132a",
+      "tensor": "dst_init"
+    },
+    {
+      "name": "transpose_expected.mem",
+      "width_bits": 64,
+      "records": 8,
+      "sha256": "e83400dc841884e359b7567fb83ddd62f03adf3e92c52014332f3288cbd3f569",
+      "tensor": "dst_expected"
+    },
+    {
+      "name": "unsigned_a.mem",
+      "width_bits": 64,
+      "records": 9,
+      "sha256": "30dcccc5b2cc7db84ca489ba1af7643c3a37954d1fb1ffb3251b0e9f0f1ecaf2",
+      "tensor": "A",
+      "bytes": 72
+    },
+    {
+      "name": "unsigned_w.mem",
+      "width_bits": 64,
+      "records": 7,
+      "sha256": "89909b98b303977e3303b17f5db8234d5b23dab3a22ca080e92b2a7fd074dd7e",
+      "tensor": "B+bias",
+      "bytes": 56
+    },
+    {
+      "name": "unsigned_dst_init.mem",
+      "width_bits": 64,
+      "records": 72,
+      "sha256": "364edbd6c403baf6590bc2dbe104f18cdc0ecd11528844fbf13158bebdda1380",
+      "tensor": "dst_init"
+    },
+    {
+      "name": "unsigned_expected.mem",
+      "width_bits": 64,
+      "records": 72,
+      "sha256": "0b499c0333f224d4f05b09bfaf511a49ca67d65d442c3a4fc5e8a9b89b38b75c",
+      "tensor": "dst_expected"
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "mini",
+      "m": 1,
+      "n": 1,
+      "k": 1,
+      "heads": 0,
+      "n_per_head": 0,
+      "flags": 34816,
+      "transpose": false,
+      "unsigned": false,
+      "output_bits": 8,
+      "bias": false,
+      "sha256": {
+        "mini_a.mem": "61f96ac99dcae5191297b1e3721837f0a4d806b8e546e29347074456e593efe9",
+        "mini_w.mem": "f2b37a86e0f241ea77546da4d91553bceaec4b682e480d90efc8032f6b0a1dbe",
+        "mini_dst_init.mem": "e7299ab2a6fdc20a71c07d8bd2b90304953e66e092c4b7517d8ace2731e700ec",
+        "mini_expected.mem": "5371382656af93703a7e93a4b8c6a5cd803d037d9ecfdbe7aeced7c448cdad19"
+      }
+    },
+    {
+      "name": "ordinary",
+      "m": 7,
+      "n": 9,
+      "k": 5,
+      "heads": 0,
+      "n_per_head": 0,
+      "flags": 34816,
+      "transpose": false,
+      "unsigned": false,
+      "output_bits": 8,
+      "bias": false,
+      "sha256": {
+        "ordinary_a.mem": "592d2e4b349efedad29a64134082fb19e7c677582b7616117a1222409648899b",
+        "ordinary_w.mem": "796202b3b1c53f229635213ef67736a7366d85d881e1c6d7d2af804201835e68",
+        "ordinary_dst_init.mem": "7fa4c60c82bb0bf7b80d3c2c0c23f9f353d36a9260c207e214fcd59e4525132a",
+        "ordinary_expected.mem": "859ffd57427716031f46f92120ddfdfbe7a5c4a59ead1656c80a0d3b340eac61"
+      }
+    },
+    {
+      "name": "full",
+      "m": 8,
+      "n": 24,
+      "k": 8,
+      "heads": 0,
+      "n_per_head": 0,
+      "flags": 34816,
+      "transpose": false,
+      "unsigned": false,
+      "output_bits": 8,
+      "bias": false,
+      "sha256": {
+        "full_a.mem": "7e58fb8d12b50683761f291d955d6bf774ef0cee93504f65507646caea04836d",
+        "full_w.mem": "b81204b4003e0b10a4abcf2821774db1b97f45904423c3a9d3b2c461931ab358",
+        "full_dst_init.mem": "d67462df38aecc106d3c69192ca954f4fe5c2370859833936a490ad99fa1e237",
+        "full_expected.mem": "172aaf7fb4f283d3b51a8cc5e2f985d6f7c503e9a5ed58d511a3d1601be051a4"
+      }
+    },
+    {
+      "name": "tail",
+      "m": 9,
+      "n": 25,
+      "k": 17,
+      "heads": 0,
+      "n_per_head": 0,
+      "flags": 34946,
+      "transpose": false,
+      "unsigned": false,
+      "output_bits": 32,
+      "bias": true,
+      "sha256": {
+        "tail_a.mem": "3757b842d4ae946e30fa7b458e5612599cc601c926675454e34b99aec42befb0",
+        "tail_w.mem": "9cd74ff056e1ce834cf9a6d8d62c1382fb1cb3edd4fa18301dd5cb7fe3c97fa0",
+        "tail_dst_init.mem": "e0e83691cb173e78e3e663ba0812718f05950c90aea0a7142a3d44e0082723a4",
+        "tail_expected.mem": "0853ab8bf8b30133d23ce17f917187fc02f5b9a7a95b5f04e48900cc0ae421d1"
+      }
+    },
+    {
+      "name": "large",
+      "m": 197,
+      "n": 192,
+      "k": 192,
+      "heads": 0,
+      "n_per_head": 0,
+      "flags": 34816,
+      "transpose": false,
+      "unsigned": false,
+      "output_bits": 8,
+      "bias": false,
+      "sha256": {
+        "large_a.mem": "b5aa5149f11c3bd2322256d05eb92ab25c3151177768a66463646fe32d376da0",
+        "large_w.mem": "4d097d830069df1877b527f234c0aeba246990994f92f4fe9829ff66b7432772",
+        "large_dst_init.mem": "e33fe2ff62db7f35cec804dfcf7b50c6b14366fc5bba8483c0dc8867800b18f4",
+        "large_expected.mem": "e3e478d9e4be9f55307fc8ff5c512be1590e3ee11bcf39f176464d1aeb81b8ea"
+      }
+    },
+    {
+      "name": "head",
+      "m": 8,
+      "n": 64,
+      "k": 8,
+      "heads": 3,
+      "n_per_head": 64,
+      "flags": 34848,
+      "transpose": false,
+      "unsigned": false,
+      "output_bits": 8,
+      "bias": false,
+      "sha256": {
+        "head_a.mem": "139d6f48ad2f4e80cd51fb175cc38ae0056f57ea3199a4f909be947b689a59d8",
+        "head_w.mem": "e3c563787903258972953a1bdd3727818394c14d832b63e26ac5c6b0502c1362",
+        "head_dst_init.mem": "6b34067617832c97ea02cfb85cc510fe0798bf38dd11bf43261eede8202b6b79",
+        "head_expected.mem": "e574bf4224338c39eacd022a80dbbaf3866e98e509bc0044a2268f5396e7f523"
+      }
+    },
+    {
+      "name": "transpose",
+      "m": 8,
+      "n": 8,
+      "k": 64,
+      "heads": 0,
+      "n_per_head": 0,
+      "flags": 34817,
+      "transpose": true,
+      "unsigned": false,
+      "output_bits": 8,
+      "bias": false,
+      "sha256": {
+        "transpose_a.mem": "6308f6c25dda15f5fde3835506962a05e6cc8122a26e5c14921a24bc5408e66a",
+        "transpose_w.mem": "caaaede16e7a87c43a6f5ee46d447916e4102edd97c2a453ee1a9fd8e898a0b6",
+        "transpose_dst_init.mem": "7fa4c60c82bb0bf7b80d3c2c0c23f9f353d36a9260c207e214fcd59e4525132a",
+        "transpose_expected.mem": "e83400dc841884e359b7567fb83ddd62f03adf3e92c52014332f3288cbd3f569"
+      }
+    },
+    {
+      "name": "unsigned",
+      "m": 8,
+      "n": 6,
+      "k": 3,
+      "heads": 3,
+      "n_per_head": 6,
+      "flags": 297120,
+      "transpose": false,
+      "unsigned": true,
+      "output_bits": 32,
+      "bias": false,
+      "sha256": {
+        "unsigned_a.mem": "30dcccc5b2cc7db84ca489ba1af7643c3a37954d1fb1ffb3251b0e9f0f1ecaf2",
+        "unsigned_w.mem": "89909b98b303977e3303b17f5db8234d5b23dab3a22ca080e92b2a7fd074dd7e",
+        "unsigned_dst_init.mem": "364edbd6c403baf6590bc2dbe104f18cdc0ecd11528844fbf13158bebdda1380",
+        "unsigned_expected.mem": "0b499c0333f224d4f05b09bfaf511a49ca67d65d442c3a4fc5e8a9b89b38b75c"
+      }
+    }
+  ]
+}

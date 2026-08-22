@@ -1,0 +1,15 @@
+{
+  "suite": "layernorm",
+  "seed": 20260815,
+  "generator": "tools/generate_unit_vectors.py",
+  "files": [
+    {
+      "name": "layernorm.mem",
+      "width_bits": 32,
+      "records": 71,
+      "header_words": 1,
+      "channels": 192,
+      "sha256": "8eedbe4df1284d1eba1d698e24a79496b2a5eb1b239391c654094a330469e2a5"
+    }
+  ]
+}
