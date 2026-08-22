@@ -8,7 +8,7 @@ summing, mirroring the RTL residual unit.
 
 from dataclasses import dataclass
 
-from .fixed import requant
+from .fixed import requant, round_shift_away, sat_signed
 from .gemm import gemm_numpy, gemm_writeback
 from .layout import head_concat, patchify, qkv_unpack
 from .nonlinear import gelu, layernorm, softmax_attention
@@ -238,14 +238,16 @@ def mhsa(x, params):
         rows = []
         for r in range(n):
             # q16 = Q*K^T / sqrt(64) in Q8.16. ``score`` holds Q*K^T at
-            # score_scale_exp = 2*qkv_out - 3; the 1/sqrt(64) = 1/8 is one
-            # extra 3-bit right shift on top of the scale-bookkeeping
-            # shift, so the effective dst exponent is score_scale + 4.
-            # (RTL: the ATTN_SOFTMAX descriptor carries s0 = score-3 and
-            # the vector engine requants to Q8.16 generically.)
+            # score_scale_exp = 2*qkv_out - 3; the /8 folds 3 more exponent
+            # bits into the Q16 conversion, so the shift is
+            # score_scale + 13 (right for the synthetic -17, left for
+            # per-tensor scales above -13). The RTL mirrors this through
+            # ATTN_SOFTMAX s0 = score_scale - 3.
             q16 = [
-                requant(score[h][r][c], params.score_scale_exp,
-                        params.score_scale_exp + 4, 24)
+                sat_signed(
+                    round_shift_away(score[h][r][c],
+                                     -(params.score_scale_exp + 13)),
+                    24)
                 for c in range(n)
             ]
             rows.append(softmax_attention(q16))

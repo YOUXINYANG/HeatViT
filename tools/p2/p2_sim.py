@@ -328,14 +328,14 @@ def mhsa(x: torch.Tensor, p: BlockP, s: ScaleTable, n: int,
         kh = k[:, h * HEAD_DIM:(h + 1) * HEAD_DIM]
         vh = v[:, h * HEAD_DIM:(h + 1) * HEAD_DIM]
         acc = qh.to(torch.float64) @ kh.to(torch.float64).T
-        # Two golden steps: int32 writeback at score_exp (2*act - 3, the
-        # /sqrt(64) three-bit shift), then per-element requant to Q8.16
-        # with one extra 3-bit shift for the 1/8 (effective dst exp
-        # score_exp + 4; matches the RTL ATTN_SOFTMAX s0 = score_exp - 3).
+        # Two golden steps: int32 writeback at score_exp (2*act - 3), then
+        # Q8.16 conversion with the 1/sqrt(64) folded in: the shift is
+        # score_exp + 13 (right for synthetic -17, left for per-tensor
+        # scales above -13). Matches the RTL ATTN_SOFTMAX s0 = score-3.
         score = requant(acc.round().to(torch.int64),
                         2 * s.activation_exp(f"b{n}_qkv_out"),
                         score_exp, 32)
-        q16 = requant(score, score_exp, score_exp + 4, 24)
+        q16 = sat(round_shift_away(score, -(score_exp + 13)), 24)
         prob = softmax_attention(q16)
         cacc = prob.to(torch.float64) @ vh.to(torch.float64)
         ctx = requant(cacc.round().to(torch.int64),
