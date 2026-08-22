@@ -736,7 +736,8 @@ module tb_tensor_executor;
     end
 
     // ------------------------------------------------------------------
-    // ATTN_SOFTMAX N=2, all scores 0 -> every output is 64.
+    // ATTN_SOFTMAX N=2, all scores 0 -> every output is 128
+    // (P2 fix: attention delta2 = 1.0; was 64 under the old halving 0.5).
     // ------------------------------------------------------------------
     phase_str = "softmax";
     for (i = 0; i < 48; i++) dbg_w(SC_BASE + OFF_SOFTMAX_SRC + i, 8'h00);
@@ -754,7 +755,7 @@ module tb_tensor_executor;
     expect_done();
     for (i = 0; i < 12; i++) begin
       dbg_rd(SC_BASE + OFF_SOFTMAX_DST + i, got_byte);
-      if (got_byte !== 8'd64) begin
+      if (got_byte !== 8'd128) begin
         $display("softmax i=%0d got=%0d", i, got_byte);
         tb_fatal("ATTN_SOFTMAX uniform row mismatch");
       end
