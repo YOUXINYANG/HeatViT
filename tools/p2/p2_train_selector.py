@@ -275,20 +275,24 @@ def ffn_masked(y, p, s, n):
 
 
 def export_selector(sel, device, stage):
-    """Quantize a trained selector into RTL int8/Q0.16 tensors + scales."""
+    """Quantize a trained selector into RTL int8/Q0.16 tensors + scales.
+
+    PyTorch Linear stores weight [out, in]; the RTL/golden layout is
+    [in, out], so every matrix is transposed here.
+    """
     out = {}
     for h in range(3):
-        out[f"local_w{h}"] = sel.local[h][0].weight.data.detach().cpu()
+        out[f"local_w{h}"] = sel.local[h][0].weight.data.detach().cpu().t()
         out[f"local_b{h}"] = sel.local[h][0].bias.data.detach().cpu()
-        out[f"score_w1_{h}"] = sel.score[h][0].weight.data.detach().cpu()
+        out[f"score_w1_{h}"] = sel.score[h][0].weight.data.detach().cpu().t()
         out[f"score_b1_{h}"] = sel.score[h][0].bias.data.detach().cpu()
-        out[f"score_w2_{h}"] = sel.score[h][2].weight.data.detach().cpu()
+        out[f"score_w2_{h}"] = sel.score[h][2].weight.data.detach().cpu().t()
         out[f"score_b2_{h}"] = sel.score[h][2].bias.data.detach().cpu()
-        out[f"score_w3_{h}"] = sel.score[h][4].weight.data.detach().cpu()
+        out[f"score_w3_{h}"] = sel.score[h][4].weight.data.detach().cpu().t()
         out[f"score_b3_{h}"] = sel.score[h][4].bias.data.detach().cpu()
-    out["hw_w1"] = sel.head_weight[0].weight.data.detach().cpu()
+    out["hw_w1"] = sel.head_weight[0].weight.data.detach().cpu().t()
     out["hw_b1"] = sel.head_weight[0].bias.data.detach().cpu()
-    out["hw_w2"] = sel.head_weight[2].weight.data.detach().cpu()
+    out["hw_w2"] = sel.head_weight[2].weight.data.detach().cpu().t()
     out["hw_b2"] = sel.head_weight[2].bias.data.detach().cpu()
 
     q = {}
