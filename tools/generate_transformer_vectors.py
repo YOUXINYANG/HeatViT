@@ -462,7 +462,9 @@ def generate_mhsa(seed, tokens, outdir):
             opcode=OP_ATTN_SOFTMAX, flags=_flag(FLAG_DYNAMIC_M, FLAG_DYNAMIC_N),
             m=99, n=99, heads=3, param0=0,
             src0_offset=score_off, dst_offset=prob_off,
-            src0_scale_exp=-17,
+            # P2 fix: s0 = -20 adds the 1/sqrt(64) (3 extra bits) to the
+            # Q8.16 requant (was -17).
+            src0_scale_exp=-20,
         ),
         Descriptor(
             opcode=OP_GEMM,
@@ -923,7 +925,9 @@ def _block_descriptors(n, scratch, weight):
             opcode=OP_ATTN_SOFTMAX, flags=_flag(FLAG_DYNAMIC_M, FLAG_DYNAMIC_N),
             m=99, n=99, heads=3, param0=0,
             src0_offset=scratch["score"], dst_offset=scratch["prob"],
-            src0_scale_exp=-17,
+            # P2 fix: s0 = -20 adds the 1/sqrt(64) (3 extra bits) to the
+            # Q8.16 requant (was -17).
+            src0_scale_exp=-20,
         ),
         Descriptor(
             opcode=OP_GEMM,
