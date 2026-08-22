@@ -100,6 +100,7 @@ def golden_params_from_real(floats, table, selector_payload):
         image_scale_exp=table.activation_exp("input"),
         weight_scale_exp=table.weights["patch_w"],
         activation_scale_exp=table.activation_exp("act_patch_embed"),
+        tokens_scale_exp=table.activation_exp("act_tokens"),
         cls_scale_exp=table.weights["cls"],
         pos_scale_exp=table.weights["pos"],
     )

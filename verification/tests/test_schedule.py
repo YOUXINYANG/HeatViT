@@ -20,6 +20,7 @@ from verification.heatvit_ref.descriptor import (
 )
 from tools.generate_descriptors import (
     ACT_SLOT,
+    _scale_lookup,
     block_sequence,
     build_memory_map,
     build_schedule,
@@ -168,11 +169,12 @@ class ScheduleTest(unittest.TestCase):
                        src0_offset=4).validate()
 
     def test_sequence_helper_sizes(self):
-        self.assertEqual(len(patch_sequence(self.mm)), 3)
-        self.assertEqual(len(block_sequence(1, self.mm, True)), 13)
+        sc = _scale_lookup(None)
+        self.assertEqual(len(patch_sequence(self.mm, sc)), 3)
+        self.assertEqual(len(block_sequence(1, self.mm, True, sc)), 13)
         self.assertEqual(len(selector_sequence(1, self.mm, True)), 12)
-        self.assertEqual(len(final_layernorm_sequence(self.mm)), 1)
-        self.assertEqual(len(classifier_sequence(self.mm)), 1)
+        self.assertEqual(len(final_layernorm_sequence(self.mm, sc)), 1)
+        self.assertEqual(len(classifier_sequence(self.mm, sc)), 1)
         self.assertEqual(Descriptor.finish().opcode, OP_FINISH)
 
     def test_memory_map_regions(self):

@@ -64,6 +64,7 @@ class PatchParams:
     image_scale_exp: int = -7
     weight_scale_exp: int = -7
     activation_scale_exp: int = -7    # patch embedding output
+    tokens_scale_exp: int = -7        # post cls/pos addition (act_tokens)
     cls_scale_exp: int = -7
     pos_scale_exp: int = -7
 
@@ -128,7 +129,7 @@ def patch_embedding(image, params):
         _align_add_requant(
             params.cls[c], params.cls_scale_exp,
             params.pos[0][c], params.pos_scale_exp,
-            params.activation_scale_exp,
+            params.tokens_scale_exp,
         )
         for c in range(params.embed_dim)
     ])
@@ -137,7 +138,7 @@ def patch_embedding(image, params):
             _align_add_requant(
                 embed_row[c], params.activation_scale_exp,
                 params.pos[i + 1][c], params.pos_scale_exp,
-                params.activation_scale_exp,
+                params.tokens_scale_exp,
             )
             for c in range(params.embed_dim)
         ])
