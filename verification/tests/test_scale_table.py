@@ -97,8 +97,8 @@ class TestScaleTable(unittest.TestCase):
         # 3 patch-region weights + 12*8 block weights + 3*6 selector
         # weights + final gamma/beta + head = 3 + 96 + 18 + 3 = 120.
         self.assertEqual(len(WEIGHT_NAMES), 120)
-        # input + 3 patch activations + 12*8 block + 3*7 selector + final ln.
-        self.assertEqual(len(ACTIVATION_NAMES), 1 + 3 + 96 + 21 + 1)
+        # input + 3 patch activations + 12*9 block + 3*7 selector + final ln.
+        self.assertEqual(len(ACTIVATION_NAMES), 1 + 3 + 108 + 21 + 1)
 
 
 if __name__ == "__main__":

@@ -20,8 +20,9 @@ sequence builders):
             final_gamma, final_beta, head_w
   activations : input,
             act_patch_matrix, act_patch_embed, act_tokens,
-            b<N>_ln1_out, b<N>_qkv_out, b<N>_msa_out, b<N>_y,
-            b<N>_ln2_out, b<N>_hidden, b<N>_ffn_out, b<N>_out (N = 1..12),
+            b<N>_ln1_out, b<N>_qkv_out, b<N>_context_out, b<N>_msa_out,
+            b<N>_y, b<N>_ln2_out, b<N>_hidden, b<N>_ffn_out, b<N>_out
+            (N = 1..12),
             s<S>_local_out, s<S>_concat_out, s<S>_h1_out, s<S>_h2_out,
             s<S>_logits_out, s<S>_stats_out, s<S>_hw_hidden_out (S = 1..3),
             final_ln_out
@@ -41,8 +42,8 @@ _BLOCK_WEIGHTS = ("wqkv", "wproj", "gamma1", "beta1", "w1", "w2",
                   "gamma2", "beta2")
 _SELECTOR_WEIGHTS = ("local_w", "score_w1", "score_w2", "score_w3",
                      "hw_w1", "hw_w2")
-_BLOCK_ACTIVATIONS = ("ln1_out", "qkv_out", "msa_out", "y", "ln2_out",
-                      "hidden", "ffn_out", "out")
+_BLOCK_ACTIVATIONS = ("ln1_out", "qkv_out", "context_out", "msa_out", "y",
+                      "ln2_out", "hidden", "ffn_out", "out")
 _SELECTOR_ACTIVATIONS = ("local_out", "concat_out", "h1_out", "h2_out",
                          "logits_out", "stats_out", "hw_hidden_out")
 
