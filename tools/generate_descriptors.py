@@ -201,27 +201,48 @@ def build_memory_map():
 # ---------------------------------------------------------------------
 # Sequence builders. Activation references use slot-relative offsets
 # (0..ACT_SLOT-1); the scheduler rebases them at issue time.
+# Per-tensor scales: ``sc`` is a callable (name, uniform_key) -> exp; with
+# a real-weight ScaleTable it returns the per-tensor exponent, otherwise
+# the uniform SCALES value (synthetic path, byte-identical output).
 # ---------------------------------------------------------------------
-def patch_sequence(mm):
+def _scale_lookup(table):
+    if table is None:
+        return lambda name, uniform: SCALES[uniform]
+
+    def lookup(name, uniform):
+        if name in table.activations:
+            return table.activations[name]
+        if name in table.weights:
+            return table.weights[name]
+        return SCALES[uniform]
+
+    return lookup
+
+
+def patch_sequence(mm, sc):
     s = mm["scratch"]
     w = mm["weight"]
     return [
         _desc(OP_PATCHIFY, _flag(FLAG_SRC0_INPUT), m=196, n=768,
               src0=0, dst=s["patch_matrix"],
-              s0=SCALES["input"], sdst=SCALES["activation"]),
+              s0=sc("input", "input"),
+              sdst=sc("act_patch_matrix", "activation")),
         _desc(OP_GEMM, _flag(FLAG_BIAS_ENABLE), m=196, n=192, k=768,
               src0=s["patch_matrix"], src1=w["patch_w"],
               bias=w["patch_b"], dst=s["patch_embed"],
-              s0=SCALES["activation"], s1=SCALES["weight"],
-              sdst=SCALES["activation"]),
+              s0=sc("act_patch_matrix", "activation"),
+              s1=sc("patch_w", "weight"),
+              sdst=sc("act_patch_embed", "activation")),
         _desc(OP_COPY_ADD_POS, _flag(FLAG_AUX_WEIGHT), m=197, n=192,
               src0=s["patch_embed"], src1=w["pos"], aux=w["cls"],
-              dst=0, s0=SCALES["activation"], s1=SCALES["cls_pos_beta"],
-              saux=SCALES["cls_pos_beta"], sdst=SCALES["activation"]),
+              dst=0, s0=sc("act_patch_embed", "activation"),
+              s1=sc("pos", "cls_pos_beta"),
+              saux=sc("cls", "cls_pos_beta"),
+              sdst=sc("act_tokens", "activation")),
     ]
 
 
-def block_sequence(block_index, mm, flag4):
+def block_sequence(block_index, mm, flag4, sc):
     """13 descriptors; x/z reference the activation slots, flag4 on
     Residual2 marks the buffer switch."""
     s = mm["scratch"]
@@ -234,69 +255,88 @@ def block_sequence(block_index, mm, flag4):
         _desc(OP_LAYERNORM, base_flags | _flag(FLAG_AUX_WEIGHT),
               m=99, n=192, src0=0, src1=w[f"{prefix}_gamma1"],
               aux=w[f"{prefix}_beta1"], dst=b["ln1"],
-              s0=SCALES["activation"], s1=SCALES["gamma"],
-              saux=SCALES["cls_pos_beta"], sdst=SCALES["activation"]),
+              s0=sc(f"b{block_index - 1}_out" if block_index > 1
+                    else "act_tokens", "activation"),
+              s1=sc(f"b{block_index}_gamma1", "gamma"),
+              saux=sc(f"b{block_index}_beta1", "cls_pos_beta"),
+              sdst=sc(f"b{block_index}_ln1_out", "activation")),
         _desc(OP_GEMM, _flag(FLAG_BIAS_ENABLE, FLAG_DYNAMIC_M),
               m=99, n=576, k=192, src0=b["ln1"],
               src1=w[f"{prefix}_wqkv"], bias=w[f"{prefix}_bqkv"],
-              dst=b["fused"], s0=SCALES["activation"],
-              s1=SCALES["weight"], sdst=SCALES["activation"]),
+              dst=b["fused"], s0=sc(f"b{block_index}_ln1_out", "activation"),
+              s1=sc(f"b{block_index}_wqkv", "weight"),
+              sdst=sc(f"b{block_index}_qkv_out", "activation")),
         _desc(OP_QKV_UNPACK, base_flags, m=99, n=576, heads=3,
               src0=b["fused"], dst=b["qkv"],
-              s0=SCALES["activation"], sdst=SCALES["activation"]),
+              s0=sc(f"b{block_index}_qkv_out", "activation"),
+              sdst=sc(f"b{block_index}_qkv_out", "activation")),
         _desc(OP_GEMM,
               _flag(FLAG_RHS_TRANSPOSE, FLAG_HEAD_MODE, FLAG_OUTPUT_INT32,
                     FLAG_DYNAMIC_M, FLAG_DYNAMIC_N, FLAG_SRC1_SCRATCH),
               m=99, n=99, k=64, heads=3, src0=b["qkv"],
               src1=b["qkv"], dst=b["score"],
-              s0=SCALES["activation"], s1=SCALES["activation"],
-              sdst=-17),
+              s0=sc(f"b{block_index}_qkv_out", "activation"),
+              s1=sc(f"b{block_index}_qkv_out", "activation"),
+              sdst=2 * sc(f"b{block_index}_qkv_out", "activation") - 3),
         _desc(OP_ATTN_SOFTMAX, _flag(FLAG_DYNAMIC_M, FLAG_DYNAMIC_N),
               m=99, n=99, heads=3, src0=b["score"], dst=b["prob"],
-              # s0 = -20: the vector engine requants to Q8.16 with a 4-bit
-              # shift = scale bookkeeping (score at -17 -> -16) plus the
-              # 1/sqrt(64) = 1/8 (3 extra bits). Per-tensor scales replace
-              # this with 2*qkv_out_scale - 6.
-              s0=-20, sdst=SCALES["attn_uq0_8"]),
+              # s0 = 2*qkv_out - 6: the vector engine requants to Q8.16
+              # with a 4-bit shift = scale bookkeeping (score -> -16) plus
+              # the 1/sqrt(64) = 1/8 (3 extra bits).
+              s0=2 * sc(f"b{block_index}_qkv_out", "activation") - 6,
+              sdst=SCALES["attn_uq0_8"]),
         _desc(OP_GEMM,
               _flag(FLAG_HEAD_MODE, FLAG_SRC0_UNSIGNED, FLAG_DYNAMIC_M,
                     FLAG_DYNAMIC_K, FLAG_SRC1_SCRATCH),
               m=99, n=64, k=99, heads=3, src0=b["prob"],
               src1=b["qkv"], dst=b["context"],
-              s0=SCALES["attn_uq0_8"], s1=SCALES["activation"],
-              sdst=SCALES["activation"]),
+              s0=SCALES["attn_uq0_8"],
+              s1=sc(f"b{block_index}_qkv_out", "activation"),
+              sdst=sc(f"b{block_index}_context_out", "activation")),
         _desc(OP_HEAD_CONCAT, base_flags, m=99, n=192, heads=3,
               src0=b["context"], dst=b["concat"],
-              s0=SCALES["activation"], sdst=SCALES["activation"]),
+              s0=sc(f"b{block_index}_context_out", "activation"),
+              sdst=sc(f"b{block_index}_context_out", "activation")),
         _desc(OP_GEMM, _flag(FLAG_BIAS_ENABLE, FLAG_DYNAMIC_M),
               m=99, n=192, k=192, src0=b["concat"],
               src1=w[f"{prefix}_wproj"], bias=w[f"{prefix}_bproj"],
-              dst=b["msa"], s0=SCALES["activation"],
-              s1=SCALES["weight"], sdst=SCALES["activation"]),
+              dst=b["msa"], s0=sc(f"b{block_index}_context_out",
+                                  "activation"),
+              s1=sc(f"b{block_index}_wproj", "weight"),
+              sdst=sc(f"b{block_index}_msa_out", "activation")),
         _desc(OP_RESIDUAL, base_flags, m=99, n=192,
               src0=0, aux=b["msa"], dst=b["y"],
-              s0=SCALES["activation"], saux=SCALES["activation"],
-              sdst=SCALES["activation"]),
+              s0=sc(f"b{block_index - 1}_out" if block_index > 1
+                    else "act_tokens", "activation"),
+              saux=sc(f"b{block_index}_msa_out", "activation"),
+              sdst=sc(f"b{block_index}_y", "activation")),
         _desc(OP_LAYERNORM, base_flags | _flag(FLAG_AUX_WEIGHT),
               m=99, n=192, src0=b["y"], src1=w[f"{prefix}_gamma2"],
               aux=w[f"{prefix}_beta2"], dst=b["ln2"],
-              s0=SCALES["activation"], s1=SCALES["gamma"],
-              saux=SCALES["cls_pos_beta"], sdst=SCALES["activation"]),
+              s0=sc(f"b{block_index}_y", "activation"),
+              s1=sc(f"b{block_index}_gamma2", "gamma"),
+              saux=sc(f"b{block_index}_beta2", "cls_pos_beta"),
+              sdst=sc(f"b{block_index}_ln2_out", "activation")),
         _desc(OP_GEMM,
               _flag(FLAG_BIAS_ENABLE, FLAG_DYNAMIC_M) | (POST_GELU << 8),
               m=99, n=768, k=192, src0=b["ln2"],
               src1=w[f"{prefix}_w1"], bias=w[f"{prefix}_b1"],
-              dst=b["hidden"], s0=SCALES["activation"],
-              s1=SCALES["weight"], sdst=SCALES["activation"]),
+              dst=b["hidden"], s0=sc(f"b{block_index}_ln2_out",
+                                     "activation"),
+              s1=sc(f"b{block_index}_w1", "weight"),
+              sdst=sc(f"b{block_index}_hidden", "activation")),
         _desc(OP_GEMM, _flag(FLAG_BIAS_ENABLE, FLAG_DYNAMIC_M),
               m=99, n=192, k=768, src0=b["hidden"],
               src1=w[f"{prefix}_w2"], bias=w[f"{prefix}_b2"],
-              dst=b["ffn_out"], s0=SCALES["activation"],
-              s1=SCALES["weight"], sdst=SCALES["activation"]),
+              dst=b["ffn_out"], s0=sc(f"b{block_index}_hidden",
+                                      "activation"),
+              s1=sc(f"b{block_index}_w2", "weight"),
+              sdst=sc(f"b{block_index}_ffn_out", "activation")),
         _desc(OP_RESIDUAL, base4 if flag4 else base_flags, m=99, n=192,
               src0=b["y"], aux=b["ffn_out"], dst=0,
-              s0=SCALES["activation"], saux=SCALES["activation"],
-              sdst=SCALES["activation"]),
+              s0=sc(f"b{block_index}_y", "activation"),
+              saux=sc(f"b{block_index}_ffn_out", "activation"),
+              sdst=sc(f"b{block_index}_out", "activation")),
     ]
 
 
@@ -377,19 +417,21 @@ def selector_sequence(selector_index, mm, flag4):
     ]
 
 
-def final_layernorm_sequence(mm):
+def final_layernorm_sequence(mm, sc):
     s = mm["scratch"]
     w = mm["weight"]
     return [
         _desc(OP_LAYERNORM, _flag(FLAG_DYNAMIC_M, FLAG_AUX_WEIGHT),
               m=99, n=192, src0=0, src1=w["final_gamma"],
               aux=w["final_beta"], dst=s["final_ln"],
-              s0=SCALES["activation"], s1=SCALES["gamma"],
-              saux=SCALES["cls_pos_beta"], sdst=SCALES["activation"]),
+              s0=sc("b12_out", "activation"),
+              s1=sc("final_gamma", "gamma"),
+              saux=sc("final_beta", "cls_pos_beta"),
+              sdst=sc("final_ln_out", "activation")),
     ]
 
 
-def classifier_sequence(mm):
+def classifier_sequence(mm, sc):
     s = mm["scratch"]
     w = mm["weight"]
     return [
@@ -397,22 +439,24 @@ def classifier_sequence(mm):
                              FLAG_DST_OUTPUT),
               m=1, n=CLASSES, k=192, src0=s["final_ln"],
               src1=w["head_w"], bias=w["head_b"], dst=0,
-              s0=SCALES["activation"], s1=SCALES["weight"],
+              s0=sc("final_ln_out", "activation"),
+              s1=sc("head_w", "weight"),
               sdst=SCALES["logit"]),
     ]
 
 
-def build_schedule(memory_map):
-    descs = list(patch_sequence(memory_map))
+def build_schedule(memory_map, scale_table=None):
+    sc = _scale_lookup(scale_table)
+    descs = list(patch_sequence(memory_map, sc))
     # Static ping-pong bookkeeping: the active buffer flips after every
     # Residual2 / Finalize (flag 4), which the scheduler mirrors at runtime.
     for block_index in range(1, 13):
         if block_index in (4, 7, 10):
             selector_index = {4: 1, 7: 2, 10: 3}[block_index]
             descs.extend(selector_sequence(selector_index, memory_map, True))
-        descs.extend(block_sequence(block_index, memory_map, True))
-    descs.extend(final_layernorm_sequence(memory_map))
-    descs.extend(classifier_sequence(memory_map))
+        descs.extend(block_sequence(block_index, memory_map, True, sc))
+    descs.extend(final_layernorm_sequence(memory_map, sc))
+    descs.extend(classifier_sequence(memory_map, sc))
     descs.append(Descriptor.finish())
     if len(descs) != 198:
         raise ValueError(f"descriptor count {len(descs)} != 198")
@@ -499,13 +543,22 @@ def main():
                         default="build/vectors/e2e/descriptor_listing.csv")
     parser.add_argument("--map", type=Path,
                         default="build/vectors/e2e/memory_map.json")
+    parser.add_argument("--scale-table", type=Path, default=None,
+                        help="per-tensor scale table JSON (P2 real weights); "
+                             "omit for the uniform synthetic scales")
     args = parser.parse_args()
 
     config = json.loads(Path(args.config).read_text(encoding="utf-8"))
     assert config["tokens"] == 197 and config["blocks"] == 12
 
+    scale_table = None
+    if args.scale_table is not None:
+        from tools.p2.scale_table import ScaleTable
+        scale_table = ScaleTable.load(args.scale_table)
+        scale_table.validate()
+
     mm, scratch_bytes, weight_bytes = build_memory_map()
-    descs = build_schedule(mm)
+    descs = build_schedule(mm, scale_table)
     for desc in descs:
         desc.validate()
 

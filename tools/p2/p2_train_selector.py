@@ -206,7 +206,6 @@ def train_forward(model, selectors, img_q, targets, s):
                          s.weight_exp("head_w"), S.LOGIT_SCALE_EXP, 32)
     return logits[:, 0].float(), sparsity_loss
 
-
 def transformer_block_masked(tokens, p, s, n, x_exp, valid):
     """Exact integer block with an attention validity mask [B,N,1]."""
     msa_out = mhsa_masked(tokens, p, s, n, x_exp, valid)
@@ -369,25 +368,30 @@ def main():
     crit = nn.CrossEntropyLoss()
 
     steps = 0
+    run_ce = 0.0
+    run_sp = 0.0
     for epoch in range(args.epochs):
-        running = 0.0
         t0 = time.time()
         for img, label in loader:
             img = img.to(device)
             label = label.to(device)
             logits, sp_loss = train_forward(model, selectors, img,
                                             STAGE_TARGETS, table)
-            loss = crit(logits, label) + args.sparsity_weight * sp_loss
+            ce = crit(logits, label)
+            loss = ce + args.sparsity_weight * sp_loss
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(selectors.parameters(), 1.0)
             opt.step()
-            running += loss.item()
+            run_ce += ce.item()
+            run_sp += sp_loss.item()
             steps += 1
             if steps % 20 == 0:
-                print(f"step {steps}: loss {running / 20:.3f} "
+                print(f"step {steps}: ce {run_ce / 20:.2f} "
+                      f"sparsity {run_sp / 20:.4f} "
                       f"({time.time() - t0:.0f}s)", flush=True)
-                running = 0.0
+                run_ce = 0.0
+                run_sp = 0.0
 
     out_path = REPO_ROOT / args.out
     out_path.parent.mkdir(parents=True, exist_ok=True)
