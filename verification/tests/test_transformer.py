@@ -43,7 +43,7 @@ def random_block_params(rng):
             for row in rng.integers(-8, 8, size=(192, 192), dtype=np.int64)
         ],
         bproj=[int(v) for v in rng.integers(-64, 64, size=192)],
-        weight_scale_exp=0,
+        wqkv_scale_exp=0, wproj_scale_exp=0,
     )
     ffn_params = FfnParams(
         ln_gamma=[int(v) for v in rng.integers(0, 128, size=192)],
@@ -58,7 +58,7 @@ def random_block_params(rng):
             for row in rng.integers(-128, 128, size=(768, 192), dtype=np.int64)
         ],
         b2=[int(v) for v in rng.integers(-64, 64, size=192)],
-        weight_scale_exp=0,
+        w1_scale_exp=0, w2_scale_exp=0,
     )
     return BlockParams(mhsa=mhsa_params, ffn=ffn_params)
 
@@ -188,7 +188,7 @@ class TransformerTest(unittest.TestCase):
             bqkv=bqkv,
             wproj=wproj,
             bproj=bproj,
-            weight_scale_exp=0,
+            wqkv_scale_exp=0, wproj_scale_exp=0,
         )
 
         output, ck = mhsa(x, params)
@@ -259,7 +259,7 @@ class TransformerTest(unittest.TestCase):
             b1=b1,
             w2=w2,
             b2=b2,
-            weight_scale_exp=0,
+            w1_scale_exp=0, w2_scale_exp=0,
         )
 
         z, ck = ffn(y, params)

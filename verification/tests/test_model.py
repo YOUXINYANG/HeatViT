@@ -41,6 +41,10 @@ class ModelTest(unittest.TestCase):
         params.final_beta = [0] * 192
         params.head_w = [[0] * 1000 for _ in range(192)]
         params.head_b = [0] * 1000
+        params.final_gamma_scale_exp = -6
+        params.final_beta_scale_exp = -7
+        params.final_ln_out_scale_exp = -7
+        params.blocks[-1].ffn.out_scale_exp = -7
 
         with mock.patch(
             "verification.heatvit_ref.model.patch_embedding",

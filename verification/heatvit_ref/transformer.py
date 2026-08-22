@@ -63,7 +63,9 @@ class PatchParams:
     tokens: int = 197
     image_scale_exp: int = -7
     weight_scale_exp: int = -7
-    activation_scale_exp: int = -7
+    activation_scale_exp: int = -7    # patch embedding output
+    cls_scale_exp: int = -7
+    pos_scale_exp: int = -7
 
     def __post_init__(self):
         if self.embed_dim != 192:
@@ -116,7 +118,7 @@ def patch_embedding(image, params):
     )
     patch_embed = gemm_writeback(
         accum,
-        2 * params.weight_scale_exp,
+        params.image_scale_exp + params.weight_scale_exp,
         params.activation_scale_exp,
         8,
     )
@@ -124,8 +126,8 @@ def patch_embedding(image, params):
     activation = []
     activation.append([
         _align_add_requant(
-            params.cls[c], params.activation_scale_exp,
-            params.pos[0][c], params.activation_scale_exp,
+            params.cls[c], params.cls_scale_exp,
+            params.pos[0][c], params.pos_scale_exp,
             params.activation_scale_exp,
         )
         for c in range(params.embed_dim)
@@ -134,7 +136,7 @@ def patch_embedding(image, params):
         activation.append([
             _align_add_requant(
                 embed_row[c], params.activation_scale_exp,
-                params.pos[i + 1][c], params.activation_scale_exp,
+                params.pos[i + 1][c], params.pos_scale_exp,
                 params.activation_scale_exp,
             )
             for c in range(params.embed_dim)
@@ -144,7 +146,12 @@ def patch_embedding(image, params):
 
 @dataclass(frozen=True)
 class MhsaParams:
-    """Immutable three-head MHSA tensors and fixed-point scales."""
+    """Immutable three-head MHSA tensors and per-tensor fixed-point scales.
+
+    P2: the uniform synthetic scales were split into per-tensor exponents
+    so real DeiT-T weights can carry individual scales (the RTL descriptor
+    already supports per-tensor src/dst exponents).
+    """
 
     ln_gamma: tuple = ()
     ln_beta: tuple = ()
@@ -155,14 +162,17 @@ class MhsaParams:
     embed_dim: int = 192
     heads: int = 3
     head_dim: int = 64
-    x_scale_exp: int = -7
-    gamma_scale_exp: int = -6
-    beta_scale_exp: int = -7
-    ln_out_scale_exp: int = -7
-    weight_scale_exp: int = -7
-    score_scale_exp: int = -17
-    prob_scale_exp: int = -8
-    activation_scale_exp: int = -7
+    x_scale_exp: int = -7            # block input (pre-LN1)
+    gamma1_scale_exp: int = -6
+    beta1_scale_exp: int = -7
+    ln1_out_scale_exp: int = -7
+    wqkv_scale_exp: int = -7
+    qkv_out_scale_exp: int = -7      # fused QKV GEMM output
+    score_scale_exp: int = -17       # must equal 2*qkv_out - 3 (/sqrt(64))
+    prob_scale_exp: int = -8         # UQ0.8
+    context_out_scale_exp: int = -7  # attention*V output (head concat in)
+    wproj_scale_exp: int = -7
+    msa_out_scale_exp: int = -7      # projection output
 
     def __post_init__(self):
         if self.embed_dim != 192 or self.heads != 3 or self.head_dim != 64:
@@ -202,16 +212,16 @@ def mhsa(x, params):
             list(params.ln_gamma),
             list(params.ln_beta),
             params.x_scale_exp,
-            params.gamma_scale_exp,
-            params.beta_scale_exp,
-            params.ln_out_scale_exp,
+            params.gamma1_scale_exp,
+            params.beta1_scale_exp,
+            params.ln1_out_scale_exp,
         )
         ln1.append(out)
 
     fused = gemm_writeback(
         gemm_numpy(ln1, [list(r) for r in params.wqkv], list(params.bqkv), False),
-        params.x_scale_exp + params.weight_scale_exp,
-        params.activation_scale_exp,
+        params.ln1_out_scale_exp + params.wqkv_scale_exp,
+        params.qkv_out_scale_exp,
         8,
     )
     qkv = qkv_unpack(fused, n)
@@ -219,7 +229,7 @@ def mhsa(x, params):
     score = []
     for h in range(params.heads):
         acc = gemm_numpy(qkv[0][h], qkv[1][h], None, True)
-        score.append(gemm_writeback(acc, 2 * params.activation_scale_exp,
+        score.append(gemm_writeback(acc, 2 * params.qkv_out_scale_exp,
                                     params.score_scale_exp, 32))
 
     prob = []
@@ -227,7 +237,7 @@ def mhsa(x, params):
         rows = []
         for r in range(n):
             # q16 = Q*K^T / sqrt(64) in Q8.16. ``score`` holds Q*K^T at
-            # score_scale_exp = 2*act - 3; the 1/sqrt(64) = 1/8 is one
+            # score_scale_exp = 2*qkv_out - 3; the 1/sqrt(64) = 1/8 is one
             # extra 3-bit right shift on top of the scale-bookkeeping
             # shift, so the effective dst exponent is score_scale + 4.
             # (RTL: the ATTN_SOFTMAX descriptor carries s0 = score-3 and
@@ -245,16 +255,16 @@ def mhsa(x, params):
         acc = gemm_numpy(prob[h], qkv[2][h], None, False, a_unsigned=True)
         context.append(gemm_writeback(
             acc,
-            params.prob_scale_exp + params.activation_scale_exp,
-            params.activation_scale_exp,
+            params.prob_scale_exp + params.qkv_out_scale_exp,
+            params.context_out_scale_exp,
             8,
         ))
 
     concat = head_concat(context, n)
     output = gemm_writeback(
         gemm_numpy(concat, [list(r) for r in params.wproj], list(params.bproj), False),
-        params.activation_scale_exp + params.weight_scale_exp,
-        params.activation_scale_exp,
+        params.context_out_scale_exp + params.wproj_scale_exp,
+        params.msa_out_scale_exp,
         8,
     )
 
@@ -273,7 +283,7 @@ def mhsa(x, params):
 
 @dataclass(frozen=True)
 class FfnParams:
-    """Immutable two-layer FFN tensors and fixed-point scales."""
+    """Immutable two-layer FFN tensors and per-tensor fixed-point scales."""
 
     ln_gamma: tuple = ()
     ln_beta: tuple = ()
@@ -283,12 +293,15 @@ class FfnParams:
     b2: tuple = ()
     embed_dim: int = 192
     ffn_dim: int = 768
-    x_scale_exp: int = -7
-    gamma_scale_exp: int = -6
-    beta_scale_exp: int = -7
-    ln_out_scale_exp: int = -7
-    weight_scale_exp: int = -7
-    activation_scale_exp: int = -7
+    x_scale_exp: int = -7            # residual y (LN2 input)
+    gamma2_scale_exp: int = -6
+    beta2_scale_exp: int = -7
+    ln2_out_scale_exp: int = -7
+    w1_scale_exp: int = -7
+    hidden_out_scale_exp: int = -7   # post-GELU
+    w2_scale_exp: int = -7
+    ffn_out_scale_exp: int = -7
+    out_scale_exp: int = -7          # block output z (residual2)
 
     def __post_init__(self):
         if self.embed_dim != 192 or self.ffn_dim != 768:
@@ -324,18 +337,18 @@ def ffn(y, params):
             list(params.ln_gamma),
             list(params.ln_beta),
             params.x_scale_exp,
-            params.gamma_scale_exp,
-            params.beta_scale_exp,
-            params.ln_out_scale_exp,
+            params.gamma2_scale_exp,
+            params.beta2_scale_exp,
+            params.ln2_out_scale_exp,
         )
         ln2.append(out)
 
     hidden_acc = gemm_numpy(ln2, [list(r) for r in params.w1], list(params.b1), False)
-    src_exp = params.x_scale_exp + params.weight_scale_exp
+    src_exp = params.ln2_out_scale_exp + params.w1_scale_exp
     hidden = [
         [
             requant(gelu(requant(v, src_exp, -16, 24)), -16,
-                    params.activation_scale_exp, 8)
+                    params.hidden_out_scale_exp, 8)
             for v in row
         ]
         for row in hidden_acc
@@ -343,8 +356,8 @@ def ffn(y, params):
 
     ffn_out = gemm_writeback(
         gemm_numpy(hidden, [list(r) for r in params.w2], list(params.b2), False),
-        params.activation_scale_exp + params.weight_scale_exp,
-        params.activation_scale_exp,
+        params.hidden_out_scale_exp + params.w2_scale_exp,
+        params.ffn_out_scale_exp,
         8,
     )
 
@@ -352,9 +365,9 @@ def ffn(y, params):
     for r in range(n):
         z.append([
             _align_add_requant(
-                y[r][c], params.activation_scale_exp,
-                ffn_out[r][c], params.activation_scale_exp,
-                params.activation_scale_exp,
+                y[r][c], params.x_scale_exp,
+                ffn_out[r][c], params.ffn_out_scale_exp,
+                params.out_scale_exp,
             )
             for c in range(params.embed_dim)
         ])
@@ -393,13 +406,15 @@ def transformer_block(x, params):
         raise TypeError("params must be BlockParams")
     x = _int8_matrix("x", x, len(x), params.mhsa.embed_dim)
     n = len(x)
-    act_exp = params.mhsa.activation_scale_exp
+    x_exp = params.mhsa.x_scale_exp
 
     msa_out, msa_checkpoints = mhsa(x, params.mhsa)
     y = [
         [
             _align_add_requant(
-                x[r][c], act_exp, msa_out[r][c], act_exp, act_exp
+                x[r][c], x_exp,
+                msa_out[r][c], params.mhsa.msa_out_scale_exp,
+                params.ffn.x_scale_exp,
             )
             for c in range(params.mhsa.embed_dim)
         ]

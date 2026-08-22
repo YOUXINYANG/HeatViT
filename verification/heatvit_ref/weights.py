@@ -71,6 +71,7 @@ def build_patch_params(rng):
              for _ in range(197)],
         width=224, height=224, patch=16, embed_dim=192, tokens=197,
         image_scale_exp=-7, weight_scale_exp=-7, activation_scale_exp=-7,
+        cls_scale_exp=-7, pos_scale_exp=-7,
     )
 
 
@@ -82,9 +83,11 @@ def build_block_params(rng):
         bqkv=_int32_vec(rng, 576),
         wproj=_int8_matrix(rng, 192, 192),
         bproj=_int32_vec(rng, 192),
-        x_scale_exp=-7, gamma_scale_exp=-6, beta_scale_exp=-7,
-        ln_out_scale_exp=-7, weight_scale_exp=-7, score_scale_exp=-17,
-        prob_scale_exp=-8, activation_scale_exp=-7,
+        x_scale_exp=-7, gamma1_scale_exp=-6, beta1_scale_exp=-7,
+        ln1_out_scale_exp=-7, wqkv_scale_exp=-7, qkv_out_scale_exp=-7,
+        score_scale_exp=-17, prob_scale_exp=-8,
+        context_out_scale_exp=-7, wproj_scale_exp=-7,
+        msa_out_scale_exp=-7,
     )
     ffn = FfnParams(
         ln_gamma=_gamma_vec(rng, 192),
@@ -93,8 +96,10 @@ def build_block_params(rng):
         b1=_int32_vec(rng, 768),
         w2=_int8_matrix(rng, 768, 192),
         b2=_int32_vec(rng, 192),
-        x_scale_exp=-7, gamma_scale_exp=-6, beta_scale_exp=-7,
-        ln_out_scale_exp=-7, weight_scale_exp=-7, activation_scale_exp=-7,
+        x_scale_exp=-7, gamma2_scale_exp=-6, beta2_scale_exp=-7,
+        ln2_out_scale_exp=-7, w1_scale_exp=-7,
+        hidden_out_scale_exp=-7, w2_scale_exp=-7,
+        ffn_out_scale_exp=-7, out_scale_exp=-7,
     )
     return BlockParams(mhsa=mhsa, ffn=ffn)
 

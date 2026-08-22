@@ -32,6 +32,10 @@ class HeatViTParams:
     final_beta: tuple        # 192 int8
     head_w: tuple            # [192][1000] int8
     head_b: tuple            # 1000 int32
+    final_gamma_scale_exp: int = -6
+    final_beta_scale_exp: int = -7
+    final_ln_out_scale_exp: int = -7
+    head_w_scale_exp: int = -7
     selector_blocks: tuple = (4, 7, 10)  # block numbers preceded by a
                                          # selector (config: selector_before_blocks)
 
@@ -52,12 +56,13 @@ class ModelResult:
     selector_summary: tuple
 
 
-def _layer_norm_rows(x, gamma, beta):
+def _layer_norm_rows(x, gamma, beta, x_scale, gamma_scale, beta_scale,
+                     out_scale):
     out = []
     for row in x:
         out_row, _warn = layernorm(
             list(row), list(gamma), list(beta),
-            -7, -6, -7, -7)
+            x_scale, gamma_scale, beta_scale, out_scale)
         out.append(out_row)
     return out
 
@@ -94,7 +99,11 @@ class HeatViTModel:
             x, _ = transformer_block(x, params.blocks[block_number - 1])
             checkpoints[f"block_{block_number:02d}"] = [list(row) for row in x]
 
-        final_ln = _layer_norm_rows(x, params.final_gamma, params.final_beta)
+        final_ln = _layer_norm_rows(
+            x, params.final_gamma, params.final_beta,
+            params.blocks[-1].ffn.out_scale_exp,
+            params.final_gamma_scale_exp, params.final_beta_scale_exp,
+            params.final_ln_out_scale_exp)
         logits = gemm([final_ln[0]], [list(row) for row in params.head_w],
                       list(params.head_b), False)[0]
         checkpoints["final_ln"] = final_ln
