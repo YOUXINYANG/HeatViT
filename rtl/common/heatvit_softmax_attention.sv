@@ -1,5 +1,8 @@
-// Attention softmax wrapper: delta2 = 0.5, output rounded right by 8 and
-// saturated to unsigned Q0.8.
+// Attention softmax wrapper: delta2 = 1.0, output rounded right by 8 and
+// saturated to unsigned Q0.8. delta2=1.0 keeps the probability mass at 1.0
+// (attention output is not halved); the /sqrt(64) scaling is applied by the
+// tensor executor when it requants the score to Q8.16 (ATTN_SOFTMAX s0 =
+// score_scale - 3).
 module heatvit_softmax_attention
   import heatvit_pkg::*;
 (
@@ -32,7 +35,7 @@ module heatvit_softmax_attention
 
   heatvit_softmax_core #(
     .MAX_ROW    (197),
-    .DELTA2_Q16 (32768)
+    .DELTA2_Q16 (65536)
   ) u_core (
     .clk            (clk),
     .rst_n          (rst_n),

@@ -226,8 +226,15 @@ def mhsa(x, params):
     for h in range(params.heads):
         rows = []
         for r in range(n):
+            # q16 = Q*K^T / sqrt(64) in Q8.16. ``score`` holds Q*K^T at
+            # score_scale_exp = 2*act - 3; the 1/sqrt(64) = 1/8 is one
+            # extra 3-bit right shift on top of the scale-bookkeeping
+            # shift, so the effective dst exponent is score_scale + 4.
+            # (RTL: the ATTN_SOFTMAX descriptor carries s0 = score-3 and
+            # the vector engine requants to Q8.16 generically.)
             q16 = [
-                requant(score[h][r][c], params.score_scale_exp, -16, 24)
+                requant(score[h][r][c], params.score_scale_exp,
+                        params.score_scale_exp + 4, 24)
                 for c in range(n)
             ]
             rows.append(softmax_attention(q16))

@@ -253,7 +253,11 @@ def block_sequence(block_index, mm, flag4):
               sdst=-17),
         _desc(OP_ATTN_SOFTMAX, _flag(FLAG_DYNAMIC_M, FLAG_DYNAMIC_N),
               m=99, n=99, heads=3, src0=b["score"], dst=b["prob"],
-              s0=-17, sdst=SCALES["attn_uq0_8"]),
+              # s0 = -20: the vector engine requants to Q8.16 with a 4-bit
+              # shift = scale bookkeeping (score at -17 -> -16) plus the
+              # 1/sqrt(64) = 1/8 (3 extra bits). Per-tensor scales replace
+              # this with 2*qkv_out_scale - 6.
+              s0=-20, sdst=SCALES["attn_uq0_8"]),
         _desc(OP_GEMM,
               _flag(FLAG_HEAD_MODE, FLAG_SRC0_UNSIGNED, FLAG_DYNAMIC_M,
                     FLAG_DYNAMIC_K, FLAG_SRC1_SCRATCH),

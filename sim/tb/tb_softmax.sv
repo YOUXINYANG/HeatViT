@@ -251,14 +251,14 @@ module tb_softmax;
     row_x[1] = 24'sd0;
     exp_sel[0] = 17'd32768;
     exp_sel[1] = 17'd32768;
-    exp_att[0] = 8'd64;
-    exp_att[1] = 8'd64;
+    exp_att[0] = 8'd128;
+    exp_att[1] = 8'd128;
     run_selector_row(2, 4);
     run_attention_row(2, 4);
 
     row_x[0] = 24'sd12345;
     exp_sel[0] = 17'd65536;
-    exp_att[0] = 8'd128;
+    exp_att[0] = 8'd255;
     run_selector_row(1, 3);
     run_attention_row(1, 3);
 

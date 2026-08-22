@@ -44,7 +44,7 @@ SOFTMAX_LN2_Q16 = 45426
 SOFTMAX_QUAD_Q16 = 23495
 SOFTMAX_OFFSET_Q16 = 88670
 SOFTMAX_CONST_Q16 = 22544
-DELTA2_ATTENTION = 32768
+DELTA2_ATTENTION = 65536
 DELTA2_SELECTOR = 65536
 LN_D = 192
 LN_EPS_Q32 = 4295
@@ -329,11 +329,13 @@ def mhsa(x: torch.Tensor, p: BlockP, s: ScaleTable, n: int,
         vh = v[:, h * HEAD_DIM:(h + 1) * HEAD_DIM]
         acc = qh.to(torch.float64) @ kh.to(torch.float64).T
         # Two golden steps: int32 writeback at score_exp (2*act - 3, the
-        # /sqrt(64) three-bit shift), then per-element requant to Q8.16.
+        # /sqrt(64) three-bit shift), then per-element requant to Q8.16
+        # with one extra 3-bit shift for the 1/8 (effective dst exp
+        # score_exp + 4; matches the RTL ATTN_SOFTMAX s0 = score_exp - 3).
         score = requant(acc.round().to(torch.int64),
                         2 * s.activation_exp(f"b{n}_qkv_out"),
                         score_exp, 32)
-        q16 = requant(score, score_exp, -16, 24)
+        q16 = requant(score, score_exp, score_exp + 4, 24)
         prob = softmax_attention(q16)
         cacc = prob.to(torch.float64) @ vh.to(torch.float64)
         ctx = requant(cacc.round().to(torch.int64),
@@ -493,10 +495,13 @@ def token_selector(tokens: torch.Tensor, package_present: bool,
     return torch.cat(out, dim=0), package is not None
 
 
-def forward_image(model: QuantDeiT, image_float: torch.Tensor, rec=None):
+def forward_image(model: QuantDeiT, image_float: torch.Tensor, rec=None,
+                  prune: bool = True):
     """Full inference: normalized float [3,224,224] -> int32 logits.
 
     Returns (logits_int32 [1000], token_counts, logits_scale_exp).
+    ``prune=False`` skips all Token Selectors (full 197-token path, used
+    for PTQ accuracy evaluation of the quantized backbone).
     """
     s = model.scales
     inp_exp = s.activation_exp("input")
@@ -529,7 +534,7 @@ def forward_image(model: QuantDeiT, image_float: torch.Tensor, rec=None):
     for n in range(1, 13):
         in_exp = s.activation_exp("act_tokens") if n == 1 \
             else s.activation_exp(f"b{n - 1}_out")
-        if n in SELECTOR_BLOCKS:
+        if n in SELECTOR_BLOCKS and prune:
             sel_idx += 1
             tokens, package_present = token_selector(
                 tokens, package_present, model.selectors[sel_idx - 1], s,

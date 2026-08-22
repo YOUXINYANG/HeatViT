@@ -110,7 +110,9 @@ SystemVerilog；描述符调度；逐位仿真验证
 - 训练期 Gumbel-Softmax 不进入推理 RTL；推理使用确定性 Softmax 和 `0.5` 阈值。
 - Selector Head 权重分支默认采用 `3 -> 3 -> 3`，尺寸仍由描述符表达。
 - Token Package 采用论文公式 (10) 的加权平均；分母为零时采用算术平均回退。
-- Attention Softmax 使用论文的 `delta2=0.5`；Selector 二分类 Softmax 使用 `delta2=1.0`，从而保留 `0.5` 判决含义。
+- Attention Softmax 与 Selector 二分类 Softmax 均使用 `delta2=1.0`，从而保留 `0.5` 判决含义与 1.0 的概率质量。
+  （P2 修正：attention 原为 `delta2=0.5`，会把注意力概率整体减半；改为
+  `1.0` 后 UQ0.8 仍不溢出，概率和恢复为 1。）
 - 使用确定性合成权重和输入完成数值验证，不使用训练 checkpoint。
 - 使用通用行为级外部存储接口，不复现 ZCU102 的 CPU/DDR 子系统。
 
@@ -270,7 +272,7 @@ MSA 顺序为 Q/K/V 投影、三个 Head 的 `Q*K^T`、缩放、Softmax、`Atten
 
 ### 9.3 概率和中间值
 
-- Attention Softmax 输出为 8-bit unsigned UQ0.8；由于 `delta2=0.5`，最大合法值不超过 0.5。
+- Attention Softmax 输出为 8-bit unsigned UQ0.8；`delta2=1.0` 时最大合法值不超过 255/256（饱和到 255）。
 - Selector Score 和 Head Weight 使用 17-bit unsigned Q0.16，`1.0` 编码为 `65536`。
 - 非线性输入和主要中间值使用 signed 24-bit Q8.16。
 - 平方、方差、倒数和 Package 累加允许扩展到 32 或 48 bit。
@@ -314,7 +316,7 @@ GELU（Q8.16）：
 | `EXP_CONST_Q16` | 22544 |
 | `LN2_DIV_MAGIC` | 94548（`ceil(2^32 / 45426)`，仅内部实现用） |
 
-Softmax delta2（Q8.16）：`SOFTMAX_DELTA_Q16_ATTENTION = 32768`（0.5）、
+Softmax delta2（Q8.16）：`SOFTMAX_DELTA_Q16_ATTENTION = 65536`（1.0，P2 修正，原 32768）、
 `SOFTMAX_DELTA_Q16_SELECTOR = 65536`（1.0）。LayerNorm：
 `LN_EPS_Q32 = 4295`（Q16.32 的 `10^-6`）。
 
@@ -536,7 +538,7 @@ Q8.16 常量：
 | `0.3585` | 23495 |
 | `1.353` | 88670 |
 | `0.344` | 22544 |
-| Attention `delta2=0.5` | 32768 |
+| Attention `delta2=1.0`（P2 修正，原 0.5） | 65536 |
 | Selector `delta2=1.0` | 65536 |
 
 令 Q8.16 指数整数为 `E_i`、整数行和为 `S`。行和只计算一次 33-bit Q0.32 倒数，逐元素按下式计算：
@@ -1062,7 +1064,7 @@ function automatic logic signed [31:0] sat_s32(input logic signed [127:0] value)
 | `rtl/common/heatvit_gelu.sv` | 论文 GELU 定点近似 |
 | `rtl/common/heatvit_plan_sigmoid.sv` | PLAN 分段 Sigmoid |
 | `rtl/common/heatvit_softmax_core.sv` | 行缓存、最大值、指数和归一化 |
-| `rtl/common/heatvit_softmax_attention.sv` | `delta2=0.5`、UQ0.8 输出封装 |
+| `rtl/common/heatvit_softmax_attention.sv` | `delta2=1.0`（P2 修正，原 0.5）、UQ0.8 输出封装 |
 | `rtl/common/heatvit_softmax_selector.sv` | `delta2=1.0`、Q0.16 输出封装 |
 | `rtl/common/heatvit_layernorm.sv` | D=192 两遍定点 LayerNorm |
 | `verification/heatvit_ref/fixed.py` | Python 位宽、舍入、饱和和打包基准 |
@@ -1503,7 +1505,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/task_checkpoint.ps1 
 
 - [x] **Step 1: 写行级失败测试**
 
-覆盖长度 1、2、3、197；全相等值、一个明显最大值、Q8.16 负极值和输出回压。Selector 长度 2 且输入相等时两个输出必须都是 `32768`；Attention `delta2=0.5` 的单元素行输出必须是 UQ0.8 的 `128`。
+覆盖长度 1、2、3、197；全相等值、一个明显最大值、Q8.16 负极值和输出回压。Selector 长度 2 且输入相等时两个输出必须都是 `32768`；Attention `delta2=1.0` 的单元素行输出必须是 UQ0.8 的 `255`（P2 修正：原 `delta2=0.5` 时为 `128`）。
 
 - [x] **Step 2: 运行并确认 Softmax 模块缺失**
 

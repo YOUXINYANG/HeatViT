@@ -9,6 +9,7 @@ __pycache__/
 p2_test_tmp/
 p2_test_tmp_*/
 .tmp_p2_tests_*/
+p2_out/
 
 # --- Vivado / XSim generated artifacts ---
 .Xil/
