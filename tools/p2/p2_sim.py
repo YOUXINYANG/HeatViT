@@ -76,8 +76,15 @@ def sat(x: torch.Tensor, bits: int) -> torch.Tensor:
 
 
 def round_div(num: torch.Tensor, den: torch.Tensor) -> torch.Tensor:
-    """Nearest integer division, ties away from zero (positive inputs)."""
-    return (num + den // 2) // den
+    """Nearest integer division, ties away from zero (fixed.round_div).
+
+    ``den`` must be positive; negative numerators round on their magnitude
+    and restore the sign.
+    """
+    sign = torch.where(num < 0, -1, 1)
+    q, r = num.abs() // den, num.abs() % den
+    q = torch.where(2 * r >= den, q + 1, q)
+    return sign * q
 
 
 def requant(x: torch.Tensor, src_exp: int, dst_exp: int,
@@ -140,6 +147,44 @@ def softmax_selector(logits_q16: torch.Tensor) -> torch.Tensor:
     return scaled[..., 1].clamp(0, PLAN_ONE)
 
 
+def mul_rsa48(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Exact round_shift_away(a*b, 48) for |a| < 2^33, 0 <= b < 2^48.
+
+    The product needs up to 81 bits, exceeding int64; split b into 24-bit
+    halves so every intermediate stays inside int64. Ties round away from
+    zero; the sign comes from a (b is non-negative).
+    """
+    sign = torch.where(a < 0, -1, 1)
+    a_abs = a.abs()
+    hi = b >> 24
+    lo = b & ((1 << 24) - 1)
+    q_hi = a_abs * hi                      # < 2^57
+    q_lo = a_abs * lo                      # < 2^57
+    r = ((q_hi & ((1 << 24) - 1)) << 24) + (q_lo & ((1 << 48) - 1))
+    q = (q_hi >> 24) + (q_lo >> 48) + (r >> 48)
+    r = r & ((1 << 48) - 1)
+    q = torch.where(2 * r >= (1 << 48), q + 1, q)
+    return sign * q
+
+
+def rsa_sq32(m: torch.Tensor) -> torch.Tensor:
+    """Exact round_shift_away(m*m, 32) for |m| < 2^32 (no int64 overflow).
+
+    The result is always non-negative (it rounds a square).
+    """
+    a = m.abs()
+    mh = a >> 17
+    ml = a & ((1 << 17) - 1)
+    t1 = mh * mh
+    t2 = 2 * mh * ml
+    t3 = ml * ml
+    r = ((t1 << 2) & 0xFFFFFFFF) + ((t2 << 17) & 0xFFFFFFFF) \
+        + (t3 & 0xFFFFFFFF)
+    q = (t1 << 2) + (t2 >> 15) + (t3 >> 32) + (r >> 32)
+    r = r & 0xFFFFFFFF
+    return torch.where(2 * r >= (1 << 32), q + 1, q)
+
+
 def layernorm(xs: torch.Tensor, gammas: torch.Tensor, betas: torch.Tensor,
               x_exp: int, g_exp: int, b_exp: int,
               out_exp: int) -> torch.Tensor:
@@ -154,14 +199,17 @@ def layernorm(xs: torch.Tensor, gammas: torch.Tensor, betas: torch.Tensor,
     d = torch.tensor(LN_D, dtype=torch.int64, device=x64.device)
     mean = round_div(sum_x, d)
     e2 = round_div(sum_sq, d)
-    mean_sq = round_shift_away(mean * mean, 32)
+    mean_sq = rsa_sq32(mean)
     variance = (e2 - mean_sq).clamp(min=0)
     std_q16 = torch.sqrt((variance + LN_EPS_Q32).to(torch.float64)).floor().to(
         torch.int64)
     inv_std = round_div(torch.tensor(1 << 48, dtype=torch.int64,
                                      device=x64.device), std_q16)
-    norm_q16 = sat(round_shift_away((x_q32 - mean) * inv_std, 48), 24)
+    norm_q16 = sat(mul_rsa48(x_q32 - mean, inv_std), 24)
     common = min(g_exp - 16, b_exp)
+    if g_exp - 16 - common > 24 or b_exp - common > 24:
+        raise ValueError("layernorm affine scale gap exceeds sim int64 "
+                         "safety bound (24 bits)")
     aligned = ((norm_q16 * gammas.to(torch.int64))
                << (g_exp - 16 - common)) \
         + (betas.to(torch.int64) << (b_exp - common))
@@ -182,6 +230,9 @@ def gemm_int8(a: torch.Tensor, w: torch.Tensor, b: Optional[torch.Tensor],
 def residual_add(a: torch.Tensor, a_exp: int, b: torch.Tensor, b_exp: int,
                  out_exp: int) -> torch.Tensor:
     """Scale-aligned int8 residual sum (transformer._align_add_requant)."""
+    if abs(a_exp - b_exp) > 24:
+        raise ValueError("residual scale gap exceeds sim int64 safety "
+                         "bound (24 bits)")
     common = min(a_exp, b_exp)
     a_q = a.to(torch.int64) << (a_exp - common)
     b_q = b.to(torch.int64) << (b_exp - common)
@@ -250,15 +301,23 @@ class QuantDeiT:
 
 
 # ---- operator blocks ------------------------------------------------------
+def _rec(rec, name, tensor):
+    """Record a named activation into the optional collector dict."""
+    if rec is not None:
+        rec[name] = tensor.detach().cpu().clone()
+
+
 def mhsa(x: torch.Tensor, p: BlockP, s: ScaleTable, n: int,
-         x_exp: int) -> torch.Tensor:
+         x_exp: int, rec=None) -> torch.Tensor:
     """Pre-LN MHSA under per-tensor scales; x is int8 [N,192]."""
     ln1 = layernorm(x, p.gamma1, p.beta1, x_exp,
                     s.weight_exp(f"b{n}_gamma1"), s.weight_exp(f"b{n}_beta1"),
                     s.activation_exp(f"b{n}_ln1_out"))
+    _rec(rec, f"b{n}_ln1_out", ln1)
     fused = gemm_int8(ln1, p.wqkv, p.bqkv, s.activation_exp(f"b{n}_ln1_out"),
                       s.weight_exp(f"b{n}_wqkv"),
                       s.activation_exp(f"b{n}_qkv_out"), 8)
+    _rec(rec, f"b{n}_qkv_out", fused)
     q = fused[:, :D]
     k = fused[:, D:2 * D]
     v = fused[:, 2 * D:]
@@ -269,44 +328,60 @@ def mhsa(x: torch.Tensor, p: BlockP, s: ScaleTable, n: int,
         kh = k[:, h * HEAD_DIM:(h + 1) * HEAD_DIM]
         vh = v[:, h * HEAD_DIM:(h + 1) * HEAD_DIM]
         acc = qh.to(torch.float64) @ kh.to(torch.float64).T
-        score = requant(acc.round().to(torch.int64), score_exp, -16, 24)
-        prob = softmax_attention(score)
+        # Two golden steps: int32 writeback at score_exp (2*act - 3, the
+        # /sqrt(64) three-bit shift), then per-element requant to Q8.16.
+        score = requant(acc.round().to(torch.int64),
+                        2 * s.activation_exp(f"b{n}_qkv_out"),
+                        score_exp, 32)
+        q16 = requant(score, score_exp, -16, 24)
+        prob = softmax_attention(q16)
         cacc = prob.to(torch.float64) @ vh.to(torch.float64)
         ctx = requant(cacc.round().to(torch.int64),
                       -8 + s.activation_exp(f"b{n}_qkv_out"),
                       s.activation_exp(f"b{n}_context_out"), 8).to(torch.int8)
         contexts.append(ctx)
     concat = torch.cat(contexts, dim=-1)
-    return gemm_int8(concat, p.wproj, p.bproj,
-                     s.activation_exp(f"b{n}_context_out"),
-                     s.weight_exp(f"b{n}_wproj"),
-                     s.activation_exp(f"b{n}_msa_out"), 8)
+    _rec(rec, f"b{n}_context_out", concat)
+    out = gemm_int8(concat, p.wproj, p.bproj,
+                    s.activation_exp(f"b{n}_context_out"),
+                    s.weight_exp(f"b{n}_wproj"),
+                    s.activation_exp(f"b{n}_msa_out"), 8)
+    _rec(rec, f"b{n}_msa_out", out)
+    return out
 
 
-def ffn(y: torch.Tensor, p: BlockP, s: ScaleTable, n: int) -> torch.Tensor:
+def ffn(y: torch.Tensor, p: BlockP, s: ScaleTable, n: int,
+        rec=None) -> torch.Tensor:
     ln2 = layernorm(y, p.gamma2, p.beta2, s.activation_exp(f"b{n}_y"),
                     s.weight_exp(f"b{n}_gamma2"), s.weight_exp(f"b{n}_beta2"),
                     s.activation_exp(f"b{n}_ln2_out"))
+    _rec(rec, f"b{n}_ln2_out", ln2)
     acc = ln2.to(torch.float64) @ p.w1.to(torch.float64) \
         + p.b1.to(torch.float64)
     src_exp = s.activation_exp(f"b{n}_ln2_out") + s.weight_exp(f"b{n}_w1")
     q16 = requant(acc.round().to(torch.int64), src_exp, -16, 24)
     hidden = requant(gelu_q16(q16), -16, s.activation_exp(f"b{n}_hidden"), 8)
-    return gemm_int8(hidden, p.w2, p.b2, s.activation_exp(f"b{n}_hidden"),
-                     s.weight_exp(f"b{n}_w2"),
-                     s.activation_exp(f"b{n}_ffn_out"), 8)
+    _rec(rec, f"b{n}_hidden", hidden)
+    out = gemm_int8(hidden, p.w2, p.b2, s.activation_exp(f"b{n}_hidden"),
+                    s.weight_exp(f"b{n}_w2"),
+                    s.activation_exp(f"b{n}_ffn_out"), 8)
+    _rec(rec, f"b{n}_ffn_out", out)
+    return out
 
 
 def transformer_block(x: torch.Tensor, p: BlockP, s: ScaleTable, n: int,
-                      x_exp: int) -> torch.Tensor:
+                      x_exp: int, rec=None) -> torch.Tensor:
     """Y = X + MSA(LN1(X)); Z = Y + FFN(LN2(Y)). Returns Z int8."""
-    msa_out = mhsa(x, p, s, n, x_exp)
+    msa_out = mhsa(x, p, s, n, x_exp, rec)
     y = residual_add(x, x_exp, msa_out, s.activation_exp(f"b{n}_msa_out"),
                      s.activation_exp(f"b{n}_y"))
-    ffn_out = ffn(y, p, s, n)
-    return residual_add(y, s.activation_exp(f"b{n}_y"), ffn_out,
-                        s.activation_exp(f"b{n}_ffn_out"),
-                        s.activation_exp(f"b{n}_out"))
+    _rec(rec, f"b{n}_y", y)
+    ffn_out = ffn(y, p, s, n, rec)
+    z = residual_add(y, s.activation_exp(f"b{n}_y"), ffn_out,
+                     s.activation_exp(f"b{n}_ffn_out"),
+                     s.activation_exp(f"b{n}_out"))
+    _rec(rec, f"b{n}_out", z)
+    return z
 
 
 def _head_gemm_gelu(a: torch.Tensor, w: torch.Tensor, b: torch.Tensor,
@@ -418,7 +493,7 @@ def token_selector(tokens: torch.Tensor, package_present: bool,
     return torch.cat(out, dim=0), package is not None
 
 
-def forward_image(model: QuantDeiT, image_float: torch.Tensor):
+def forward_image(model: QuantDeiT, image_float: torch.Tensor, rec=None):
     """Full inference: normalized float [3,224,224] -> int32 logits.
 
     Returns (logits_int32 [1000], token_counts, logits_scale_exp).
@@ -427,11 +502,17 @@ def forward_image(model: QuantDeiT, image_float: torch.Tensor):
     inp_exp = s.activation_exp("input")
     img_q = torch.clamp(torch.round(image_float / (2.0 ** inp_exp)),
                         -128, 127).to(torch.int8)
-    patches = img_q.permute(1, 2, 0).reshape(196, 768)
+    # NHWC patchify: [224,224,3] -> 14x14 grid of 16x16 patches, each
+    # flattened as (in_row, in_col, channel) in raster patch order.
+    img_nhwc = img_q.permute(1, 2, 0)
+    patches = img_nhwc.reshape(14, 16, 14, 16, 3) \
+        .permute(0, 2, 1, 3, 4).reshape(196, 768)
+    _rec(rec, "act_patch_matrix", patches)
 
     embed = gemm_int8(patches, model.patch_w, model.patch_b, inp_exp,
                       s.weight_exp("patch_w"),
                       s.activation_exp("act_patch_embed"), 8)
+    _rec(rec, "act_patch_embed", embed)
     cls_exp = s.weight_exp("cls")
     pos_exp = s.weight_exp("pos")
     out_exp = s.activation_exp("act_tokens")
@@ -440,6 +521,7 @@ def forward_image(model: QuantDeiT, image_float: torch.Tensor):
     rows1 = residual_add(embed, s.activation_exp("act_patch_embed"),
                          model.pos[1:], pos_exp, out_exp)
     tokens = torch.cat([row0, rows1], dim=0)
+    _rec(rec, "act_tokens", tokens)
 
     package_present = False
     token_counts = [tokens.shape[0]]
@@ -453,13 +535,15 @@ def forward_image(model: QuantDeiT, image_float: torch.Tensor):
                 tokens, package_present, model.selectors[sel_idx - 1], s,
                 sel_idx, in_exp)
             token_counts.append(tokens.shape[0])
-        tokens = transformer_block(tokens, model.blocks[n - 1], s, n, in_exp)
+        tokens = transformer_block(tokens, model.blocks[n - 1], s, n, in_exp,
+                                   rec)
 
     final_ln = layernorm(tokens, model.final_gamma, model.final_beta,
                          s.activation_exp("b12_out"),
                          s.weight_exp("final_gamma"),
                          s.weight_exp("final_beta"),
                          s.activation_exp("final_ln_out"))
+    _rec(rec, "final_ln_out", final_ln)
     logits = gemm_int8(final_ln[:1], model.head_w, model.head_b,
                        s.activation_exp("final_ln_out"),
                        s.weight_exp("head_w"), LOGIT_SCALE_EXP, 32)
