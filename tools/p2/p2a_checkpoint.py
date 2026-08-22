@@ -22,11 +22,16 @@ import torch
 def build_timm_deit_tiny(device):
     import timm
     model = timm.create_model("deit_tiny_patch16_224", pretrained=False)
-    state = torch.load(
+    raw = torch.load(
         r"C:\Users\Youxi\.cache\torch\hub\checkpoints"
         r"\deit_tiny_patch16_224-a1311bcf.pth",
-        map_location="cpu", weights_only=True,
+        map_location="cpu", weights_only=False,
     )
+    state = raw.get("model", raw) if isinstance(raw, dict) else raw
+    extra = {k: v for k, v in raw.items() if k != "model"} \
+        if isinstance(raw, dict) else {}
+    if extra:
+        print(f"checkpoint metadata: {extra}")
     missing, unexpected = model.load_state_dict(state, strict=True)
     assert not missing and not unexpected, (missing, unexpected)
     model = model.to(device).eval()
@@ -62,7 +67,7 @@ def main():
     indices = range(min(args.max_images, len(dataset)))
     subset = torch.utils.data.Subset(dataset, indices)
     loader = torch.utils.data.DataLoader(subset, batch_size=args.batch_size,
-                                         shuffle=False, num_workers=2)
+                                         shuffle=False, num_workers=0)
 
     correct = 0
     total = 0
