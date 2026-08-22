@@ -1,8 +1,13 @@
 # --- Python ---
 .venv/
+.venv-torch/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# P2 scratch dirs (sandbox may leave mkdtemp leftovers unremovable)
+p2_test_tmp/
+p2_test_tmp_*/
 
 # --- Vivado / XSim generated artifacts ---
 .Xil/
