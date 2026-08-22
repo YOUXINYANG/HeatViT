@@ -15,8 +15,8 @@ package e2e_tb_config_pkg;
   localparam int WATCHDOG_CYCLES = 795000000;
   localparam int OUTPUT_SCALE_EXP = -14;
 
-  localparam int SELECTOR_IN_N [0:2] = '{197, 88, 46};
-  localparam int SELECTOR_OUT_N [0:2] = '{88, 46, 33};
+  localparam int SELECTOR_IN_N [0:2] = '{197, 88, 45};
+  localparam int SELECTOR_OUT_N [0:2] = '{88, 45, 35};
   localparam int SELECTOR_PACKAGE [0:2] = '{1, 1, 1};
 
   localparam int CHECKPOINT_DESC_INDEX [0:17] = '{2, 15, 28, 41, 53, 66, 79, 92, 104, 117, 130, 143, 155, 168, 181, 194, 195, 196};
@@ -40,7 +40,7 @@ package e2e_tb_config_pkg;
       32'h02182208,
       32'h03000000
   };
-  localparam int CHECKPOINT_BYTES [0:17] = '{37824, 37824, 37824, 37824, 16896, 16896, 16896, 16896, 8832, 8832, 8832, 8832, 6336, 6336, 6336, 6336, 6336, 4000};
+  localparam int CHECKPOINT_BYTES [0:17] = '{37824, 37824, 37824, 37824, 16896, 16896, 16896, 16896, 8640, 8640, 8640, 8640, 6720, 6720, 6720, 6720, 6720, 4000};
   localparam logic signed [5:0] CHECKPOINT_SCALE [0:17] = '{
       -6'sd7,
       -6'sd7,

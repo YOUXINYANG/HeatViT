@@ -82,9 +82,11 @@ class PlanSigmoidTest(unittest.TestCase):
 
 
 class SoftmaxTest(unittest.TestCase):
-    def test_attention_single_element_is_half(self):
+    def test_attention_single_element_is_one(self):
+        # P2 fix: attention delta2 = 1.0, single-element row saturates
+        # UQ0.8 to 255 (was 128 under the old halving delta2 = 0.5).
         for row in ([0], [12345], [Q8_16_MIN], [Q8_16_MAX]):
-            self.assertEqual(softmax_attention(row), [128])
+            self.assertEqual(softmax_attention(row), [255])
 
     def test_selector_single_element_is_one(self):
         for row in ([0], [12345], [Q8_16_MIN], [Q8_16_MAX]):

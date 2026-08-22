@@ -200,26 +200,57 @@ def initial_scale_table(floats):
     return ScaleTable(weights=weights, activations=acts)
 
 
+def _pick_exp_mse(hist, centers, clamp_le_zero=False):
+    """Choose the scale exponent minimizing quantization MSE.
+
+    ``hist`` is a histogram over the fixed grid ``centers``; for each
+    candidate exponent e the MSE of round(clamp(x/2^e)) * 2^e against x is
+    evaluated exactly (out-of-range mass is clamped). Returns the optimal
+    exponent in [-32, 31] (optionally <= 0).
+    """
+    hist = hist.to(torch.float64)
+    best_exp, best_mse = None, None
+    lo_e, hi_e = (-32, 0) if clamp_le_zero else (-32, 4)
+    for e in range(lo_e, hi_e + 1):
+        step = 2.0 ** e
+        q = torch.clamp(torch.round(centers / step), -128, 127) * step
+        mse = ((q - centers) ** 2 * hist).sum().item()
+        if best_mse is None or mse < best_mse:
+            best_mse, best_exp = mse, e
+    return best_exp
+
+
+HIST_BINS = 4096
+HIST_LO, HIST_HI = -64.0, 64.0
+HIST_CENTERS = None  # filled lazily
+
+
 def calibrate_float(state, images, device, batch_size=64):
-    """Collect true float activation ranges via forward hooks.
+    """Collect float activation histograms and pick MSE-optimal exponents.
 
     Measuring the *quantized* activations is biased (values saturate at
     127 and the range estimate collapses), so calibration runs the float
     timm model and hooks the exact tensor positions that the RTL contract
-    names. One pass, no iteration.
+    names. One pass; the per-tensor exponent minimizes quantization MSE on
+    the calibration histogram (max-based exponents waste bits on outliers).
     """
+    global HIST_CENTERS
+    if HIST_CENTERS is None:
+        HIST_CENTERS = torch.linspace(HIST_LO, HIST_HI, HIST_BINS,
+                                      dtype=torch.float64)
     import timm
     model = timm.create_model("deit_tiny_patch16_224", pretrained=False)
     model.load_state_dict(state, strict=True)
     model = model.to(device).eval()
 
-    max_abs = {name: 0.0 for name in ACTIVATION_NAMES}
+    hist = {name: torch.zeros(HIST_BINS, dtype=torch.float64)
+            for name in ACTIVATION_NAMES}
     block_inputs = {}
 
     def upd(name, tensor):
-        v = tensor.detach().abs().max().item()
-        if v > max_abs[name]:
-            max_abs[name] = v
+        h = tensor.detach().float().reshape(-1).histc(
+            bins=HIST_BINS, min=HIST_LO, max=HIST_HI).to(torch.float64).cpu()
+        hist[name] += h
 
     hooks = []
 
@@ -277,14 +308,11 @@ def calibrate_float(state, images, device, batch_size=64):
 
     acts = {}
     for name in ACTIVATION_NAMES:
-        v = max_abs.get(name, 0.0)
-        if name.startswith("s") or v <= 0:
+        if name.startswith("s") or hist[name].sum().item() <= 0:
             acts[name] = -7
             continue
-        exp = max(-32, min(31, math.ceil(math.log2(v / 127.0))))
-        if name in LN_INPUT_NAMES or name == "input":
-            exp = min(exp, 0)
-        acts[name] = exp
+        clamp0 = name in LN_INPUT_NAMES or name == "input"
+        acts[name] = _pick_exp_mse(hist[name], HIST_CENTERS, clamp0)
     return acts
 
 

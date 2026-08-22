@@ -212,10 +212,13 @@ class TransformerTest(unittest.TestCase):
         self.assertNotEqual(ck["prob"][1], ck["prob"][2])
 
         # The dominant row catches a missing unsigned-src0 flag downstream.
-        self.assertEqual(ck["prob"][0][0][0], 128)
-        # V is identity, so prob=128 times V[0][0]=127 requantizes to 64 under
-        # unsigned interpretation (signed interpretation would give -64).
-        self.assertEqual(ck["context"][0][0][0], 64)
+        # (P2 fix: attention delta2 = 1.0, so the single dominant row
+        # saturates UQ0.8 to 255 instead of the old 128.)
+        self.assertEqual(ck["prob"][0][0][0], 255)
+        # V is identity, so prob=255 times V[0][0]=127 requantizes to 127
+        # under unsigned interpretation (signed interpretation would
+        # give -127).
+        self.assertEqual(ck["context"][0][0][0], 127)
         # weight_scale=0 plus identity projection makes output equal concat.
         self.assertEqual(output, ck["concat"])
 
