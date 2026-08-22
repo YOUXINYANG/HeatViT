@@ -295,34 +295,30 @@ def export_selector(sel, device, stage):
     out["hw_w2"] = sel.head_weight[2].weight.data.detach().cpu().t()
     out["hw_b2"] = sel.head_weight[2].bias.data.detach().cpu()
 
+    # The RTL/golden selector path uses uniform scale exp -7 for all
+    # selector weights (descriptor SCALES), so quantize at -7 exactly
+    # rather than per-tensor exponents.
     q = {}
     q[f"local_w"] = torch.stack(
-        [quantize_int8(out[f"local_w{h}"], pick_weight_exp(out[f"local_w{h}"]))
-         for h in range(3)])
+        [quantize_int8(out[f"local_w{h}"], -7) for h in range(3)])
     q[f"local_b"] = torch.stack(
-        [quantize_bias(out[f"local_b{h}"], -7 - 7) for h in range(3)])
+        [quantize_bias(out[f"local_b{h}"], -14) for h in range(3)])
     q["score_w1"] = torch.stack(
-        [quantize_int8(out[f"score_w1_{h}"],
-                       pick_weight_exp(out[f"score_w1_{h}"]))
-         for h in range(3)])
+        [quantize_int8(out[f"score_w1_{h}"], -7) for h in range(3)])
     q["score_b1"] = torch.stack(
-        [quantize_bias(out[f"score_b1_{h}"], -7 - 7) for h in range(3)])
+        [quantize_bias(out[f"score_b1_{h}"], -14) for h in range(3)])
     q["score_w2"] = torch.stack(
-        [quantize_int8(out[f"score_w2_{h}"],
-                       pick_weight_exp(out[f"score_w2_{h}"]))
-         for h in range(3)])
+        [quantize_int8(out[f"score_w2_{h}"], -7) for h in range(3)])
     q["score_b2"] = torch.stack(
-        [quantize_bias(out[f"score_b2_{h}"], -7 - 7) for h in range(3)])
+        [quantize_bias(out[f"score_b2_{h}"], -14) for h in range(3)])
     q["score_w3"] = torch.stack(
-        [quantize_int8(out[f"score_w3_{h}"],
-                       pick_weight_exp(out[f"score_w3_{h}"]))
-         for h in range(3)])
+        [quantize_int8(out[f"score_w3_{h}"], -7) for h in range(3)])
     q["score_b3"] = torch.stack(
-        [quantize_bias(out[f"score_b3_{h}"], -7 - 7) for h in range(3)])
-    q["hw_w1"] = quantize_int8(out["hw_w1"], pick_weight_exp(out["hw_w1"]))
-    q["hw_b1"] = quantize_bias(out["hw_b1"], -7 - 7)
-    q["hw_w2"] = quantize_int8(out["hw_w2"], pick_weight_exp(out["hw_w2"]))
-    q["hw_b2"] = quantize_bias(out["hw_b2"], -7 - 7)
+        [quantize_bias(out[f"score_b3_{h}"], -14) for h in range(3)])
+    q["hw_w1"] = quantize_int8(out["hw_w1"], -7)
+    q["hw_b1"] = quantize_bias(out["hw_b1"], -14)
+    q["hw_w2"] = quantize_int8(out["hw_w2"], -7)
+    q["hw_b2"] = quantize_bias(out["hw_b2"], -14)
     return q
 
 
@@ -399,7 +395,8 @@ def main():
 
     out_path = REPO_ROOT / args.out
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"selectors": [], "table": dict(table.activations)}
+    payload = {"selectors": [], "table": dict(table.activations),
+               "selectors_float": [s.state_dict() for s in selectors]}
     for sel in selectors:
         payload["selectors"].append(export_selector(sel, device, None))
     torch.save(payload, out_path)

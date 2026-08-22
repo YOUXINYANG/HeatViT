@@ -8,7 +8,7 @@ never used, matching the bit-exact integer reference discipline.
 
 from dataclasses import dataclass
 
-from .gemm import gemm
+from .gemm import gemm, gemm_writeback
 from .nonlinear import layernorm
 from .selector import SelectorParams, token_selector
 from .transformer import (
@@ -104,8 +104,15 @@ class HeatViTModel:
             params.blocks[-1].ffn.out_scale_exp,
             params.final_gamma_scale_exp, params.final_beta_scale_exp,
             params.final_ln_out_scale_exp)
-        logits = gemm([final_ln[0]], [list(row) for row in params.head_w],
-                      list(params.head_b), False)[0]
+        # P2 per-tensor: the head GEMM accumulator sits at
+        # final_ln_out + head_w; write back to the fixed logit scale.
+        logits = gemm_writeback(
+            gemm([final_ln[0]], [list(row) for row in params.head_w],
+                 list(params.head_b), False),
+            params.final_ln_out_scale_exp + params.head_w_scale_exp,
+            LOGIT_SCALE_EXP,
+            32,
+        )[0]
         checkpoints["final_ln"] = final_ln
         checkpoints["logits"] = list(logits)
         return ModelResult(

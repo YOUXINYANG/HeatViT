@@ -233,6 +233,81 @@ def checkpoint_layout_real(mm, token_counts, table):
     return layout
 
 
+def calibrate_selector_biases(params, image, targets=(86, 43, 30)):
+    """Shift each stage's keep-logit bias so the 0.5 threshold keeps the
+    target number of normal tokens (mirrors weights.py calibrate_selector).
+
+    The pipeline prefix is computed once; per stage only the selector runs
+    for each candidate delta, so the scan is fast. Deltas are geometric
+    (real shifts of the keep logit).
+    """
+    import dataclasses
+
+    from verification.heatvit_ref.selector import token_selector
+    from verification.heatvit_ref.transformer import (
+        patch_embedding,
+        transformer_block,
+    )
+
+    grid = [int(shift * (1 << 14)) for shift in
+            (-16.0, -8.0, -4.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0,
+             4.0, 8.0, 16.0, 32.0)]
+
+    x = patch_embedding(image, params.patch)
+    package_present = False
+    sel_idx = 0
+    for block_number in range(1, 13):
+        if block_number in (4, 7, 10):
+            stage = sel_idx
+            target = targets[stage]
+            best = None
+            for delta in grid:
+                p = dataclasses.replace(params)
+                selectors = list(p.selectors)
+                sel = selectors[stage]
+                score = dataclasses.replace(
+                    sel.score,
+                    b3=tuple(tuple(v + delta if c == 0 else v
+                                   for c, v in enumerate(row))
+                             for row in sel.score.b3))
+                selectors[stage] = dataclasses.replace(sel, score=score)
+                p = dataclasses.replace(p, selectors=tuple(selectors))
+                try:
+                    res = token_selector(x, package_present,
+                                         p.selectors[stage])
+                except ValueError:
+                    continue
+                if res.kept_normal_count >= 1 \
+                        and res.pruned_normal_count >= 2:
+                    if best is None or abs(
+                            res.kept_normal_count - target) < abs(
+                                best[0] - target):
+                        best = (res.kept_normal_count, delta)
+            if best is None:
+                raise RuntimeError(
+                    f"selector stage {stage + 1} calibration failed")
+            delta = best[1]
+            p = dataclasses.replace(params)
+            selectors = list(p.selectors)
+            sel = selectors[stage]
+            score = dataclasses.replace(
+                sel.score,
+                b3=tuple(tuple(v + delta if c == 0 else v
+                               for c, v in enumerate(row))
+                         for row in sel.score.b3))
+            selectors[stage] = dataclasses.replace(sel, score=score)
+            params = dataclasses.replace(p, selectors=tuple(selectors))
+            res = token_selector(x, package_present, params.selectors[stage])
+            print(f"stage {stage + 1}: delta={delta} "
+                  f"kept={res.kept_normal_count} "
+                  f"pruned={res.pruned_normal_count}")
+            x = res.tokens
+            package_present = res.package_present
+            sel_idx += 1
+        x, _ = transformer_block(x, params.blocks[block_number - 1])
+    return params
+
+
 def export_one(outdir, image, params, table, scale_table):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -330,6 +405,10 @@ def main():
                              "with the per-tensor scale table (do this only "
                              "when no other XSim run is pending, since the "
                              "ROM is read at simulation time 0)")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="per-stage keep-bias calibration toward the "
+                             "paper token targets (needed for trained "
+                             "selectors that over-prune)")
     args = parser.parse_args()
 
     table = ScaleTable.load(REPO_ROOT / args.table)
@@ -356,8 +435,10 @@ def main():
 
     for i, img in enumerate(images):
         image = real_image_list(img, table)
+        params_out = calibrate_selector_biases(params, image) \
+            if args.calibrate else params
         export_one(Path(args.output) / f"img{i}",
-                   image, params, table, table)
+                   image, params_out, table, table)
     print("done")
 
 

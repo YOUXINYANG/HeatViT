@@ -44,6 +44,7 @@ class ModelTest(unittest.TestCase):
         params.final_gamma_scale_exp = -6
         params.final_beta_scale_exp = -7
         params.final_ln_out_scale_exp = -7
+        params.head_w_scale_exp = -7
         params.blocks[-1].ffn.out_scale_exp = -7
 
         with mock.patch(
