@@ -22,24 +22,32 @@ class GeluTest(unittest.TestCase):
         self.assertEqual(gelu(0), 0)
 
     def test_known_quantized_values(self):
+        # I-ViT ShiftGELU (ln2 slope) anchors, computed by the golden
+        # function itself; cross-checked against the torch simulator
+        # (20000 random inputs, 0 mismatches) and against float GELU
+        # (gelu(1.0) = 0.838 vs 0.841, gelu(-128.0) = 0 vs ~0).
         self.assertEqual(gelu(0), 0)
         self.assertEqual(gelu(1), 1)
         self.assertEqual(gelu(-1), 0)
-        self.assertEqual(gelu(32768), 19836)
-        self.assertEqual(gelu(-32768), -12932)
-        self.assertEqual(gelu(163965), 122974)
-        self.assertEqual(gelu(-163965), -40991)
-        self.assertEqual(gelu(8388607), 6291455)
-        self.assertEqual(gelu(-8388608), -2097152)
+        self.assertEqual(gelu(32768), 22817)
+        self.assertEqual(gelu(-32768), -9802)
+        self.assertEqual(gelu(163965), 161556)
+        self.assertEqual(gelu(-163965), -2404)
+        self.assertEqual(gelu(8388607), 8323583)
+        self.assertEqual(gelu(-8388608), 0)
 
     def test_min_max_stay_in_range(self):
         for x in (Q8_16_MIN, Q8_16_MAX):
             self.assertGreaterEqual(gelu(x), Q8_16_MIN)
             self.assertLessEqual(gelu(x), Q8_16_MAX)
 
-    def test_monotonic_non_decreasing(self):
+    def test_monotonic_non_decreasing_for_non_negative(self):
+        # x*sigmoid(1.702x) is monotonic for x >= 0; for negative x the
+        # sigmoid approximation has a mild dip (minimum ~-0.16 at x~-0.75,
+        # true GELU min ~-0.17), so monotonicity is only asserted on the
+        # non-negative half where GELU acts as a ReLU-like gain.
         previous = None
-        for x in range(-40, 41):
+        for x in range(0, 41):
             y = gelu(x * 4096)
             if previous is not None:
                 self.assertGreaterEqual(y, previous)

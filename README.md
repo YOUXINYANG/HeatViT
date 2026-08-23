@@ -100,17 +100,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -
 ```
 
 > 只有显式加 `-RegenerateVectors` 才会重新生成端到端向量，防止失败重跑时误换期望值。
-> 全套回归预计时长：端到端两轮各约 35–40 分钟（实测 175.5M / 198.5M 周期），其余套件分钟级到二十余分钟。成功输出 `TEST_PASS <Top>`。
+> 全套回归预计时长：端到端两轮各约 45–55 分钟（实测 225.3M / 249.7M 周期，2026-08-23
+> ShiftGELU 契约），其余套件分钟级到二十余分钟。成功输出 `TEST_PASS <Top>`。
 
 ## 验证结果（实测摘要）
 
 | 项目 | 结果 |
 | --- | --- |
 | 18 个检查点 + 1000 个 Logit | 与整数黄金模型**逐字节一致**（零容差） |
-| 端到端 · 无回压 | PASS · 175,478,117 周期 |
-| 端到端 · 伪随机回压（STALL_MASK=3） | PASS · 198,522,559 周期 |
+| 端到端 · 无回压 | PASS · 225,312,221 周期（2026-08-23 ShiftGELU 契约） |
+| 端到端 · 伪随机回压（STALL_MASK=3） | PASS · 249,735,346 周期 |
 | 错误码 1–7 / 警告位 0–2 | 10 个注入案例全部命中一次并通过 |
-| Watchdog | 795,000,000 周期（≈4× 实测最坏情况） |
+| Watchdog | 1,000,000,000 周期（≈4× 实测最坏情况） |
 | Vivado IP 审计 | `NO_MANUAL_VIVADO_IP_REQUIRED`（0 个手工 IP） |
 | 全套回归 `-Suite all` | 退出码 0 |
 
@@ -132,8 +133,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -
 - [x] **P0** 版本控制与基线 tag `v1.0.0-sim`
 - [ ] **P1** 综合 + 布局布线：资源利用率（LUT/BRAM/DSP48E1）、时序收敛、功耗初评与 FPS 估算
 - [x] **P2** 真实 DeiT-T 权重 + PTQ 量化 + ImageNet 精度验证（机制完成；精度结论见下）
+- [x] **P2 精度优化** I-ViT 整数量化方法融合（ShiftGELU 主导：0.82% → 76.34% @5k；详见 §13.7）
+- [x] **P2 精度优化·RTL 同步** ShiftGELU-ln2 落 RTL（`heatvit_gelu.sv` 重写为 shift-exp 核 + 局部除法器，黄金模型/向量/契约同步；详见 §13.8）
 - [ ] **P3** 上板验证：ZCU102 + MIG/DDR + 主机接口
-- [ ] **P2+** 量化感知训练（QAT）或每通道尺度扩展——P2 结论显示论文级精度需要二者之一
+- [ ] **P2+** 补齐剩余 −3.9pp：每通道 LN 输出重参数化（RepQ-ViT 式）或 QAT；Shiftmax/Newton LN 硬件简化项评估；Selector 按新 GELU 契约重训
 
 ## P2：真实 DeiT-T 权重结果（2026-08-23）
 
@@ -151,6 +154,32 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -
 契约在纯 PTQ 下仅达 ~1–2% 精度（LN 尾部裁剪 + 注意力误差放大 + 12 块复利），
 论文 71.9% 依赖其未公开的量化方案（几乎必然包含 QAT）。达到论文级精度需要
 **QAT 或契约扩展**，建议作为后续阶段。详见 `docs/heatvit.md` 第二部分 §13.6。
+
+## P2 精度优化：I-ViT 整数量化方法融合（2026-08-23）
+
+把 I-ViT（ICCV 2023）的 Shiftmax / ShiftGELU / I-LayerNorm 融合进现有
+PTQ 流程（`tools/p2/p2_sim_ivit.py` + `tools/p2/p2_ivit.py`，消融矩阵 +
+单元自检），结果如下（ImageNet val 前 3000/5000 张，float 同子集
+80.37% / 80.22%）：
+
+| 配置 | 3k Top-1 | 5k Top-1 |
+| --- | ---: | ---: |
+| 契约基线（§13.6 方案复现） | 1.37% | — |
+| + ShiftGELU（I-ViT 整数 GELU，斜率 1/2） | 73.73% | 74.04% |
+| + ShiftGELU（斜率 11/16 ≈ ln2 细化） | 76.40% | 76.06% |
+| **i-vit 三件套（ShiftGELU-ln2 + Shiftmax + I-LayerNorm）** | **76.20%** | **76.34%** |
+| + 每通道权重（契约扩展轴） | 73.83% | 74.18% |
+| 仅 Shiftmax / 仅放宽 LN 输入尺度 | 1.1–1.3% / 1.37% | —（中性/零效应） |
+
+**关键结论**：量化精度从 0.82% 提升到 **76.34%**（5k，float −3.9pp），
+约 55 个百分点——**几乎全部来自 ShiftGELU**。根因是契约 GELU 的
+`δ1=0.5` 正则化近似（HeatViT 论文式 (11)(12)）对冻结的官方 DeiT-T
+权重构成系统性 ~25% 增益失真（`GELU_aprx(x→∞)=0.75x`），该失真在
+合成权重逐位自洽验证下不可见；论文的 71.9% 是在训练中带着近似学到的。
+Shiftmax 与 I-LayerNorm 精度中性但硬件形态更优（纯移位 / 固定 10 拍
+迭代）。剩余 −3.9pp 差距归因于 int8 激活逐张量尾裁剪（LN 输出离群通道、
+深块残差）与注意力 UQ0.8，补齐需 RepQ-ViT 式每通道 LN 输出重参数化或
+QAT。详见 `docs/heatvit.md` 第二部分 §13.7。
 
 ## 文档
 

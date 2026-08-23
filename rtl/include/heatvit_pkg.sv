@@ -124,10 +124,15 @@ package heatvit_pkg;
   // ---------------------------------------------------------------------
   // Fixed-point constants
   // ---------------------------------------------------------------------
-  localparam int GELU_A_Q16        = -18927;
-  localparam int GELU_B_Q16        = -115933;
-  localparam int GELU_DELTA_Q16    = 32768;
-  localparam int INV_SQRT2_Q16     = 46341;
+  // GELU = I-ViT ShiftGELU (ln2-slope refinement), see heatvit_gelu.sv:
+  //   i_p = x + (x>>1) + (x>>3) + (x>>4)   [1.702x, (1.1011)b]
+  //   i_p2 = i_p + (i_p>>1) - (i_p>>4)     [* log2(e), (1.0111)b]
+  //   frac = (r * 11 + 15) >> 4            [2^x linear approx, slope 11/16]
+  localparam int GELU_SLOPE_NUM_Q16    = 11;
+  localparam int GELU_SLOPE_SHIFT      = 4;
+  localparam int GELU_SLOPE_ROUND_ADD  = 15;
+  localparam int GELU_EXP_NEG_Q_MAX    = 16;  // e underflows at q > 16
+  localparam int GELU_EXP_POS_Q_MAX    = 7;   // e saturates at q > 7
   localparam int EXP_LN2_Q16       = 45426;
   localparam int EXP_QUAD_Q16      = 23495;
   localparam int EXP_OFFSET_Q16    = 88670;

@@ -200,17 +200,19 @@ def initial_scale_table(floats):
     return ScaleTable(weights=weights, activations=acts)
 
 
-def _pick_exp_mse(hist, centers, clamp_le_zero=False):
+def _pick_exp_mse(hist, centers, hi_exp=None):
     """Choose the scale exponent minimizing quantization MSE.
 
     ``hist`` is a histogram over the fixed grid ``centers``; for each
     candidate exponent e the MSE of round(clamp(x/2^e)) * 2^e against x is
     evaluated exactly (out-of-range mass is clamped). Returns the optimal
-    exponent in [-32, 31] (optionally <= 0).
+    exponent in [-32, 31]. ``hi_exp`` bounds the search: None = 4
+    (non-LN tensors), an int = hard upper bound (0 for the original LN
+    input contract, positive for the relaxed I-ViT variant).
     """
     hist = hist.to(torch.float64)
     best_exp, best_mse = None, None
-    lo_e, hi_e = (-32, 0) if clamp_le_zero else (-32, 4)
+    lo_e, hi_e = -32, 4 if hi_exp is None else hi_exp
     for e in range(lo_e, hi_e + 1):
         step = 2.0 ** e
         q = torch.clamp(torch.round(centers / step), -128, 127) * step
@@ -225,31 +227,32 @@ HIST_LO, HIST_HI = -64.0, 64.0
 HIST_CENTERS = None  # filled lazily
 
 
-def calibrate_float(state, images, device, batch_size=64):
-    """Collect float activation histograms and pick MSE-optimal exponents.
+def _get_centers(hist_hi, hist_bins):
+    return torch.linspace(-hist_hi, hist_hi, hist_bins, dtype=torch.float64)
 
-    Measuring the *quantized* activations is biased (values saturate at
-    127 and the range estimate collapses), so calibration runs the float
-    timm model and hooks the exact tensor positions that the RTL contract
-    names. One pass; the per-tensor exponent minimizes quantization MSE on
-    the calibration histogram (max-based exponents waste bits on outliers).
+
+def collect_float_histograms(state, images, device, batch_size=64,
+                             hist_hi=64.0, hist_bins=4096):
+    """Collect float activation histograms for all ACTIVATION_NAMES.
+
+    Same hook positions as :func:`calibrate_float`; returns
+    ``(histograms, centers)`` so several scale-table variants (e.g. the
+    relaxed I-ViT LayerNorm input contract) can be derived from one float
+    pass.
     """
-    global HIST_CENTERS
-    if HIST_CENTERS is None:
-        HIST_CENTERS = torch.linspace(HIST_LO, HIST_HI, HIST_BINS,
-                                      dtype=torch.float64)
     import timm
     model = timm.create_model("deit_tiny_patch16_224", pretrained=False)
     model.load_state_dict(state, strict=True)
     model = model.to(device).eval()
 
-    hist = {name: torch.zeros(HIST_BINS, dtype=torch.float64)
+    hist = {name: torch.zeros(hist_bins, dtype=torch.float64)
             for name in ACTIVATION_NAMES}
     block_inputs = {}
 
     def upd(name, tensor):
         h = tensor.detach().float().reshape(-1).histc(
-            bins=HIST_BINS, min=HIST_LO, max=HIST_HI).to(torch.float64).cpu()
+            bins=hist_bins, min=-hist_hi, max=hist_hi).to(
+            torch.float64).cpu()
         hist[name] += h
 
     hooks = []
@@ -305,15 +308,43 @@ def calibrate_float(state, images, device, batch_size=64):
     finally:
         for h in hooks:
             h.remove()
+    return hist, _get_centers(hist_hi, hist_bins)
 
+
+def pick_activation_exps(hist, centers, ln_clamp_max=0):
+    """Pick MSE-optimal activation exponents from collected histograms.
+
+    ``ln_clamp_max`` bounds the chosen exponent of LayerNorm input
+    tensors (``act_tokens``, ``b<N>_y``, ``b<N>_out``); the original P2-B
+    contract uses 0 (range +-127), the relaxed I-ViT variant allows
+    positive exponents so the residual streams are not clipped.
+    """
     acts = {}
     for name in ACTIVATION_NAMES:
         if name.startswith("s") or hist[name].sum().item() <= 0:
             acts[name] = -7
             continue
-        clamp0 = name in LN_INPUT_NAMES or name == "input"
-        acts[name] = _pick_exp_mse(hist[name], HIST_CENTERS, clamp0)
+        if name in LN_INPUT_NAMES:
+            acts[name] = _pick_exp_mse(hist[name], centers, ln_clamp_max)
+        elif name == "input":
+            acts[name] = _pick_exp_mse(hist[name], centers, 0)
+        else:
+            acts[name] = _pick_exp_mse(hist[name], centers, None)
     return acts
+
+
+def calibrate_float(state, images, device, batch_size=64):
+    """Collect float activation histograms and pick MSE-optimal exponents.
+
+    Measuring the *quantized* activations is biased (values saturate at
+    127 and the range estimate collapses), so calibration runs the float
+    timm model and hooks the exact tensor positions that the RTL contract
+    names. One pass; the per-tensor exponent minimizes quantization MSE on
+    the calibration histogram (max-based exponents waste bits on outliers).
+    """
+    hist, centers = collect_float_histograms(
+        state, images, device, batch_size=batch_size)
+    return pick_activation_exps(hist, centers, ln_clamp_max=0)
 
 
 def make_val_loader(max_images, batch_size=1, shuffle=False):

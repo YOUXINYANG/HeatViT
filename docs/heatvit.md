@@ -297,14 +297,19 @@ MSA 顺序为 Q/K/V 投影、三个 Head 的 `Q*K^T`、缩放、Softmax、`Atten
 
 ### 9.5 批准常量总表
 
-GELU（Q8.16）：
+GELU（I-ViT ShiftGELU，ln2 斜率细化；Q8.16）：
 
 | 常量 | 值 |
 | --- | ---: |
-| `GELU_A_Q16` | -18927 |
-| `GELU_B_Q16` | -115933 |
-| `GELU_DELTA_Q16` | 32768 |
-| `INV_SQRT2_Q16` | 46341 |
+| `GELU_SLOPE_NUM_Q16` | 11 |
+| `GELU_SLOPE_SHIFT` | 4 |
+| `GELU_SLOPE_ROUND_ADD` | 15 |
+| `GELU_EXP_NEG_Q_MAX` | 16 |
+| `GELU_EXP_POS_Q_MAX` | 7 |
+
+（2026-08-23 P2+ 契约变更：原 erf 多项式常量 `GELU_A_Q16=-18927`、
+`GELU_B_Q16=-115933`、`GELU_DELTA_Q16=32768`、`INV_SQRT2_Q16=46341` 退役，
+见第二部分 §13.8。）
 
 指数近似（Q8.16）：
 
@@ -378,22 +383,27 @@ scale_to_exp(value, src_exp, dst_exp):
 
 ### 9.7 各数值单元序列
 
-GELU：
+GELU（I-ViT ShiftGELU，ln2 斜率；Q8.16）：
 
 ```text
-u_q16       = round_shift_away(x_q16 * 46341, 16)
-clip_q16    = min(abs(u_q16), 115933)
-t_q16       = clip_q16 - 115933
-t2_q16      = round_shift_away(t_q16 * t_q16, 16)
-poly_q16    = round_shift_away(-18927 * t2_q16, 16) + 65536
-erf_mag_q16 = round_shift_away(32768 * poly_q16, 16)
-l_erf_q16   = sign(u_q16) * erf_mag_q16          # sign(0) = 0
-y_q16       = round_shift_away(x_q16 * (65536 + l_erf_q16), 17)
-y           = sat_signed_24(y_q16)
+i_p     = x + (x >> 1) + (x >> 3) + (x >> 4)      # 1.702x，(1.1011)b
+i_p2    = i_p + (i_p >> 1) - (i_p >> 4)           # × log2(e)，(1.0111)b
+q       = |i_p2| >> 16
+r       = |i_p2| & 0xFFFF
+frac    = (r * 11 + 15) >> 4                      # 2^x 线性近似，斜率 11/16 ≈ ln2
+e       = i_p2 < 0 ? ((65536 - frac) >> q,  q <= 16，否则 0)
+                   : (min((65536 + frac) << q, 2^23 - 1), q <= 7，否则 2^23 - 1)
+sig     = ((e << 16) + ((65536 + e) >> 1)) // (65536 + e)   # 40/24-bit 整数除法
+y       = round_shift_away(x * sig, 16)
+y       = sat_signed_24(y)
 ```
 
-最后一轮 17 位舍入使该近似天然不是奇对称（`gelu(1)=1`、`gelu(-1)=0`），
-测试按双侧精确值锚定。
+`e` 是 `e^{1.702x}` 的 Q16 定点值（移位型指数：整数部分为 2 的幂移位，
+分数部分线性近似，斜率 11/16 ≈ ln2 以细化论文原版斜率 1/2 的近似误差）；
+`sig` 是 sigmoid 的 Q0.16 值（一次整数除法，最近舍入）。最后结果饱和到
+signed 24-bit Q8.16。负半轴 `x·σ(1.702x)` 在 `x≈-0.75` 处有轻微凹陷
+（最小值 ≈ -0.16，与真实 GELU 的 -0.17 一致量级），单调性断言仅覆盖
+`x >= 0`。
 
 PLAN Sigmoid（对 `abs_x`，Q8.16）：
 
@@ -494,29 +504,36 @@ Patch Embedding、Q/K/V、Attention、Projection、FFN、Selector MLP 和分类�
 
 ### 11.1 GELU
 
-使用 HeatViT 公式 (11)、(12)，`delta1=0.5`。Q8.16 常量固定为：
+使用 I-ViT ShiftGELU（ln2 斜率细化）。Q8.16 常量固定为：
 
-| 常量 | Q8.16 整数 |
+| 常量 | 值 |
 | --- | ---: |
-| `a=-0.2888` | -18927 |
-| `b=-1.769` | -115933 |
-| `delta1=0.5` | 32768 |
-| `1/sqrt(2)` | 46341 |
+| `GELU_SLOPE_NUM_Q16` | 11 |
+| `GELU_SLOPE_SHIFT` | 4 |
+| `GELU_SLOPE_ROUND_ADD` | 15 |
+| `GELU_EXP_NEG_Q_MAX` | 16 |
+| `GELU_EXP_POS_Q_MAX` | 7 |
 
 所有乘法后按第 9 节规则舍入和饱和。
 
 对 Q8.16 输入 `x`，整数执行顺序固定为：
 
 ```text
-u       = round_q16(x * inv_sqrt2)
-c       = min(abs(u), -b)
-t       = c + b
-poly    = round_q16(a * round_q16(t*t)) + 1.0
-l_erf   = sign(u) * round_q16(delta1 * poly)
-gelu    = round((x * (1.0 + l_erf)) / (1<<17))
+i_p   = x + (x >> 1) + (x >> 3) + (x >> 4)        # 1.702x
+i_p2  = i_p + (i_p >> 1) - (i_p >> 4)             # × log2(e)
+q     = |i_p2| >> 16,  r = |i_p2| & 0xFFFF
+frac  = (r * 11 + 15) >> 4
+e     = i_p2 < 0 ? ((65536 - frac) >> q  [q <= 16] 否则 0)
+                 : (min((65536 + frac) << q, 2^23 - 1) [q <= 7] 否则 2^23 - 1)
+sig   = ((e << 16) + ((65536 + e) >> 1)) // (65536 + e)
+gelu  = round_shift_away(x * sig, 16)
 ```
 
-其中 `sign(0)=0`、`-b=115933`；最后结果饱和到 signed 24-bit Q8.16。最后一式的分母 `1<<17` 同时包含 Q16 乘法缩放与 GELU 的 `1/2`。
+最后结果饱和到 signed 24-bit Q8.16。GELU 单元内的一次 40/24-bit 除法使用
+局部 40 拍恢复除法器（`heatvit_udiv` 参数化实例，`QUOT_W = NUM_W = 40`：
+该除法器只消费分子最高的 `QUOT_W` 位，两者必须相等才是精确整数除法），
+每 lane 总时延 42 拍；executor 的共享三客户端除法器（LN/Softmax 通道）
+不参与。
 
 ### 11.2 Softmax 和指数
 
@@ -1061,7 +1078,7 @@ function automatic logic signed [31:0] sat_s32(input logic signed [127:0] value)
 | `rtl/common/heatvit_udiv.sv` | 64-bit 无符号恢复除法 |
 | `rtl/common/heatvit_div_arbiter.sv` | Softmax、LayerNorm、Package 共用除法器的三客户端仲裁 |
 | `rtl/common/heatvit_isqrt.sv` | 无符号整数平方根 |
-| `rtl/common/heatvit_gelu.sv` | 论文 GELU 定点近似 |
+| `rtl/common/heatvit_gelu.sv` | I-ViT ShiftGELU 整数 GELU（shift-exp 核 + 局部除法器） |
 | `rtl/common/heatvit_plan_sigmoid.sv` | PLAN 分段 Sigmoid |
 | `rtl/common/heatvit_softmax_core.sv` | 行缓存、最大值、指数和归一化 |
 | `rtl/common/heatvit_softmax_attention.sv` | `delta2=1.0`（P2 修正，原 0.5）、UQ0.8 输出封装 |
@@ -1105,13 +1122,19 @@ module tb_pkg_smoke;
   heatvit_desc_t desc;
   initial begin
     if ($bits(desc) != 320) $fatal(1, "descriptor width=%0d", $bits(desc));
-    if (GELU_A_Q16 != -18927) $fatal(1, "GELU_A_Q16");
+    if (GELU_SLOPE_NUM_Q16 != 11) $fatal(1, "GELU_SLOPE_NUM_Q16");
+    if (GELU_SLOPE_SHIFT != 4) $fatal(1, "GELU_SLOPE_SHIFT");
+    if (GELU_SLOPE_ROUND_ADD != 15) $fatal(1, "GELU_SLOPE_ROUND_ADD");
+    if (GELU_EXP_NEG_Q_MAX != 16) $fatal(1, "GELU_EXP_NEG_Q_MAX");
+    if (GELU_EXP_POS_Q_MAX != 7) $fatal(1, "GELU_EXP_POS_Q_MAX");
     if (LN_EPS_Q32 != 48'd4295) $fatal(1, "LN_EPS_Q32");
     $display("TEST_PASS tb_pkg_smoke");
     $finish;
   end
 endmodule
 ```
+
+（2026-08-23 P2+：GELU 常量断言随 ShiftGELU 契约更新，见 §9.5/§13.8。）
 
 - [x] **Step 2: 直接编译并确认测试因 package 缺失而失败**
 
@@ -1141,7 +1164,8 @@ Expected: 非零退出码，日志包含无法找到 `heatvit_pkg`。
   "classes": 1000,
   "selector_before_blocks": [4, 7, 10],
   "gemm_tile": {"heads": 3, "input": 8, "output": 8},
-  "gelu_q16": {"a": -18927, "b": -115933, "delta": 32768, "inv_sqrt2": 46341},
+  "gelu_q16": {"slope_num": 11, "slope_shift": 4, "slope_round": 15,
+               "exp_neg_q_max": 16, "exp_pos_q_max": 7},
   "exp_q16": {"ln2": 45426, "quad": 23495, "offset": 88670, "constant": 22544},
   "softmax_delta_q16": {"attention": 32768, "selector": 65536},
   "layernorm_epsilon_q32": 4295,
@@ -4164,6 +4188,160 @@ DeiT-T 量化精度约为 2%（LN 输出 int8 尾部裁剪 + 注意力误差放�
 PTQ 范围，建议作为后续阶段。Selector 的机制（结构、训练、导出、阈值）
 已验证；在主干精度恢复前，其剪枝精度无参考意义。
 
+### 13.7 P2-B 精度优化：I-ViT 整数量化方法融合（as-built）
+
+**状态：完成（2026-08-23）。** 在 §13.6 的 0.82% 结论之上，按任务要求
+把 I-ViT（ICCV 2023，arXiv:2207.01405，整数量化 ViT）的三个非线性方法
+——Shiftmax（整数 Softmax）、ShiftGELU（整数 GELU）、I-LayerNorm（整数
+迭代开方）——融合进现有 PTQ 流程，量化其精度收益。工具链（`tools/p2/`）：
+`p2_sim_ivit.py`（可配置非线性变体仿真器）、`p2_ivit.py`（校准 + 消融
+矩阵 + `--unit` 自检）、`p2_nonlin_probe.py`（非线性 op 对浮点参考的
+误差探针）、`p2_range_diag.py`（激活范围诊断）、`p2_ivit_diag.py`（逐块
+归因）。产物：`p2_out/ivit/results.json`、`scale_table_{legacy,relax}.json`。
+
+**实现前的四项关键诊断（决定消融设计）：**
+
+1. **契约 GELU 是最大失真源**。契约 GELU（HeatViT 论文式 (11)(12)，
+   `δ1=0.5`）在饱和区给出 `GELU_aprx(x) = 0.75x`，而真实 GELU 渐近
+   `x`——正半轴系统误差 12–25%（x=1 时 −20.5%、x=3 时 −24.9%）。在真实
+   FFN 预激活分布上契约 GELU 平均绝对误差 0.296（Q16 单位 19419），
+   I-ViT ShiftGELU 为 0.0099（650），相差 30 倍。`δ1` 是 HeatViT 论文
+   自述的「量化误差正则化」参数（其 §IV-E：导数恒 <1 以压缩误差传播），
+   论文 71.9% 精度是在**训练中带着该近似**学到的（QAT 吸收）；本项目
+   用冻结的官方 DeiT-T 权重纯 PTQ 直接套用，等于给每层 FFN 注入系统性
+   ~25% 增益失真，12 块复利后必然崩坏。合成权重只测自洽（黄金==RTL），
+   该失真从未暴露。
+2. **注意力 Softmax 近似不是主要误差源**。契约二次 exp 近似与 Shiftmax
+   在真实注意力 logits（QKᵀ/√64）分布上误差相当（输出 UQ0.8 平均
+   |err| 7.7e-4 vs 8.1e-4），方向与论文自身消融一致（Shiftmax≈多项式）。
+3. **LN 输入 `exp ≤ 0` 钳位对 DeiT-T 不构成约束**。128 图诊断残差流
+   `b12_y` max≈30（exp −2 已覆盖）；放宽钳位（≤ +6）后校准表与契约表
+   **逐位相同（0 个差异）**。「LN 尾部裁剪」实为 LN **输出**（离群
+   gamma 通道，如 `b9_ln2_out` max≈21.5 @ exp −3 范围 ±15.9）的裁剪。
+4. **逐张量 8-bit 权重平均相对误差 ~15%**（wqkv/w1/patch_w；gamma/beta
+   仅 0.3–0.5%）。每通道权重可把该误差降到 ~2%，故列入消融轴。
+
+**实现要点（`p2_sim_ivit.py`，与契约仿真器同一接口）：**
+
+- `Shiftmax`（论文 Alg.1）：`Ip = Id + (Id≫1) − (Id≫4)`（×log₂e）→
+  整数/小数分解 → 分数段线性近似 `2^x ≈ 1+x/2`（斜率可配）→ `IntDiv`
+  到 UQ0.8。仅 1 次减法、1 次求和、1 次除法，其余全移位。
+- `ShiftGELU`（论文 Alg.2 的稳健形式）：`GELU(x) ≈ x·σ(1.702x)`，
+  `1.702 ≈ (1.1011)b` 用 3 次移位加法；sigmoid 用数学等价形式
+  `σ(z)=1/(1+e^{−z})` 逐元素实现（**偏离**论文的全局 max 归一化：后者
+  在 PTQ 输入范围下分子分母同时下溢，见模块 docstring）。斜率 1/2 之外
+  另实现 11/16≈ln2（RTL 仅 `r≪3+r≪1+r` 一次移位加法）。
+- `I-LayerNorm`：LN 输入 exp 放宽到 ≤ +6（配套 `mul_rsa48_wide`，
+  16-bit 词分解的 94-bit 精确乘积取整，与契约 `mul_rsa48` 在共同输入
+  域上逐位一致）；sqrt 换论文式固定 10 次 Newton 迭代（`I_{i+1} =
+  (I_i + ⌊Var/I_i⌋)≫1`），与契约 isqrt 输出一致（单元级验证）。
+- 每通道权重指数（契约扩展轴，非 I-ViT 组件）：dyadic 逐通道 requant，
+  偏置按 `a_exp + w_exp[c]` 量化。
+- 正确性闸门（`--unit`）：契约配置下与 `p2_sim` **logit 逐位一致**；
+  批量前向与单图前向逐位一致；宽乘法 5 万随机用例 0 错误；LN 三变体
+  交叉一致。
+
+**消融结果**（ImageNet val 前 3000 / 5000 张；float 同子集 80.37% /
+80.22%；契约基线 1.37%@3k，落在 §13.6 的 0.8–2.4% 区间内）：
+
+| 配置（相对契约的增量） | 3k Top-1 | 5k Top-1 | 说明 |
+| --- | ---: | ---: | --- |
+| contract（基线） | 1.37% | — | 与 §13.6 一致 |
+| + Shiftmax（斜率 1/2） | 1.30% | — | 中性 |
+| + Shiftmax（斜率 ln2） | 1.13% | — | 中性略负 |
+| **+ ShiftGELU（斜率 1/2）** | **73.73%** | **74.04%** | **主导增益（≈ +72pp）** |
+| **+ ShiftGELU（斜率 ln2）** | **76.40%** | **76.06%** | 斜率修正再 +2.3~2.7pp |
+| + ShiftGELU + Shiftmax | 73.30% | — | Shiftmax 略拖累 |
+| 放宽 LN 输入 exp / Newton LN | 1.37% | — | 零效应（表逐位相同，见诊断 3） |
+| i-vit（三件套，斜率 1/2） | 73.30% | — | |
+| **i-vit（三件套，斜率 ln2）** | **76.20%** | **76.34%** | **最佳：float −3.9pp** |
+| 仅每通道权重（契约 GELU） | 1.67% | — | 被 GELU 失真掩盖 |
+| i-vit + 每通道权重 | 73.83% | 74.18% | 每通道权重增益 ~0.5pp，有限 |
+
+逐块归因（`p2_ivit_diag.py`，shiftgelu-ln2）：块输出与浮点相关性
+0.990 → 0.828（b12），logits 相关性 0.835（契约基线逐块衰减至 0.1），
+最大块误差 1.0 → 12.4（b11）缓慢增长。
+
+**诚实结论：**
+
+1. I-ViT 融合把 PTQ Top-1 从 1.37% 提升到 **76.34%**（5k，float 同子集
+   80.22%，差距 −3.9pp），约 **55 个百分点**；其中 **ShiftGELU 单独贡献
+   几乎全部增益**——它修复的是契约 GELU 的 `δ1=0.5` 正则化失真，而非
+   「量化方案本身」的常规损耗。Shiftmax 与 I-LayerNorm 在本设置下精度
+   中性，但硬件形态更优（纯移位 / 固定 10 拍迭代），仍值得作为契约
+   简化项。
+2. 论文原版斜率 1/2 的线性 2^x 近似是 ShiftGELU 自身的主要误差；斜率
+   改 11/16（≈ln2，RTL 一次 3 项移位加法）端到端 **+2.3~2.7pp**，是
+   对论文方法的合理细化（其 QAT 吸收了该近似误差，纯 PTQ 无法吸收）。
+3. 剩余 −3.9pp 差距的归因（按证据强度排序）：int8 激活逐张量尾裁剪
+   （LN 输出离群通道、深块残差 `b11/b12` 误差 12–15）＞注意力 UQ0.8 与
+   分数精度＞逐张量权重（每通道单独只值 ~0.5pp）。补齐需要 RepQ-ViT 式
+   每通道 LN 输出重参数化（契约扩展）或 QAT——与 §13.6 的后续建议一致，
+   但优先级已从「GELU/非线性」转向「激活尾裁剪」。
+4. 将 ShiftGELU 落 RTL（已实施，见 §13.8）：`heatvit_gelu.sv` 已替换为
+   shift-exp 核（移位 + 局部 `heatvit_udiv` 除法），黄金模型、TB、向量
+   与全套回归同步更新。Shiftmax 与 Newton LN 为可选项（精度中性）。
+
+### 13.8 P2+ RTL 契约变更：ShiftGELU 落 RTL（as-built）
+
+**状态：RTL 实施完成、回归验证中（2026-08-23 下午）。** 把 §13.7 的
+精度结论同步进 RTL 契约——仅落 **ShiftGELU-ln2**（消融证据显示它是
+唯一精度关键项，+72pp）；Shiftmax / Newton LN 精度中性，保持原契约
+（其硬件简化收益另行评估）。
+
+**变更清单：**
+
+| 文件 | 变更 |
+| --- | --- |
+| `rtl/common/heatvit_gelu.sv` | 重写：shift-exp 核（1.702x 移位加法 + ×log₂e + 斜率 11/16 线性 2^x 近似）+ 局部 40 拍恢复除法器（`heatvit_udiv` 参数化 `NUM_W=40/DEN_W=24/QUOT_W=40`）+ 乘法/舍入；每 lane 42 拍 |
+| `rtl/include/heatvit_pkg.sv` | GELU 常量替换为 `GELU_SLOPE_NUM_Q16=11`、`GELU_SLOPE_SHIFT=4`、`GELU_SLOPE_ROUND_ADD=15`、`GELU_EXP_NEG_Q_MAX=16`、`GELU_EXP_POS_Q_MAX=7`（旧 `GELU_A/B/DELTA/INV_SQRT2` 退役） |
+| `verification/heatvit_ref/nonlinear.py` | 黄金 `gelu()` 改为 ShiftGELU-ln2（与 RTL 逐位同构） |
+| `tools/p2/p2_sim.py` | `gelu_q16` 改为新契约（张量化同构） |
+| `tools/p2/p2_sim_ivit.py` | 旧多项式保留为 `legacy_gelu_q16`（"poly" 参考配置）；"plan" 配置保留（PLAN-GELU 实测 67.77% 被否决） |
+| `verification/tests/test_nonlinear.py` | 已知值锚点更新；单调性断言改为 x ≥ 0（x·σ(1.702x) 负半轴有轻微凹陷） |
+| `verification/tests/test_config_contract.py` + `config/heatvit_t.json` | 常量映射更新 |
+| `sim/tb/tb_pkg_smoke.sv` | 常量断言更新 |
+| `tools/generate_unit_vectors.py` | 边界用例改为 shift-exp 边界（i_p2 = x·621/256 的 q∈{1,2,7,8,16,17,24} 与 r=0xFFFF 邻域） |
+| `sim/vectors/nonlinear/` | 向量与 manifest 重生成（seed 不变，1109 条记录） |
+| `docs/heatvit.md` | §9.5/§9.7/§11.1/§7.2 契约与设计描述更新（本条记录） |
+
+**实施中发现并修复的问题：**
+
+1. `heatvit_udiv` 是定点除法器：只消费分子最高的 `QUOT_W` 位，商 =
+   `floor((num >> (NUM_W−QUOT_W)) / den)`。初版 GELU 用 `QUOT_W=17` 只
+   算了 num 的高 17 位（商恒 0）。修正为 `QUOT_W = NUM_W = 40`（消费
+   全部 40 位，商取低 17 位），已在单元 TB 与 `tb_gelu_plan` 全向量
+   逐位验证。
+2. `tools/generate_transformer_vectors.py` 的 MhsaParams/FfnParams 调用
+   仍用 P2 逐张量尺度重构前的 `weight_scale_exp=0`（重构后字段已拆为
+   `wqkv_scale_exp/wproj_scale_exp` 与 `w1_scale_exp/w2_scale_exp`），
+   是 2026-08-23 凌晨重构遗留的既有失配（transformer 套件自重构后未再
+   跑过）；三处调用已修正为拆后字段（值 0 与描述符 `src1_scale_exp=0`
+   一致）。
+3. 黄金/仿真器交叉验证：新 `gelu()` 与 torch 仿真器 `shiftgelu_q16`
+   随机 2 万输入 0 失配；`p2_sim_smoke` 合成权重全模型 logit 逐位一致。
+
+**验证状态（全部完成，2026-08-23）：** Python 测试 112 项全绿
+（exit 0）；foundation 套件 6 个 TB 全 PASS（含新 GELU 向量比对）；
+transformer 套件 23 个 TEST_PASS；selector 套件全 PASS（含 N=197 全
+Selector）；e2e 两轮逐位一致——无回压 **225,312,221** 周期、伪随机回压
+**249,735,346** 周期（旧契约 175.5M/198.5M，+28%，GELU 局部除法器
+主导）；错误码 1–7 / 警告位 0–2 十个注入案例全 PASS；watchdog 按新
+实测重标定为 **1,000,000,000**（≈4× 最坏）；PTQ「contract」配置在新
+契约下 **76.40%**@3k，与 §13.7 消融实验的 shiftgelu-ln2 完全一致。
+回归记录见 `build/reports/regression_summary.txt` 与
+`p2_out/ivit/results.json`。
+
+**时延影响（实测、后续优化项）：** GELU 每 lane 42 拍（40 拍除法主导），
+e2e 实测 225.3M/249.7M 周期（旧契约 175.5M/198.5M，+28%），watchdog
+已按 4× 新最坏重标定（1.0B）。可选优化（另行评估）：radix-4 恢复除法
+（20 拍）、把 GELU 除法并入 executor 共享除法器（64 拍但可与其他子
+引擎重叠）、或在保证逐位一致前提下的除前归一化。
+
+**遗留说明：** Selector 训练产物（`p2_out/selectors*.pt`）基于旧 GELU
+契约，在新契约下需重训（P2-C 范围，不影响合成权重 e2e）；剪枝版精度
+评估在主干精度恢复后另做。
+
 # 第三部分：仿真与验证指南
 
 本节说明如何从零复现全部仿真验证（环境变量、向量生成、回归命令、日志
@@ -4228,8 +4406,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_regression.ps1 -
 1. **`TEST_PASS` 未出现**：看 `xsim.log` 里的 `Fatal:`/`mismatch` 行——
    检查点比对会打印 checkpoint 名、字节 index、got/want 与当前 descriptor。
 2. **watchdog**：完整 e2e 的 `WATCHDOG_CYCLES` 由 manifest 给出（按实测
-   标定为 795,000,000，约 4× 实测最坏情况）；若超时先确认向量没有被误
-   重新生成（hash 门禁应已拦截），再检查设计是否挂死。
+   标定为 1,000,000,000，约 4× 实测最坏情况 249.7M）；若超时先确认向量
+   没有被误重新生成（hash 门禁应已拦截），再检查设计是否挂死。
 3. **`descriptor error code=N`**：对照 `heatvit_pkg` 的 `heatvit_error_e`；
    常见 code 2 = 维度/参数非法、code 3 = 地址越界、code 4 = Token 数非法。
 4. **trace 越界**：打印 `trace desc=<idx> addr=... len=...`——检查对应
@@ -4241,9 +4419,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_regression.ps1 -
 
 - foundation/gemm：分钟级；transformer：十余分钟（含 N=197 全尺寸 Block）；
 - selector：约二十分钟（含 N=197 全 Selector）；
-- e2e 无回压：约 35–40 分钟（198 条描述符全尺寸推理，实测 175,478,117
-  周期）；e2e 回压轮略长（实测 198,522,559 周期）。全部为纯仿真时间，
-  无综合/布线。
+- e2e 无回压：约 45–55 分钟（198 条描述符全尺寸推理，实测 225,312,221
+  周期，2026-08-23 ShiftGELU 契约）；e2e 回压轮略长（实测 249,735,346
+  周期）。全部为纯仿真时间，无综合/布线。
 
 ## 8. 结果边界（必须保留）
 
@@ -4382,20 +4560,23 @@ Scheduler 在 Finalize 描述符完成拍原子锁存，随后被 Block 4/7/10 �
 全部与黄金模型逐字节一致；各 `.mem` 文件 SHA-256 见
 `build/reports/e2e_summary.json` 的 `checkpoints` 数组。
 
-- `checkpoints/logits.mem` SHA-256：`e1b3a1a34721b20950eb53331087121f27c9225d9a99f33fb0b1ed051defef50`（1000 个 int32 Logit，scale exponent -14）。
+- `checkpoints/logits.mem` SHA-256：`c9c538dac89fffb728107469bf6017dc25d3a56757f72a77b697b4c6e0438887`（1000 个 int32 Logit，scale exponent -14）。
 - 1000 个 Logit 与黄金模型逐位一致（TB 内 byte-by-byte 比较，零容差）。
 
 ## 4. 周期数与 Watchdog
 
 | 运行 | STALL_MASK | 状态 | 周期数 |
 | --- | --- | --- | --- |
-| 无回压 | 0 | PASS | 175,478,117 |
-| 随机回压 | 3 | PASS | 198,522,559 |
+| 无回压 | 0 | PASS | 225,312,221 |
+| 随机回压 | 3 | PASS | 249,735,346 |
+
+（2026-08-23 P2+ ShiftGELU 落 RTL 后的实测值；GELU 每 lane 42 拍的
+40 拍局部除法器使 e2e 周期相对旧契约 175.5M/198.5M 增加约 28%。）
 
 实际周期数在 `TEST_PASS tb_heatvit_e2e` 之后由 TB 打印（`e2e_cycles=...`），
 并由 `run_regression.ps1` 落盘为 `build/reports/e2e_run_stall<mask>.txt`，
 最终汇入 `e2e_summary.json` 的 `runs`。Watchdog 上界按实测标定：
-`watchdog_cycles = 795,000,000` ≈ 4× 实测最坏情况（回压轮 198.5M 周期），
+`watchdog_cycles = 1,000,000,000` ≈ 4× 实测最坏情况（回压轮 249.7M 周期），
 在正常跑与挂死检测之间保留约 4 倍裕量。
 
 ## 5. 错误与警告注入
@@ -4550,7 +4731,7 @@ graph TD
 | `rtl/common/heatvit_rv_fifo.sv` | 47 | 参数化 ready/valid FIFO（首字直通，2 的幂深度）；库模块，仅 TB 使用 | §6 |
 | `rtl/common/heatvit_requant.sv` | 15 | 组合 48-bit→int8 重定标 + 饱和标志；库模块，仅 TB 使用 | §7 |
 | `rtl/common/heatvit_residual.sv` | 55 | 一级寄存残差加法：main + aux 尺度对齐后相加，int8 输出 | §7 |
-| `rtl/common/heatvit_gelu.sv` | 70 | 定点 GELU 三段近似（Q8.16 入/出，饱和 24-bit） | §7 |
+| `rtl/common/heatvit_gelu.sv` | 159 | I-ViT ShiftGELU 移位指数核 + 局部 40 拍除法器（Q8.16 入/出，饱和 24-bit） | §7 |
 | `rtl/common/heatvit_plan_sigmoid.sv` | 55 | PLAN 分段线性 Sigmoid（Q8.16→Q0.16，负输入对称） | §7 |
 | `rtl/common/heatvit_softmax_core.sv` | 205 | 三遍行 Softmax 共享核（最大值减法→指数求和→共享除法归一） | §7 |
 | `rtl/common/heatvit_softmax_attention.sv` | 60 | Attention 封装：δ2=0.5，输出 Q0.8 | §7 |
@@ -5821,32 +6002,39 @@ wire fire = main_valid && aux_valid && (out_ready || !out_valid_q);
 
 ### 7.2 GELU 与 PLAN Sigmoid
 
-`heatvit_gelu` 的数据通路是论文近似式的直译（Q8.16 入/出）：
+`heatvit_gelu`（2026-08-23 P2+ 契约变更）实现 I-ViT ShiftGELU（ln2
+斜率细化）：shift-exp 核 + 一次 40/24-bit 整数除法 + 一次乘法，Q8.16
+入/出、饱和 24-bit：
 
 ```systemverilog
-assign prod_u      = heatvit_s48_t'(x_r) * heatvit_s48_t'(INV_SQRT2_Q16);
-assign u_q16       = round_shift_away_s48(prod_u, 16);          // u = x/√2
-assign abs_u       = (u_q16 < 0) ? -u_q16 : u_q16;
-assign clip_q16    = (abs_u > heatvit_s48_t'(-GELU_B_Q16))
-                       ? heatvit_s48_t'(-GELU_B_Q16) : abs_u;   // |u| ≤ 1.769
-assign t_q16       = clip_q16 + heatvit_s48_t'(GELU_B_Q16);     // t ∈ [-1.769, 0]
-assign t2_q16      = round_shift_away_s48(t_q16 * t_q16, 16);
-assign poly_q16    = round_shift_away_s48(
-                       heatvit_s48_t'(GELU_A_Q16) * t2_q16, 16
-                     ) + 48'sd65536;                            // 1 + A·t²
-assign erf_mag_q16 = round_shift_away_s48(
-                       heatvit_s48_t'(GELU_DELTA_Q16) * poly_q16, 16);  // Δ·poly
-assign l_erf_q16   = sign_u * erf_mag_q16;                     // erf(u)·sign
-assign prod_y      = heatvit_s48_t'(x_r) * (48'sd65536 + l_erf_q16);
-assign y_scaled    = round_shift_away_s48(prod_y, 17);         // y = x·(1+erf)/2
-assign y_sat       = (y_scaled > 48'sd8388607)  ? 48'sd8388607 :
-                     (y_scaled < -48'sd8388608) ? -48'sd8388608 : y_scaled;
+assign i_p   = heatvit_s48_t'(x_r) + (heatvit_s48_t'(x_r) >>> 1)
+             + (heatvit_s48_t'(x_r) >>> 3) + (heatvit_s48_t'(x_r) >>> 4);
+assign i_p2  = i_p + (i_p >>> 1) - (i_p >>> 4);          // × log2(e)
+assign q_int = (i_p2 < 0 ? -i_p2 : i_p2) >> 16;
+assign r_q16 = (i_p2 < 0 ? -i_p2 : i_p2)[15:0];
+assign frac  = ((r_q16 * GELU_SLOPE_NUM_Q16) + GELU_SLOPE_ROUND_ADD)
+               >> GELU_SLOPE_SHIFT;                       // 斜率 11/16 ≈ ln2
+// e = e^{1.702x} 的 Q16 值：负侧 i_b >> q（q>16 下溢为 0），
+// 正侧 i_b << q 饱和到 2^23 - 1（q>7 直接饱和）
+assign num   = {e_comb, 16'd0};                          // e << 16
+assign den   = 24'd65536 + e_comb;
+// sig = round(num / den)：局部 40 拍恢复除法器（heatvit_udiv 参数化
+// NUM_W=40/DEN_W=24/QUOT_W=40——QUOT_W 必须等于 NUM_W，该除法器只消费
+// 分子最高的 QUOT_W 位），余数判半进位
+assign prod_y   = heatvit_s48_t'(x_r) * sig_wide;
+assign y_scaled = round_shift_away_s48(prod_y, 16);
+assign y_sat    = (y_scaled > 48'sd8388607)  ? 48'sd8388607 :
+                  (y_scaled < -48'sd8388608) ? -48'sd8388608 : y_scaled;
 ```
 
-> 注释：GELU(x) = x/2·(1+erf(x/√2))，erf 用论文的三段近似（|u| 裁剪到
-> 1.769 后二次多项式）。系数 `GELU_A/B/DELTA_Q16`、`INV_SQRT2_Q16` 定义在
-> 公共包（数值见第一部分 §9.5）。每步乘后立即 Q16 舍入，48-bit 中间值
-> 全程无溢出风险，末端饱和到 24-bit。
+> 注释：GELU(x) ≈ x·σ(1.702x)，sigmoid 用数学等价形式 σ(z)=1/(1+e^{-z})
+> 实现：e 是 e^{1.702x} 的 Q16 定点值（整数部分 2 的幂移位、分数部分
+> 斜率 11/16 的线性近似），一次整数除法归一化。系数
+> `GELU_SLOPE_NUM_Q16/GELU_SLOPE_SHIFT/GELU_SLOPE_ROUND_ADD/
+> GELU_EXP_NEG_Q_MAX/GELU_EXP_POS_Q_MAX` 定义在公共包（数值见第一部分
+> §9.5）。每 lane 时延 42 拍（1 拍锁存 + 40 拍除法 + 1 拍输出）；除法器
+> 为 GELU 单元局部实例，executor 的共享三客户端除法器（LN/Softmax
+> 通道）不参与。替换背景与精度证据见第二部分 §13.7/§13.8。
 
 `heatvit_plan_sigmoid` 是四段线性近似（Q8.16→UQ0.16）：
 
@@ -6188,9 +6376,11 @@ packager 发 `div_start`，把 Package 行写到输出 slot `kept+1`，最终状
 2. **无全局流水、靠局部并行**：一次只跑一个子引擎，吞吐来自 GEMM 内部的
    三 Bank/K 循环流水与流式引擎的突发搬运；正确性不依赖跨模块流水假设，
    这也是回压仿真能通过的基础。
-3. **资源复用极致**：除法器全局仅 1 个（三客户端仲裁）、GELU/PLAN 各 1 个
-   顺序单元、isqrt 1 个、mem_master 2 个（执行器 + GEMM 各一）、
-   softmax_core 2 例（Attention/Selector 封装各一）。
+3. **资源复用极致**：共享除法器仅 1 个（executor 内三客户端仲裁，服务
+   LN/Softmax 通道）、GELU 1 个顺序单元（2026-08-23 起内置局部 40 拍
+   恢复除法器，见 §7.2/§13.8）、PLAN 1 个、isqrt 1 个、mem_master 2 个
+   （执行器 + GEMM 各一）、softmax_core 2 例（Attention/Selector 封装
+   各一）。
 4. **协议安全优先**：所有对外突发经 addr_guard 预检 + mem_master 的
    framing 校验与合法排空；abort 从不破坏内存；错误单周期脉冲、状态机
    自恢复。

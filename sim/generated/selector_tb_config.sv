@@ -40,8 +40,8 @@ package selector_tb_config_pkg;
   localparam int HW_HIDDEN_BYTES = 588;
   localparam int HW_BYTES = 2352;
   localparam int FUSED_BYTES = 784;
-  localparam int OUT_BYTES = 36480;
-  localparam logic [7:0] NEXT_TOKEN_COUNT = 8'd190;
+  localparam int OUT_BYTES = 37056;
+  localparam logic [7:0] NEXT_TOKEN_COUNT = 8'd193;
   localparam logic       NEXT_PACKAGE_PRESENT = 1'b1;
 
   localparam logic [319:0] DESC0 = 320'h0320022a00c4002000403000000c0000000000000180000000000000093c0e790390000000100000;

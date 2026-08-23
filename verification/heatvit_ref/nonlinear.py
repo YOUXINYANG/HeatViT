@@ -3,15 +3,34 @@
 Both functions accept signed Q8.16 integers and never touch Python
 floats, so the golden model cannot drift from the RTL fixed-point
 contract. GELU returns signed Q8.16; PLAN returns unsigned Q0.16.
+
+P2+ (I-ViT fusion, 2026-08-23): GELU was replaced by the I-ViT
+ShiftGELU (arXiv:2207.01405) with the ln2-slope refinement. The old
+erf-polynomial (HeatViT paper Eq. 11/12, delta1 = 0.5) is retired; it
+distorted frozen DeiT-T weights by ~25% in saturation (PTQ 1.37% vs
+76.4% with ShiftGELU, see docs/heatvit.md Part 2 section 13.7).
+
+ShiftGELU sequence (Q8.16 in/out, sat 24):
+
+    i_p  = x + (x>>1) + (x>>3) + (x>>4)          # 1.702x, (1.1011)b
+    i_p2 = i_p + (i_p>>1) - (i_p>>4)             # * log2(e) ~ 1.4375
+    q    = |i_p2| >> 16,  r = |i_p2| & 0xFFFF    # integer/fraction split
+    frac = (r * 11 + 15) >> 4                    # slope 11/16 ~ ln2
+    e    = i_p2 < 0 ? ((65536 - frac) >> q  if q <= 16 else 0)
+                    : (min((65536 + frac) << q, 2^23 - 1) if q <= 7
+                       else 2^23 - 1)            # e^{1.702x} in Q16
+    sig  = ((e << 16) + ((65536 + e) >> 1)) // (65536 + e)
+    y    = round_shift_away(x * sig, 16), saturated to 24 bits
 """
 
 from .fixed import isqrt, requant, round_div, round_shift_away, sat_signed
 
 
-GELU_A_Q16 = -18927
-GELU_B_Q16 = -115933
-GELU_DELTA_Q16 = 32768
-INV_SQRT2_Q16 = 46341
+GELU_SLOPE_NUM_Q16 = 11     # frac = (r * 11 + 15) >> 4  (slope 11/16 ~ ln2)
+GELU_SLOPE_SHIFT = 4
+GELU_SLOPE_ROUND_ADD = 15
+GELU_EXP_NEG_Q_MAX = 16     # e underflows to 0 beyond q = 16 (2^-16 relative)
+GELU_EXP_POS_Q_MAX = 7      # e saturates at 2^23 - 1 beyond q = 7
 
 PLAN_BP_1_Q16 = 65536    # 1.0
 PLAN_BP_2_Q16 = 155648   # 2.375
@@ -39,17 +58,25 @@ def _check_int(name, value):
 
 
 def gelu(x: int) -> int:
-    """HeatViT Q8.16 GELU approximation, saturated to signed 24 bits."""
+    """I-ViT ShiftGELU approximation, Q8.16 in/out, saturated to 24 bits."""
     _check_int("x", x)
-    u = round_shift_away(x * INV_SQRT2_Q16, 16)
-    clip = min(abs(u), -GELU_B_Q16)
-    t = clip + GELU_B_Q16
-    t2 = round_shift_away(t * t, 16)
-    poly = round_shift_away(GELU_A_Q16 * t2, 16) + 65536
-    erf_mag = round_shift_away(GELU_DELTA_Q16 * poly, 16)
-    sign = (u > 0) - (u < 0)
-    l_erf = sign * erf_mag
-    y = round_shift_away(x * (65536 + l_erf), 17)
+    i_p = x + (x >> 1) + (x >> 3) + (x >> 4)        # 1.702x
+    i_p2 = i_p + (i_p >> 1) - (i_p >> 4)            # * log2(e)
+    a = abs(i_p2)
+    q = a >> 16
+    r = a & 0xFFFF
+    frac = (r * GELU_SLOPE_NUM_Q16 + GELU_SLOPE_ROUND_ADD) \
+        >> GELU_SLOPE_SHIFT
+    if i_p2 < 0:
+        i_b = 65536 - frac
+        e = i_b >> q if q <= GELU_EXP_NEG_Q_MAX else 0
+    else:
+        i_b = 65536 + frac
+        e = min(i_b << q, (1 << 23) - 1) if q <= GELU_EXP_POS_Q_MAX \
+            else (1 << 23) - 1
+    den = 65536 + e
+    sig = ((e << 16) + (den >> 1)) // den
+    y = round_shift_away(x * sig, 16)
     return sat_signed(y, 24)
 
 

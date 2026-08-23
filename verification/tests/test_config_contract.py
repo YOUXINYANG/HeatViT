@@ -28,10 +28,11 @@ class ConfigContractTest(unittest.TestCase):
 
     def test_fixed_point_constants_match_config(self):
         expected = {
-            "GELU_A_Q16": self.config["gelu_q16"]["a"],
-            "GELU_B_Q16": self.config["gelu_q16"]["b"],
-            "GELU_DELTA_Q16": self.config["gelu_q16"]["delta"],
-            "INV_SQRT2_Q16": self.config["gelu_q16"]["inv_sqrt2"],
+            "GELU_SLOPE_NUM_Q16": self.config["gelu_q16"]["slope_num"],
+            "GELU_SLOPE_SHIFT": self.config["gelu_q16"]["slope_shift"],
+            "GELU_SLOPE_ROUND_ADD": self.config["gelu_q16"]["slope_round"],
+            "GELU_EXP_NEG_Q_MAX": self.config["gelu_q16"]["exp_neg_q_max"],
+            "GELU_EXP_POS_Q_MAX": self.config["gelu_q16"]["exp_pos_q_max"],
             "EXP_LN2_Q16": self.config["exp_q16"]["ln2"],
             "EXP_QUAD_Q16": self.config["exp_q16"]["quad"],
             "EXP_OFFSET_Q16": self.config["exp_q16"]["offset"],
@@ -77,10 +78,9 @@ class ConfigContractTest(unittest.TestCase):
             "Q0.16",
             "UQ0.8",
             "Q0.32",
-            "GELU_A_Q16",
+            "GELU_SLOPE_NUM_Q16",
             "LN_EPS_Q32",
             "4295",
-            "46341",
             "94548",
             "320",
             "远离零",

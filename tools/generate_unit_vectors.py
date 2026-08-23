@@ -210,15 +210,29 @@ def generate_nonlinear(seed, outdir):
     count = 1024
 
     inputs = rng.integers(-(1 << 23), 1 << 23, size=count, dtype=np.int64)
+    # Edge inputs: ShiftGELU shift-exp boundaries. i_p2 = x * 621/256
+    # (1.702 * log2(e) with (1.1011)b * (1.0111)b = 621/256 exactly), so
+    # the q = |i_p2| >> 16 breakpoints sit at x = k * 65536 * 256 / 621.
+    # Covered: q in {1, 2} (near zero), {7, 8} (e saturation edge),
+    # {16, 17} (negative-side underflow edge), 24 (deep saturation),
+    # plus the fractional boundary r = 0xFFFF/0x0000 and sign flips.
     edge_inputs = [
         0, 1, -1, 2, -2,
         32767, 32768, 32769, -32767, -32768, -32769,
         65535, 65536, 65537, -65535, -65536, -65537,
         155647, 155648, 155649, -155647, -155648, -155649,
         327679, 327680, 327681, -327679, -327680, -327681,
-        163964, 163965, 163966, -163964, -163965, -163966,
         -(1 << 23), (1 << 23) - 1,
     ]
+    for k in (1, 2, 7, 8, 16, 17, 24):
+        x0 = k * 65536 * 256 // 621
+        for dx in (-1, 0, 1):
+            edge_inputs += [x0 + dx, -(x0 + dx)]
+    # r = 0xFFFF fractional boundary: i_p2 = k*65536 - 1 -> x ~ k*65536*256/621 - 256/621
+    for k in (2, 8):
+        x0 = (k * 65536 - 1) * 256 // 621
+        for dx in (-1, 0, 1):
+            edge_inputs += [x0 + dx, -(x0 + dx)]
     inputs = np.concatenate([inputs, np.array(edge_inputs, dtype=np.int64)])
 
     words = []

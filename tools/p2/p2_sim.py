@@ -33,10 +33,13 @@ import torch
 from tools.p2.scale_table import ScaleTable
 
 # ---- contract constants (nonlinear.py / docs Part 1 Section 9.5) ----------
-GELU_A_Q16 = -18927
-GELU_B_Q16 = -115933
-GELU_DELTA_Q16 = 32768
-INV_SQRT2_Q16 = 46341
+# P2+ (I-ViT fusion): GELU is the ShiftGELU shift-exp approximation with the
+# ln2-slope refinement; see verification/heatvit_ref/nonlinear.py.
+GELU_SLOPE_NUM_Q16 = 11
+GELU_SLOPE_SHIFT = 4
+GELU_SLOPE_ROUND_ADD = 15
+GELU_EXP_NEG_Q_MAX = 16
+GELU_EXP_POS_Q_MAX = 7
 PLAN_ONE = 65536
 PLAN_BP1, PLAN_BP2, PLAN_BP3 = 65536, 155648, 327680
 PLAN_C0, PLAN_C1, PLAN_C2 = 32768, 40960, 55296
@@ -94,17 +97,29 @@ def requant(x: torch.Tensor, src_exp: int, dst_exp: int,
 
 
 def gelu_q16(x_q16: torch.Tensor) -> torch.Tensor:
-    """Exact Q8.16 GELU approximation (nonlinear.gelu), int64 tensors."""
-    u = round_shift_away(x_q16 * INV_SQRT2_Q16, 16)
-    clip = u.abs().clamp(max=-GELU_B_Q16)
-    t = clip + GELU_B_Q16
-    t2 = round_shift_away(t * t, 16)
-    poly = round_shift_away(GELU_A_Q16 * t2, 16) + 65536
-    erf_mag = round_shift_away(GELU_DELTA_Q16 * poly, 16)
-    sign = (u > 0).to(torch.int64) - (u < 0).to(torch.int64)
-    l_erf = sign * erf_mag
-    y = round_shift_away(x_q16 * (65536 + l_erf), 17)
-    return sat(y, 24)
+    """Contract GELU (I-ViT ShiftGELU, ln2 slope), Q8.16 -> Q8.16 sat 24.
+
+    Bit-exact port of verification/heatvit_ref/nonlinear.gelu: the
+    shift-exp core computes e^{1.702x} in Q16 (linear 2^x approximation
+    with slope 11/16 on the fractional part), the sigmoid is one integer
+    division, and the final multiply/round matches the RTL heatvit_gelu.
+    """
+    i_p = x_q16 + (x_q16 >> 1) + (x_q16 >> 3) + (x_q16 >> 4)   # 1.702x
+    i_p2 = i_p + (i_p >> 1) - (i_p >> 4)                        # * log2 e
+    neg = i_p2 < 0
+    a = i_p2.abs()
+    q = a >> 16
+    r = a & 0xFFFF
+    frac = (r * GELU_SLOPE_NUM_Q16 + GELU_SLOPE_ROUND_ADD) >> GELU_SLOPE_SHIFT
+    i_b = torch.where(neg, 65536 - frac, 65536 + frac)
+    e_neg = torch.where(q <= GELU_EXP_NEG_Q_MAX, i_b >> q,
+                        torch.zeros_like(i_b))
+    e_pos = torch.where(q <= GELU_EXP_POS_Q_MAX, i_b << q,
+                        torch.full_like(i_b, (1 << 23) - 1))
+    e = torch.where(neg, e_neg, e_pos).clamp(0, (1 << 23) - 1)
+    den = 65536 + e
+    sig = (((e.to(torch.int64) << 16) + (den >> 1)) // den).clamp(0, 65536)
+    return sat(round_shift_away(x_q16.to(torch.int64) * sig, 16), 24)
 
 
 def plan_sigmoid(x_q16: torch.Tensor) -> torch.Tensor:
