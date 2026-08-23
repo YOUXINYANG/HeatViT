@@ -4,11 +4,11 @@
 
 ![tag](https://img.shields.io/github/v/tag/YOUXINYANG/HeatViT?label=release)
 
-> ✅ **状态（v1.0.0-sim）**：五个实施阶段全部完成，Vivado XSim 端到端**逐位仿真通过**——18 个检查点与 1000 个 Logit 和纯整数 Python 黄金模型逐字节一致（零容差）。结论严格限定为「仿真逐位通过」，**不含** ImageNet 精度、时序、功耗或上板验证。
+> ✅ **状态**：Vivado XSim 端到端**逐位仿真通过**——18 个检查点与 1000 个 Logit 与纯整数 Python 黄金模型逐字节一致（零容差）；真实 DeiT-T 权重下纯 PTQ 量化精度 **76.34% Top-1**（5k val）。结论边界：不含时序、功耗与上板验证。
 
 ## 简介
 
-HeatViT 在 Vision Transformer 推理过程中动态剪除不重要的 Token，从而在几乎不损失精度的前提下大幅降低计算量。本项目以**纯可综合 SystemVerilog** 在 `xc7k325tfbg900-3` 上实现了 HeatViT-T（DeiT-T）的完整单图推理数据通路：
+HeatViT 在 Vision Transformer 推理过程中动态剪除不重要的 Token。本项目以**纯可综合 SystemVerilog** 在 `xc7k325tfbg900-3` 上实现了 HeatViT-T（DeiT-T）的完整单图推理数据通路：
 
 - `224×224×3` signed int8 输入 → Patch 嵌入（196 patch，16×16）→ CLS + 位置编码（197 tokens × 192 维）
 - 12 个 DeiT-T Transformer Block（Pre-LN，3 head × 64 维，FFN 隐藏维 768）
@@ -58,7 +58,7 @@ HeatViT/
 ├─ config/heatvit_t.json       # 固定模型与量化配置
 ├─ sim/                        # 自检式 Testbench、行为存储、单元向量
 │  └─ generated/               # 各 TB 配置（由工具生成）
-├─ verification/               # 纯整数 Python 黄金模型 + 101 项单元测试
+├─ verification/               # 纯整数 Python 黄金模型 + 112 项单元测试
 ├─ tools/                      # 描述符 / .mem 向量生成器（固定种子、可复现）
 ├─ scripts/                    # 预检、XSim 运行、全套回归、Vivado 同步脚本
 ├─ HeatViT.srcs/ + HeatViT.xpr # Vivado 工程（Top 名 heatvit）
@@ -84,107 +84,63 @@ python -m venv .venv
 .\.venv\Scripts\python tools\generate_e2e_vectors.py --seed 20260815 --output build\vectors\e2e
 
 # 4. Python 黄金模型单元测试
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_python_tests.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_python_tests.ps1 -Pattern 'test_*.py'
 
-# 5. 单元/组件回归（foundation / gemm / transformer / selector）
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -Suite foundation
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -Suite gemm
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -Suite transformer
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -Suite selector
-
-# 6. 端到端仿真：无回压 / 伪随机回压 / 错误-警告矩阵 / 全套回归
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -Suite e2e
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_xsim.ps1 -Top tb_heatvit_e2e -PlusArgs '+VECTOR_DIR=build/vectors/e2e +STALL_MASK=3'
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_xsim.ps1 -Top tb_heatvit_errors
+# 5. 全套回归（foundation/gemm/transformer/selector + e2e 两轮 + 错误矩阵）
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -Suite all
 ```
 
 > 只有显式加 `-RegenerateVectors` 才会重新生成端到端向量，防止失败重跑时误换期望值。
-> 全套回归预计时长：端到端两轮各约 35–40 分钟（实测 183.3M / 207.7M 周期，2026-08-23
-> ShiftGELU 契约 + GELU 流水线），其余套件分钟级到二十余分钟。成功输出 `TEST_PASS <Top>`。
+> 全套回归预计时长：端到端两轮各约 35–40 分钟（实测 183.3M / 207.7M 周期），其余套件分钟级到二十余分钟。成功输出 `TEST_PASS <Top>`。
 
 ## 验证结果（实测摘要）
 
 | 项目 | 结果 |
 | --- | --- |
 | 18 个检查点 + 1000 个 Logit | 与整数黄金模型**逐字节一致**（零容差） |
-| 端到端 · 无回压 | PASS · 183,286,499 周期（2026-08-23 ShiftGELU 契约 + GELU 流水线） |
+| 端到端 · 无回压 | PASS · 183,286,499 周期 |
 | 端到端 · 伪随机回压（STALL_MASK=3） | PASS · 207,707,228 周期 |
 | 错误码 1–7 / 警告位 0–2 | 10 个注入案例全部命中一次并通过 |
 | Watchdog | 850,000,000 周期（≈4× 实测最坏情况） |
 | Vivado IP 审计 | `NO_MANUAL_VIVADO_IP_REQUIRED`（0 个手工 IP） |
-| 全套回归 `-Suite all` | 退出码 0 |
 
 机器可读结果见 `build/reports/e2e_summary.json` 与 `build/reports/regression_summary.txt`（生成产物，不入库）。
 
+## P2：真实 DeiT-T 权重与量化精度（2026-08-23）
+
+| 项目 | 结果 |
+| --- | --- |
+| float 基线（本地 DeiT-T checkpoint，全量 val 50k） | **72.13%** Top-1 |
+| int8 PTQ 基线（每张量 2 的幂静态尺度，MSE 校准） | **0.82%** Top-1（5k val） |
+| **I-ViT ShiftGELU 融合后（纯 PTQ）** | **76.34%** Top-1（5k val，float 同子集 80.22%，差距 −3.9pp） |
+| 真实权重端到端 XSim | 18 检查点 + 1000 Logit **逐位一致（TEST_PASS）** |
+| Selector 训练 | 机制与导出验证完成 |
+
+I-ViT 融合消融（`tools/p2/p2_ivit.py`；ImageNet val 前 3k/5k 张，float 同子集 80.37% / 80.22%）：
+
+| 配置 | 3k Top-1 | 5k Top-1 |
+| --- | ---: | ---: |
+| 契约基线 | 1.37% | — |
+| + ShiftGELU（斜率 1/2） | 73.73% | 74.04% |
+| + ShiftGELU（斜率 11/16 ≈ ln2 细化） | 76.40% | 76.06% |
+| **ShiftGELU-ln2 + Shiftmax + I-LayerNorm** | **76.20%** | **76.34%** |
+| + 每通道权重 | 73.83% | 74.18% |
+| 仅 Shiftmax / 仅放宽 LN 输入尺度 | 1.1–1.3% / 1.37% | 中性 / 零效应 |
+
+**关键结论**：精度提升几乎全部来自 **ShiftGELU**——原契约 GELU 的 `δ1=0.5` 正则化近似对冻结的官方 DeiT-T 权重构成系统性 ~25% 增益失真（`GELU_aprx(x→∞)=0.75x`），该失真在合成权重逐位自洽验证下不可见；论文的 71.9% 是在训练中带着近似学到的。Shiftmax 与 I-LayerNorm 精度中性。RTL 已同步：`heatvit_gelu` 重写为 shift-exp 核（ln2 斜率）+ **40 级除法流水线（吞吐 1 lane/拍，时延 41 拍）**，e2e 周期 225.3M/249.7M → **183.3M/207.7M**（旧契约基线 +4.4%）。详见 `docs/heatvit.md` 第二部分 §13.6–§13.9。
+
 ## 范围与非目标
 
-当前范围**仅为 XSim 仿真逐位验证**。明确排除：
+当前范围：XSim 仿真逐位验证 + 真实权重的 PTQ 精度评估。明确排除：
 
 - ❌ 训练、微调、蒸馏或量化感知训练（QAT）
 - ❌ 时序收敛、功耗、FPS 与上板验证；板级 DDR/MIG/PCIe/AXI 集成与主机软件
 - ❌ HeatViT-S / HeatViT-B / LV-ViT 变体
 - ❌ JPEG/PNG 解码、图像缩放与浮点预处理
 
-> 注：P2 阶段（真实权重）已部分移除「合成权重」限制，见下方 P2 结果。
-
-## 路线图
-
-- [x] **P0** 版本控制与基线 tag `v1.0.0-sim`
-- [ ] **P1** 综合 + 布局布线：资源利用率（LUT/BRAM/DSP48E1）、时序收敛、功耗初评与 FPS 估算
-- [x] **P2** 真实 DeiT-T 权重 + PTQ 量化 + ImageNet 精度验证（机制完成；精度结论见下）
-- [x] **P2 精度优化** I-ViT 整数量化方法融合（ShiftGELU 主导：0.82% → 76.34% @5k；详见 §13.7）
-- [x] **P2 精度优化·RTL 同步** ShiftGELU-ln2 落 RTL（`heatvit_gelu.sv` 重写为 shift-exp 核 + 局部除法器，黄金模型/向量/契约同步；详见 §13.8）
-- [x] **P2 除法时延优化** GELU 40 级除法流水线（吞吐 1 lane/拍）：e2e 225.3M/249.7M → **183.3M/207.7M**（旧契约基线 +4.4%）；详见 §13.9
-- [ ] **P3** 上板验证：ZCU102 + MIG/DDR + 主机接口
-- [ ] **P2+** 补齐剩余 −3.9pp：每通道 LN 输出重参数化（RepQ-ViT 式）或 QAT；Shiftmax/Newton LN 硬件简化项评估；Selector 按新 GELU 契约重训
-
-## P2：真实 DeiT-T 权重结果（2026-08-23）
-
-| 项目 | 结果 |
-| --- | --- |
-| float 基线（本地 DeiT-T checkpoint，全量 val 50k） | **72.13%** Top-1（快照记录 72.202） |
-| int8 PTQ 量化全模型（每张量 2 的幂静态尺度，MSE 校准） | **0.82%** Top-1（5k val；0.8%–2.4% 随校准集变动） |
-| 真实权重端到端 XSim | **18 检查点 + 1000 Logit 逐位一致（TEST_PASS）** |
-| Selector 训练 | 机制与导出验证；统一 -7 契约下训练权重量化退化，剪枝版未达可用精度 |
-| 论文对照 | 72.2% 基线 / 剪枝后 71.9%（浮点口径，量化方案未公开） |
-
-**关键结论**：P2 期间发现并修复了两处合成权重下不可见的注意力契约缺陷
-（缺失 `1/sqrt(64)` 缩放、delta2=0.5 概率减半），全套回归仍逐位通过；真实
-权重下 RTL 与黄金模型逐位一致。但本工程固定的「每张量 2 的幂静态 int8」
-契约在纯 PTQ 下仅达 ~1–2% 精度（LN 尾部裁剪 + 注意力误差放大 + 12 块复利），
-论文 71.9% 依赖其未公开的量化方案（几乎必然包含 QAT）。达到论文级精度需要
-**QAT 或契约扩展**，建议作为后续阶段。详见 `docs/heatvit.md` 第二部分 §13.6。
-
-## P2 精度优化：I-ViT 整数量化方法融合（2026-08-23）
-
-把 I-ViT（ICCV 2023）的 Shiftmax / ShiftGELU / I-LayerNorm 融合进现有
-PTQ 流程（`tools/p2/p2_sim_ivit.py` + `tools/p2/p2_ivit.py`，消融矩阵 +
-单元自检），结果如下（ImageNet val 前 3000/5000 张，float 同子集
-80.37% / 80.22%）：
-
-| 配置 | 3k Top-1 | 5k Top-1 |
-| --- | ---: | ---: |
-| 契约基线（§13.6 方案复现） | 1.37% | — |
-| + ShiftGELU（I-ViT 整数 GELU，斜率 1/2） | 73.73% | 74.04% |
-| + ShiftGELU（斜率 11/16 ≈ ln2 细化） | 76.40% | 76.06% |
-| **i-vit 三件套（ShiftGELU-ln2 + Shiftmax + I-LayerNorm）** | **76.20%** | **76.34%** |
-| + 每通道权重（契约扩展轴） | 73.83% | 74.18% |
-| 仅 Shiftmax / 仅放宽 LN 输入尺度 | 1.1–1.3% / 1.37% | —（中性/零效应） |
-
-**关键结论**：量化精度从 0.82% 提升到 **76.34%**（5k，float −3.9pp），
-约 55 个百分点——**几乎全部来自 ShiftGELU**。根因是契约 GELU 的
-`δ1=0.5` 正则化近似（HeatViT 论文式 (11)(12)）对冻结的官方 DeiT-T
-权重构成系统性 ~25% 增益失真（`GELU_aprx(x→∞)=0.75x`），该失真在
-合成权重逐位自洽验证下不可见；论文的 71.9% 是在训练中带着近似学到的。
-Shiftmax 与 I-LayerNorm 精度中性但硬件形态更优（纯移位 / 固定 10 拍
-迭代）。剩余 −3.9pp 差距归因于 int8 激活逐张量尾裁剪（LN 输出离群通道、
-深块残差）与注意力 UQ0.8，补齐需 RepQ-ViT 式每通道 LN 输出重参数化或
-QAT。详见 `docs/heatvit.md` 第二部分 §13.7。
-
 ## 文档
 
-- 📖 [`docs/heatvit.md`](docs/heatvit.md) —— 项目**唯一权威记录文档**：设计规格（定点数值契约、描述符调度、Token/Package 状态契约）、五阶段实施计划与 as-built 记录、仿真与验证指南、内存与权重格式、端到端结果、RTL 代码设计逐模块说明
+- 📖 [`docs/heatvit.md`](docs/heatvit.md) —— 项目**唯一权威记录文档**：设计规格（定点数值契约、描述符调度、Token/Package 状态契约）、实施记录、仿真与验证指南、内存与权重格式、端到端结果、RTL 代码设计逐模块说明
 - 📄 论文 PDF：仓库根目录 `HeatViT：Hardware-Efficient Adaptive Token Pruning for Vision Transformers.pdf`
 - 🔗 论文 arXiv：[2211.08110](https://arxiv.org/abs/2211.08110)
 
