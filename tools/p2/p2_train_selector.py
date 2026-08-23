@@ -61,6 +61,21 @@ from tools.p2 import p2_sim as S
 STAGE_TARGETS = (0.45, 0.51, 0.71)
 
 
+class IndexedDataset(torch.utils.data.Dataset):
+    """Wraps a base dataset and yields (image, label, index) so the
+    distillation teacher logits can be looked up per sample."""
+
+    def __init__(self, base):
+        self.base = base
+
+    def __getitem__(self, i):
+        img, label = self.base[i]
+        return img, label, i
+
+    def __len__(self):
+        return len(self.base)
+
+
 def plan_sigmoid_float(x):
     """Float mirror of the PLAN sigmoid (piecewise-linear, Q0.16 shape)."""
     ax = x.abs()
@@ -89,29 +104,51 @@ class TrainSelector(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=0.02)
                 nn.init.zeros_(m.bias)
-        # Start keep-biased (like the paper's MHTS init).
+        # Start keep-biased but inside the int8-at--7 contract range.
         for head in self.score:
             last = head[-1]
             last.bias.data[0] = 0.0
-            last.bias.data[1] = 5.0
+            last.bias.data[1] = 0.4
 
-    def forward(self, tokens_deq):
-        """tokens_deq: [B,N,192] float; returns (fused, keep_prob_soft)."""
+    def forward(self, tokens_deq, stats_scale=1.0):
+        """tokens_deq: [B,N,192] float; returns (fused, keep_soft, range_loss).
+
+        ``stats_scale`` mirrors the RTL head-weight branch: the stats are
+        the per-head means in the INPUT's units but are fed to the
+        head-weight GEMM at the ``stats_out`` scale (2^(stats_out -
+        in_exp) relative to the input). ``range_loss`` penalizes selector
+        activations/logits outside the int8-at--7 representable range
+        (+-0.99): the RTL selector runs every intermediate through int8
+        at scale exp -7, so anything beyond +-0.99 saturates and breaks
+        the decision boundary.
+        """
         b, n, d = tokens_deq.shape
         th = tokens_deq.reshape(b, n, 3, 64)
+        range_loss = torch.tensor(0.0, device=tokens_deq.device)
         local_h = []
         for h in range(3):
-            local_h.append(self.local[h](th[:, :, h]))          # [B,N,32]
+            pre = self.local[h][0](th[:, :, h])
+            act = self.local[h][1](pre)
+            range_loss = range_loss + (act.abs() - 0.9).clamp(min=0).mean()
+            local_h.append(act)
         local = torch.stack(local_h, dim=2)                     # [B,N,3,32]
         global_f = local.mean(dim=1, keepdim=True)              # [B,1,3,32]
         e = torch.cat([local, global_f.expand(-1, n, -1, -1)],
                       dim=-1)                                   # [B,N,3,64]
         keep_h = []
+        logits_h = []
         for h in range(3):
-            logits = self.score[h](e[:, :, h])                  # [B,N,2]
+            h1 = self.score[h][1](self.score[h][0](e[:, :, h]))
+            range_loss = range_loss + (h1.abs() - 0.9).clamp(min=0).mean()
+            h2 = self.score[h][3](self.score[h][2](h1))
+            range_loss = range_loss + (h2.abs() - 0.9).clamp(min=0).mean()
+            logits = self.score[h][4](h2)
+            range_loss = range_loss \
+                + (logits.abs() - 0.9).clamp(min=0).mean()
+            logits_h.append(logits)
             keep_h.append(torch.softmax(logits, dim=-1)[..., 1])
         keep_scores = torch.stack(keep_h, dim=-1)               # [B,N,3]
-        stats = th.mean(dim=-1)                                 # [B,N,3]
+        stats = th.mean(dim=-1) * stats_scale                   # [B,N,3]
         hw = plan_sigmoid_float(self.head_weight(stats))        # [B,N,3]
         if keep_scores.shape != hw.shape:
             raise RuntimeError(
@@ -120,16 +157,16 @@ class TrainSelector(nn.Module):
                 f"local={tuple(local.shape)} stats={tuple(stats.shape)}")
         den = hw.sum(dim=-1).clamp(min=1e-6)                     # [B,N]
         fused = (keep_scores * hw).sum(dim=-1) / den            # [B,N]
-        return fused, keep_scores
+        return fused, keep_scores, range_loss
 
 
-def train_forward(model, selectors, img_q, targets, s):
+def train_forward(model, selectors, img_q, targets, s, threshold=0.5):
     """One batched forward with soft-gradient/hard-mask selectors.
 
-    Returns (logits, sparsity_loss). The backbone is the exact integer
-    simulator; selectors see dequantized int8 features; the package token
-    uses the soft keep scores (gradient path) and the hard mask uses a
-    straight-through threshold (RTL semantics).
+    Returns (logits, sparsity_loss, range_loss). The backbone is the exact
+    integer simulator (gradients cannot flow through it); selectors see
+    dequantized int8 features and their own activation/logit magnitudes
+    are kept inside the int8-at--7 contract range via ``range_loss``.
     """
     inp_exp = s.activation_exp("input")
     img_q = torch.clamp(torch.round(img_q / (2.0 ** inp_exp)),
@@ -153,6 +190,7 @@ def train_forward(model, selectors, img_q, targets, s):
     valid = torch.ones(b, 197, 1, dtype=torch.int64,
                        device=tokens.device)
     sparsity_loss = torch.tensor(0.0, device=tokens.device)
+    range_loss = torch.tensor(0.0, device=tokens.device)
     sel_idx = 0
     for n in range(1, 13):
         in_exp = s.activation_exp("act_tokens") if n == 1 \
@@ -161,7 +199,13 @@ def train_forward(model, selectors, img_q, targets, s):
             sel = selectors[sel_idx]
             scale = 2.0 ** in_exp
             deq = tokens.to(torch.float32) * scale
-            fused, keep_soft = sel(deq)
+            # Mirror the RTL head-weight branch input scaling: the stats
+            # (per-head means in the input's units) are consumed at the
+            # stats_out scale.
+            stats_scale = 2.0 ** (s.activation_exp(f"s{sel_idx + 1}_stats_out")
+                                  - in_exp)
+            fused, keep_soft, rl = sel(deq, stats_scale)
+            range_loss = range_loss + rl
             fused = fused.clamp(0, 1)
             # CLS always kept.
             fused = torch.cat([torch.ones(b, 1, device=fused.device),
@@ -169,7 +213,7 @@ def train_forward(model, selectors, img_q, targets, s):
             keep_soft = torch.cat(
                 [torch.ones(b, 1, 3, device=keep_soft.device),
                  keep_soft[:, 1:]], dim=1)
-            hard = fused >= 0.5
+            hard = fused >= threshold
             mask = hard.float() + fused - fused.detach()      # STE
             # Per-sample pruning: package from the soft scores.
             parts = tokens * (1 - mask.unsqueeze(-1))
@@ -186,9 +230,11 @@ def train_forward(model, selectors, img_q, targets, s):
             valid = torch.cat(
                 [valid * mask.unsqueeze(-1),
                  torch.ones(b, 1, 1, device=valid.device)], dim=1)
-            # Sparsity loss over the normal candidates (excludes CLS and the
-            # appended package slot).
-            rate = fused[:, 1:].mean()
+            # Sparsity loss over the hard KEEP FRACTION (not the mean
+            # score): the RTL threshold is fused >= 0.5, so the targets
+            # {0.45, 0.51, 0.71} are kept-token fractions. The STE mask
+            # carries the gradient; the boolean ``hard`` alone would not.
+            rate = mask[:, 1:].mean()
             sparsity_loss = sparsity_loss + (rate - targets[sel_idx]) ** 2
             sel_idx += 1
         x_exp = s.activation_exp("act_tokens") if n == 1 \
@@ -204,7 +250,7 @@ def train_forward(model, selectors, img_q, targets, s):
     logits = S.gemm_int8(final_ln, model.head_w, model.head_b,
                          s.activation_exp("final_ln_out"),
                          s.weight_exp("head_w"), S.LOGIT_SCALE_EXP, 32)
-    return logits[:, 0].float(), sparsity_loss
+    return logits[:, 0].float(), sparsity_loss, range_loss
 
 def transformer_block_masked(tokens, p, s, n, x_exp, valid):
     """Exact integer block with an attention validity mask [B,N,1]."""
@@ -242,7 +288,10 @@ def mhsa_masked(x, p, s, n, x_exp, valid):
         score = S.requant(acc.round().to(torch.int64),
                           2 * s.activation_exp(f"b{n}_qkv_out"),
                           score_exp, 32)
-        q16 = S.requant(score, score_exp, score_exp + 4, 24)
+        # Contract conversion (1/sqrt(64) folded): shift = -(score_exp + 13);
+        # matches forward_image for every per-tensor table (the old fixed
+        # +4 shift only matched the synthetic score_exp = -17).
+        q16 = S.sat(S.round_shift_away(score, -(score_exp + 13)), 24)
         prob = S.softmax_attention(q16)
         cacc = prob.to(torch.float64) @ vh.to(torch.float64)
         ctx = S.requant(cacc.round().to(torch.int64),
@@ -274,16 +323,22 @@ def ffn_masked(y, p, s, n):
                        s.activation_exp(f"b{n}_ffn_out"), 8)
 
 
-def export_selector(sel, device, stage):
-    """Quantize a trained selector into RTL int8/Q0.16 tensors + scales.
+def export_selector(sel, device, in_exp, act):
+    """Quantize a trained selector into RTL int8/Q0.16 tensors.
+
+    Returns ``(quantized, weight_exps)``. Weight tensors use per-tensor
+    pick_weight_exp; biases quantize at (input activation exp + weight
+    exp) from the selector scale-table entries, so the exported tensors
+    pair with the calibrated selector scale table built by
+    :func:`selector_scale_table`.
 
     PyTorch Linear stores weight [out, in]; the RTL/golden layout is
     [in, out], so every matrix is transposed here.
     """
     out = {}
     for h in range(3):
-        out[f"local_w{h}"] = sel.local[h][0].weight.data.detach().cpu().t()
-        out[f"local_b{h}"] = sel.local[h][0].bias.data.detach().cpu()
+        out[f"local_w_{h}"] = sel.local[h][0].weight.data.detach().cpu().t()
+        out[f"local_b_{h}"] = sel.local[h][0].bias.data.detach().cpu()
         out[f"score_w1_{h}"] = sel.score[h][0].weight.data.detach().cpu().t()
         out[f"score_b1_{h}"] = sel.score[h][0].bias.data.detach().cpu()
         out[f"score_w2_{h}"] = sel.score[h][2].weight.data.detach().cpu().t()
@@ -295,31 +350,63 @@ def export_selector(sel, device, stage):
     out["hw_w2"] = sel.head_weight[2].weight.data.detach().cpu().t()
     out["hw_b2"] = sel.head_weight[2].bias.data.detach().cpu()
 
-    # The RTL/golden selector path uses uniform scale exp -7 for all
-    # selector weights (descriptor SCALES), so quantize at -7 exactly
-    # rather than per-tensor exponents.
+    # Per-tensor weight exponents + biases at (a_exp + w_exp), driven by
+    # the selector scale-table entries.
+    def qw(w_name, b_name, a_exp, stack_heads=True):
+        if stack_heads:
+            ws = [out[f"{w_name}_{h}"] for h in range(3)]
+            bs = [out[f"{b_name}_{h}"] for h in range(3)]
+            # One shared exponent per tensor (the RTL descriptor carries a
+            # single scale for all three heads).
+            exp = pick_weight_exp(torch.stack(ws))
+            wq = torch.stack([quantize_int8(w, exp) for w in ws])
+            bq = torch.stack(
+                [quantize_bias(b, a_exp + exp) for b in bs])
+            return wq, bq, exp
+        exps = pick_weight_exp(out[w_name])
+        wq = quantize_int8(out[w_name], exps)
+        bq = quantize_bias(out[b_name], a_exp + exps)
+        return wq, bq, exps
+
     q = {}
-    q[f"local_w"] = torch.stack(
-        [quantize_int8(out[f"local_w{h}"], -7) for h in range(3)])
-    q[f"local_b"] = torch.stack(
-        [quantize_bias(out[f"local_b{h}"], -14) for h in range(3)])
-    q["score_w1"] = torch.stack(
-        [quantize_int8(out[f"score_w1_{h}"], -7) for h in range(3)])
-    q["score_b1"] = torch.stack(
-        [quantize_bias(out[f"score_b1_{h}"], -14) for h in range(3)])
-    q["score_w2"] = torch.stack(
-        [quantize_int8(out[f"score_w2_{h}"], -7) for h in range(3)])
-    q["score_b2"] = torch.stack(
-        [quantize_bias(out[f"score_b2_{h}"], -14) for h in range(3)])
-    q["score_w3"] = torch.stack(
-        [quantize_int8(out[f"score_w3_{h}"], -7) for h in range(3)])
-    q["score_b3"] = torch.stack(
-        [quantize_bias(out[f"score_b3_{h}"], -14) for h in range(3)])
-    q["hw_w1"] = quantize_int8(out["hw_w1"], -7)
-    q["hw_b1"] = quantize_bias(out["hw_b1"], -14)
-    q["hw_w2"] = quantize_int8(out["hw_w2"], -7)
-    q["hw_b2"] = quantize_bias(out["hw_b2"], -14)
-    return q
+    w_exps = {}
+    q["local_w"], q["local_b"], w_exps["local_w"] = \
+        qw("local_w", "local_b", in_exp)
+    q["score_w1"], q["score_b1"], w_exps["score_w1"] = \
+        qw("score_w1", "score_b1", act["concat_out"])
+    q["score_w2"], q["score_b2"], w_exps["score_w2"] = \
+        qw("score_w2", "score_b2", act["h1_out"])
+    q["score_w3"], q["score_b3"], w_exps["score_w3"] = \
+        qw("score_w3", "score_b3", act["h2_out"])
+    q["hw_w1"], q["hw_b1"], w_exps["hw_w1"] = \
+        qw("hw_w1", "hw_b1", act["stats_out"], stack_heads=False)
+    q["hw_w2"], q["hw_b2"], w_exps["hw_w2"] = \
+        qw("hw_w2", "hw_b2", act["hw_hidden_out"], stack_heads=False)
+    return q, w_exps
+
+
+def selector_scale_table(table, in_exps, weight_exps):
+    """Extend a backbone scale table with calibrated selector entries.
+
+    ``in_exps`` = {stage: input activation exp}, ``weight_exps`` =
+    {stage: {tensor: exp}} from :func:`export_selector`. Activation exps
+    are the calibrated selector ranges (the uniform -7 placeholders
+    saturate the GEMM requants under the real per-tensor backbone table);
+    the stats live at the input's scale by construction.
+    """
+    acts = dict(table.activations)
+    weights = dict(table.weights)
+    for idx, in_exp in in_exps.items():
+        for name, exp in weight_exps[idx].items():
+            weights[f"s{idx}_{name}"] = exp
+        acts[f"s{idx}_local_out"] = -6
+        acts[f"s{idx}_concat_out"] = -6
+        acts[f"s{idx}_h1_out"] = -6
+        acts[f"s{idx}_h2_out"] = -6
+        acts[f"s{idx}_logits_out"] = -7
+        acts[f"s{idx}_stats_out"] = in_exp
+        acts[f"s{idx}_hw_hidden_out"] = -3
+    return ScaleTable(weights=weights, activations=acts)
 
 
 def main():
@@ -333,6 +420,22 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--out", default="p2_out/selectors.pt")
     parser.add_argument("--table", default="p2_out/scale_table.json")
+    parser.add_argument("--resume", default=None,
+                        help="continue training from a selectors.pt "
+                             "checkpoint (loads the float state dicts)")
+    parser.add_argument("--teacher", default=None,
+                        help="teacher logits .pt (from p2_teacher_logits.py) "
+                             "for soft distillation from the unpruned "
+                             "backbone")
+    parser.add_argument("--distill-weight", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=4.0)
+    parser.add_argument("--range-weight", type=float, default=1.0,
+                        help="penalty weight keeping selector activations/"
+                             "logits inside the int8-at--7 contract range")
+    parser.add_argument("--threshold-offset", type=float, default=0.012,
+                        help="training threshold = 0.5 + offset; compensates "
+                             "the systematic +~0.008 fused-score bias of the "
+                             "Q16 softmax/round-div in the exact sim")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available()
@@ -342,63 +445,128 @@ def main():
     wexp = build_weight_exps(floats)
     table = ScaleTable.load(REPO_ROOT / args.table)
 
+    teacher_logits = None
+    if args.teacher:
+        teacher_logits = torch.load(REPO_ROOT / args.teacher,
+                                    map_location="cpu",
+                                    weights_only=False)["logits"]
+        assert teacher_logits.shape[0] >= args.max_images, \
+            "teacher cache smaller than the training subset"
+
     model = build_model(floats, table, device)
     selectors = nn.ModuleList([TrainSelector() for _ in range(3)]).to(device)
+    if args.resume:
+        prev = torch.load(REPO_ROOT / args.resume, map_location="cpu",
+                          weights_only=False)
+        for sel, sd in zip(selectors, prev["selectors_float"]):
+            sel.load_state_dict(sd)
+        print(f"resumed from {args.resume}")
+
+    # Extend the scale table with calibrated selector entries (the
+    # uniform -7 placeholders saturate the selector GEMM requants under
+    # the real backbone table): activation exps from the calibrated
+    # ranges, per-tensor weight exps from the float selectors, stats at
+    # the input's scale.
+    in_exps = {1: table.activation_exp("b3_out"),
+               2: table.activation_exp("b6_out"),
+               3: table.activation_exp("b9_out")}
+    sel_acts = {i: dict(local_out=-6, concat_out=-6, h1_out=-6,
+                        h2_out=-6, logits_out=-7,
+                        stats_out=in_exps[i], hw_hidden_out=-3)
+                for i in (1, 2, 3)}
+    sel_wexps = {}
+    for i, sel in enumerate(selectors, start=1):
+        _, wexp = export_selector(sel, device, in_exps[i], sel_acts[i])
+        sel_wexps[i] = wexp
+    table = selector_scale_table(table, in_exps, sel_wexps)
 
     from torchvision import datasets, transforms
-    train_dir = r"D:\SEU_Liubo\prj\HeatViT\data\imagenet\train"
+    # Deterministic val subset (CenterCrop, first N images) as the training
+    # set: identical to the teacher-logit pass, so the cache stays valid
+    # across epochs (no augmentation mismatch).
     transform = transforms.Compose([
-        transforms.RandomResizedCrop(
-            224, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.RandomHorizontalFlip(),
+        transforms.Resize(256,
+                          interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
     ])
-    dataset = datasets.ImageFolder(train_dir, transform=transform)
-    if args.max_images and args.max_images < len(dataset):
-        gen = torch.Generator().manual_seed(20260815)
-        idx = torch.randperm(len(dataset), generator=gen)[:args.max_images]
-        dataset = torch.utils.data.Subset(dataset, idx.tolist())
+    dataset = datasets.ImageFolder(
+        r"D:\SEU_Liubo\prj\HeatViT\data\imagenet\val", transform=transform)
+    subset = torch.utils.data.Subset(dataset, range(args.max_images))
     loader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+        IndexedDataset(subset), batch_size=args.batch_size, shuffle=True,
+        num_workers=0)
 
     opt = torch.optim.AdamW(selectors.parameters(), lr=args.lr,
                             weight_decay=0.05)
     crit = nn.CrossEntropyLoss()
+    t_scale = args.temperature
 
     steps = 0
     run_ce = 0.0
     run_sp = 0.0
+    run_di = 0.0
+    run_rg = 0.0
     for epoch in range(args.epochs):
         t0 = time.time()
-        for img, label in loader:
+        for img, label, idx in loader:
             img = img.to(device)
             label = label.to(device)
-            logits, sp_loss = train_forward(model, selectors, img,
-                                            STAGE_TARGETS, table)
+            logits, sp_loss, rg_loss = train_forward(
+                model, selectors, img, STAGE_TARGETS, table,
+                threshold=0.5 + args.threshold_offset)
             ce = crit(logits, label)
-            loss = ce + args.sparsity_weight * sp_loss
+            distill = torch.tensor(0.0, device=device)
+            if teacher_logits is not None:
+                teach = teacher_logits[idx].to(device).float() / t_scale
+                distill = nn.functional.cross_entropy(
+                    logits.float() / t_scale, teach.softmax(dim=1))
+            loss = ce + args.distill_weight * distill \
+                + args.sparsity_weight * sp_loss \
+                + args.range_weight * rg_loss
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(selectors.parameters(), 1.0)
             opt.step()
+            # Keep the decision heads inside the int8-at--7 contract:
+            # weights +-0.99, score logit biases +-0.5 (the h2*w3 term
+            # must still leave headroom inside +-0.99).
+            with torch.no_grad():
+                for sel in selectors:
+                    for head in sel.score:
+                        head[-1].bias.clamp_(-0.5, 0.5)
+                    for m in sel.modules():
+                        if isinstance(m, nn.Linear):
+                            m.weight.clamp_(-0.9, 0.9)
             run_ce += ce.item()
             run_sp += sp_loss.item()
+            run_di += distill.item()
+            run_rg += rg_loss.item()
             steps += 1
             if steps % 20 == 0:
                 print(f"step {steps}: ce {run_ce / 20:.2f} "
+                      f"distill {run_di / 20:.2f} "
                       f"sparsity {run_sp / 20:.4f} "
+                      f"range {run_rg / 20:.4f} "
                       f"({time.time() - t0:.0f}s)", flush=True)
                 run_ce = 0.0
                 run_sp = 0.0
+                run_di = 0.0
+                run_rg = 0.0
 
     out_path = REPO_ROOT / args.out
     out_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"selectors": [], "table": dict(table.activations),
+               "weight_exps": {}, "sel_acts": {str(i): sel_acts[i]
+                                                for i in (1, 2, 3)},
+               "in_exps": {str(i): in_exps[i] for i in (1, 2, 3)},
                "selectors_float": [s.state_dict() for s in selectors]}
-    for sel in selectors:
-        payload["selectors"].append(export_selector(sel, device, None))
+    for i, sel in enumerate(selectors, start=1):
+        q, wexp = export_selector(sel, device, in_exps[i], sel_acts[i])
+        payload["selectors"].append(q)
+        payload["weight_exps"][str(i)] = wexp
     torch.save(payload, out_path)
     print(f"selectors -> {out_path}")
 

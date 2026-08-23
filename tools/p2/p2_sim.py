@@ -411,10 +411,12 @@ def _head_gemm_gelu(a: torch.Tensor, w: torch.Tensor, b: torch.Tensor,
 
 def token_selector(tokens: torch.Tensor, package_present: bool,
                    p: SelectorP, s: ScaleTable, idx: int,
-                   in_exp: int) -> Tuple[torch.Tensor, bool]:
+                   in_exp: int, rec=None) -> Tuple[torch.Tensor, bool]:
     """Integer Token Selector under the RTL contract.
 
     tokens: int8 [N,192]; returns (next_tokens int8 [N',192], package flag).
+    ``rec`` optionally collects the named selector activations for scale
+    calibration (P2-C selector scale extension).
     """
     cand = tokens[1:]
     c = cand.shape[0]
@@ -478,6 +480,15 @@ def token_selector(tokens: torch.Tensor, package_present: bool,
                                                device=tokens.device)),
                         round_div(num, den.clamp(min=1)))
     fused = fused.clamp(0, PLAN_ONE)
+
+    if rec is not None:
+        rec[f"s{idx}_local_out"] = locals_t.detach().cpu().clone()
+        rec[f"s{idx}_concat_out"] = lgl.detach().cpu().clone()
+        rec[f"s{idx}_h1_out"] = h1.detach().cpu().clone()
+        rec[f"s{idx}_h2_out"] = h2.detach().cpu().clone()
+        rec[f"s{idx}_logits_out"] = logits.detach().cpu().clone()
+        rec[f"s{idx}_stats_out"] = stats.detach().cpu().clone()
+        rec[f"s{idx}_hw_hidden_out"] = hw_hidden.detach().cpu().clone()
 
     normal_rows = cand[:-1] if package_present else cand
     incoming = cand[-1:] if package_present else None
