@@ -561,13 +561,14 @@ def forward_image_cfg(model: QuantDeiT, image_float: torch.Tensor,
 
 
 def forward_batch_cfg(model: QuantDeiT, images: torch.Tensor,
-                      cfg: Optional[NonlinConfig] = None):
+                      cfg: Optional[NonlinConfig] = None, rec=None):
     """Batched full inference: float [B,3,224,224] -> int32 [B,1000].
 
     Same semantics as :func:`forward_image_cfg` (prune=False) but processes
     a batch, avoiding the ~100ms/image kernel-dispatch overhead of the
     single-image path. All tensor ops are batch-generic; returns
-    (logits_int32 [B,1000], logits_scale_exp).
+    (logits_int32 [B,1000], logits_scale_exp). ``rec`` optionally collects
+    the named block activations (overwritten per batch).
     """
     if cfg is None:
         cfg = NonlinConfig()
@@ -604,7 +605,7 @@ def forward_batch_cfg(model: QuantDeiT, images: torch.Tensor,
         in_exp = s.activation_exp("act_tokens") if n == 1 \
             else s.activation_exp(f"b{n - 1}_out")
         tokens = transformer_block_cfg(tokens, model.blocks[n - 1], s, n,
-                                       in_exp, cfg, wchan)
+                                       in_exp, cfg, wchan, rec)
 
     final_ln = ln_cfg(tokens, model.final_gamma, model.final_beta,
                       s.activation_exp("b12_out"),
