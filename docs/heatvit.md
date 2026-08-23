@@ -529,11 +529,10 @@ sig   = ((e << 16) + ((65536 + e) >> 1)) // (65536 + e)
 gelu  = round_shift_away(x * sig, 16)
 ```
 
-最后结果饱和到 signed 24-bit Q8.16。GELU 单元内的一次 40/24-bit 除法使用
-局部 40 拍恢复除法器（`heatvit_udiv` 参数化实例，`QUOT_W = NUM_W = 40`：
-该除法器只消费分子最高的 `QUOT_W` 位，两者必须相等才是精确整数除法），
-每 lane 总时延 42 拍；executor 的共享三客户端除法器（LN/Softmax 通道）
-不参与。
+最后结果饱和到 signed 24-bit Q8.16。GELU 单元内的一次 40/24-bit 除法以
+40 级 radix-2 恢复除法**流水线**实现（每级 1 bit、吞吐 1 lane/拍、时延
+41 拍，结果与串行除法逐位相同）；executor 的共享三客户端除法器
+（LN/Softmax 通道）不参与。
 
 ### 11.2 Softmax 和指数
 
@@ -4324,23 +4323,64 @@ PTQ 范围，建议作为后续阶段。Selector 的机制（结构、训练、�
 **验证状态（全部完成，2026-08-23）：** Python 测试 112 项全绿
 （exit 0）；foundation 套件 6 个 TB 全 PASS（含新 GELU 向量比对）；
 transformer 套件 23 个 TEST_PASS；selector 套件全 PASS（含 N=197 全
-Selector）；e2e 两轮逐位一致——无回压 **225,312,221** 周期、伪随机回压
-**249,735,346** 周期（旧契约 175.5M/198.5M，+28%，GELU 局部除法器
-主导）；错误码 1–7 / 警告位 0–2 十个注入案例全 PASS；watchdog 按新
-实测重标定为 **1,000,000,000**（≈4× 最坏）；PTQ「contract」配置在新
-契约下 **76.40%**@3k，与 §13.7 消融实验的 shiftgelu-ln2 完全一致。
-回归记录见 `build/reports/regression_summary.txt` 与
+Selector）；e2e 两轮逐位一致（周期数已被 §13.9 流水线版替代，见第五
+部分 §4）；错误码 1–7 / 警告位 0–2 十个注入案例全 PASS；PTQ「contract」
+配置在新契约下 **76.40%**@3k，与 §13.7 消融实验的 shiftgelu-ln2 完全
+一致。回归记录见 `build/reports/regression_summary.txt` 与
 `p2_out/ivit/results.json`。
 
-**时延影响（实测、后续优化项）：** GELU 每 lane 42 拍（40 拍除法主导），
-e2e 实测 225.3M/249.7M 周期（旧契约 175.5M/198.5M，+28%），watchdog
-已按 4× 新最坏重标定（1.0B）。可选优化（另行评估）：radix-4 恢复除法
-（20 拍）、把 GELU 除法并入 executor 共享除法器（64 拍但可与其他子
-引擎重叠）、或在保证逐位一致前提下的除前归一化。
+**时延影响（已被 §13.9 流水线化解决）：** 串行版 GELU 每 lane 42 拍
+（40 拍除法主导），e2e 曾实测 225.3M/249.7M 周期（旧契约
+175.5M/198.5M，+28%）；§13.9 将除法改为 40 级流水（吞吐 1 lane/拍）
+后回到 183.3M/207.7M（+4.4%/+4.6%）。
 
 **遗留说明：** Selector 训练产物（`p2_out/selectors*.pt`）基于旧 GELU
 契约，在新契约下需重训（P2-C 范围，不影响合成权重 e2e）；剪枝版精度
 评估在主干精度恢复后另做。
+
+### 13.9 P2+ 除法时延优化：GELU 流水线化（as-built）
+
+**状态：完成（2026-08-23 晚）。** §13.8 的串行 GELU（每 lane 42 拍，
+40 拍恢复除法串行）使 e2e 增加 ~28%（225.3M/249.7M 周期）。优化为
+**流水线形态**：40 级 radix-2 恢复除法流水（每级 1 bit，吞吐 1 lane/
+拍、时延 41 拍），GEMM 引擎把整个 tile 的 lane 背靠背喂入、按序排空
+收集，喂入与收集重叠——GELU 后处理从「每 lane 42 拍」变为「每 tile
+≈ lanes + 41 拍」。
+
+**变更清单：**
+
+| 文件 | 变更 |
+| --- | --- |
+| `rtl/common/heatvit_gelu.sv` | 重写为流水线：stage 0 锁存 x 并计算 num/den；stage 1..40 每级消费 1 个分子 bit（分子寄存器逐级左移、MSB 进余数比较/减法，与串行版逐位同构）；末级舍入进位 + x·sig 乘法。`done = valid_pipe[41]`、`busy = \|valid_pipe[40:0]`（最后一 lane 完成同拍 busy 清零）；背靠背 start 每拍接受一条 lane（去掉 start&&busy 检查） |
+| `rtl/compute/heatvit_gemm_engine.sv` | GELU 后处理 FSM 重写：`S_GELU_SETTLE`（1 拍累加器落定等待）+ `S_GELU_NEXT`（(gb,gr,gc) 逐拍喂入、(cb,cr,cc) 按序收集，双指针并行）+ `S_GELU_DRAIN`（排空）；喂入值经 `gelu_x_latched` 提前 1 拍锁存；收集指针跳过空 bank（含前导空 bank） |
+| `sim/tb/tb_gelu_pipe.sv` | 新增协议 TB：单 lane 握手 + 4 lane 背靠背按序输出（`done` 为每 lane 1 拍的电平，非单脉冲） |
+| `scripts/run_regression.ps1` | foundation 套件加入 `tb_gelu_pipe` |
+
+**实施中发现并修复的问题（3 处）：**
+
+1. **累加器落定时序**：MAC bank 在最后一个 `S_COMPUTE_ACC` 拍之后 1 拍
+   才落定最后一个 K 部分积；旧串行 GELU 经模块 stage-0 采样时延天然等
+   了这 1 拍，而锁存式喂入把有效采样提前了 1 拍——首 lane 读到未落定
+   累加值（tb_ffn hidden 字节失配）。修复：GELU 阶段前插入 1 拍
+   `S_GELU_SETTLE` 状态（逐位验证：修后首 lane acc 与黄金完全一致）。
+2. **收集指针的空 bank 跳步**：喂入侧逐拍跳过 `b_cols==0` 的 bank，
+   收集侧若只做 `cb+1` 会把结果写入幻影槽位。修复：初始化跳到第一个
+   非空 bank、bank 完成时跳到下一个非空 bank（镜像喂入顺序）。
+3. **tb 对连续 done 电平的采样**：背靠背 lane 的 `done` 是连续多拍
+   电平（每拍一个结果），`wait(done)`/`@(posedge done)` 会重复触发或
+   漏拍——`tb_gelu_pipe` 按「首拍等待 + 逐拍采样」校验。
+
+**验证状态：** 黄金/向量零改动（流水线与串行逐位同构）；Python 测试
+全绿；foundation（含 `tb_gelu_plan` 全向量 + 新 `tb_gelu_pipe`）、
+transformer、selector 套件全 PASS；e2e 两轮逐位一致与错误矩阵见下方
+周期表（§13.8 的 225.3M/249.7M 基线被本轮实测替代）。
+
+**时延收益（实测）：** 见第五部分 §4 周期表；无回压 e2e 实测
+**183,286,499** 周期、回压 **207,707,228** 周期（§13.8 串行版
+225.3M/249.7M，−18.7%/−16.8%；相对旧契约基线 175.5M/198.5M 仅
++4.4%/+4.6%）。GELU 后处理从每 tile 2688 拍（64 lane × 42）降为
+~105 拍（64 + 41），剩余 +7.8M 拍为流水填充与排空开销。资源：40 级
+流水约 +2.5k LUT/+3k FF（相对串行 40 拍除法器），无新 IP。
 
 # 第三部分：仿真与验证指南
 
@@ -4406,7 +4446,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_regression.ps1 -
 1. **`TEST_PASS` 未出现**：看 `xsim.log` 里的 `Fatal:`/`mismatch` 行——
    检查点比对会打印 checkpoint 名、字节 index、got/want 与当前 descriptor。
 2. **watchdog**：完整 e2e 的 `WATCHDOG_CYCLES` 由 manifest 给出（按实测
-   标定为 1,000,000,000，约 4× 实测最坏情况 249.7M）；若超时先确认向量
+   标定为 850,000,000，约 4× 实测最坏情况 207.7M）；若超时先确认向量
    没有被误重新生成（hash 门禁应已拦截），再检查设计是否挂死。
 3. **`descriptor error code=N`**：对照 `heatvit_pkg` 的 `heatvit_error_e`；
    常见 code 2 = 维度/参数非法、code 3 = 地址越界、code 4 = Token 数非法。
@@ -4419,9 +4459,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_regression.ps1 -
 
 - foundation/gemm：分钟级；transformer：十余分钟（含 N=197 全尺寸 Block）；
 - selector：约二十分钟（含 N=197 全 Selector）；
-- e2e 无回压：约 45–55 分钟（198 条描述符全尺寸推理，实测 225,312,221
-  周期，2026-08-23 ShiftGELU 契约）；e2e 回压轮略长（实测 249,735,346
-  周期）。全部为纯仿真时间，无综合/布线。
+- e2e 无回压：约 35–40 分钟（198 条描述符全尺寸推理，实测 183,286,499
+  周期，2026-08-23 ShiftGELU 契约 + GELU 流水线）；e2e 回压轮略长
+  （实测 207,707,228 周期）。全部为纯仿真时间，无综合/布线。
 
 ## 8. 结果边界（必须保留）
 
@@ -4567,16 +4607,17 @@ Scheduler 在 Finalize 描述符完成拍原子锁存，随后被 Block 4/7/10 �
 
 | 运行 | STALL_MASK | 状态 | 周期数 |
 | --- | --- | --- | --- |
-| 无回压 | 0 | PASS | 225,312,221 |
-| 随机回压 | 3 | PASS | 249,735,346 |
+| 无回压 | 0 | PASS | 183,286,499 |
+| 随机回压 | 3 | PASS | 207,707,228 |
 
-（2026-08-23 P2+ ShiftGELU 落 RTL 后的实测值；GELU 每 lane 42 拍的
-40 拍局部除法器使 e2e 周期相对旧契约 175.5M/198.5M 增加约 28%。）
+（2026-08-23 P2+ GELU 流水线化后的实测值；ShiftGELU 契约 + 流水线除法
+相对旧契约基线 175.5M/198.5M 仅 +4.4%/+4.6%，中间状态串行除法版为
+225.3M/249.7M，见第二部分 §13.9。）
 
 实际周期数在 `TEST_PASS tb_heatvit_e2e` 之后由 TB 打印（`e2e_cycles=...`），
 并由 `run_regression.ps1` 落盘为 `build/reports/e2e_run_stall<mask>.txt`，
 最终汇入 `e2e_summary.json` 的 `runs`。Watchdog 上界按实测标定：
-`watchdog_cycles = 1,000,000,000` ≈ 4× 实测最坏情况（回压轮 249.7M 周期），
+`watchdog_cycles = 850,000,000` ≈ 4× 实测最坏情况（回压轮 207.7M 周期），
 在正常跑与挂死检测之间保留约 4 倍裕量。
 
 ## 5. 错误与警告注入
@@ -4731,7 +4772,7 @@ graph TD
 | `rtl/common/heatvit_rv_fifo.sv` | 47 | 参数化 ready/valid FIFO（首字直通，2 的幂深度）；库模块，仅 TB 使用 | §6 |
 | `rtl/common/heatvit_requant.sv` | 15 | 组合 48-bit→int8 重定标 + 饱和标志；库模块，仅 TB 使用 | §7 |
 | `rtl/common/heatvit_residual.sv` | 55 | 一级寄存残差加法：main + aux 尺度对齐后相加，int8 输出 | §7 |
-| `rtl/common/heatvit_gelu.sv` | 159 | I-ViT ShiftGELU 移位指数核 + 局部 40 拍除法器（Q8.16 入/出，饱和 24-bit） | §7 |
+| `rtl/common/heatvit_gelu.sv` | 231 | I-ViT ShiftGELU 移位指数核 + 40 级除法流水（吞吐 1 lane/拍，时延 41 拍；Q8.16 入/出，饱和 24-bit） | §7 |
 | `rtl/common/heatvit_plan_sigmoid.sv` | 55 | PLAN 分段线性 Sigmoid（Q8.16→Q0.16，负输入对称） | §7 |
 | `rtl/common/heatvit_softmax_core.sv` | 205 | 三遍行 Softmax 共享核（最大值减法→指数求和→共享除法归一） | §7 |
 | `rtl/common/heatvit_softmax_attention.sv` | 60 | Attention 封装：δ2=0.5，输出 Q0.8 | §7 |
@@ -5959,8 +6000,9 @@ heatvit_sdp_ram #(.WIDTH(64), .DEPTH(A_WORDS), .AW(RAM_AW)) a_ram (
 这些是第一阶段实现的定点算术单元，被流式引擎逐元素/逐行调用。除
 `layernorm`、`softmax_core`（多阶段）与 `udiv`、`isqrt`（迭代）外，其余
 都是「一拍计算、两拍控制」的小模块：`start` 锁存输入 → 组合数据通路 →
-下一拍 `done`。共同的防御约定：`start && busy` 时 `$error`（如 gelu L63），
-非法调用在仿真期即暴露。
+下一拍 `done`。共同的防御约定：`start && busy` 时 `$error`（PLAN/Softmax
+等串行单元；2026-08-23 起 GELU 为流水线形态，背靠背 start 是其正常
+用法，不设该检查），非法调用在仿真期即暴露。
 
 ### 7.1 重定标与残差
 
@@ -6018,9 +6060,8 @@ assign frac  = ((r_q16 * GELU_SLOPE_NUM_Q16) + GELU_SLOPE_ROUND_ADD)
 // 正侧 i_b << q 饱和到 2^23 - 1（q>7 直接饱和）
 assign num   = {e_comb, 16'd0};                          // e << 16
 assign den   = 24'd65536 + e_comb;
-// sig = round(num / den)：局部 40 拍恢复除法器（heatvit_udiv 参数化
-// NUM_W=40/DEN_W=24/QUOT_W=40——QUOT_W 必须等于 NUM_W，该除法器只消费
-// 分子最高的 QUOT_W 位），余数判半进位
+// sig = round(num / den)：40 级 radix-2 恢复除法流水线（每级 1 bit，
+// 吞吐 1 lane/拍、时延 41 拍；与串行除法逐位相同），余数判半进位
 assign prod_y   = heatvit_s48_t'(x_r) * sig_wide;
 assign y_scaled = round_shift_away_s48(prod_y, 16);
 assign y_sat    = (y_scaled > 48'sd8388607)  ? 48'sd8388607 :
@@ -6032,9 +6073,13 @@ assign y_sat    = (y_scaled > 48'sd8388607)  ? 48'sd8388607 :
 > 斜率 11/16 的线性近似），一次整数除法归一化。系数
 > `GELU_SLOPE_NUM_Q16/GELU_SLOPE_SHIFT/GELU_SLOPE_ROUND_ADD/
 > GELU_EXP_NEG_Q_MAX/GELU_EXP_POS_Q_MAX` 定义在公共包（数值见第一部分
-> §9.5）。每 lane 时延 42 拍（1 拍锁存 + 40 拍除法 + 1 拍输出）；除法器
-> 为 GELU 单元局部实例，executor 的共享三客户端除法器（LN/Softmax
-> 通道）不参与。替换背景与精度证据见第二部分 §13.7/§13.8。
+> §9.5）。流水线形态：stage 0 锁存输入并计算 num/den，stage 1..40 每级
+> 消费 1 个分子 bit（分子寄存器逐级左移、MSB 送入余数比较/减法），
+> 末级完成舍入进位与 x·sig 乘法；`done = valid_pipe[41]`、
+> `busy = |valid_pipe[40:0]`（最后一 lane 完成的同拍 busy 清零），
+> 背靠背 start 每拍接受一条 lane。GEMM 引擎以 (gb,gr,gc) 逐拍喂入、
+> (cb,cr,cc) 按序收集，喂入与收集重叠。替换背景与精度证据见第二部分
+> §13.7/§13.8/§13.9。
 
 `heatvit_plan_sigmoid` 是四段线性近似（Q8.16→UQ0.16）：
 
@@ -6377,10 +6422,10 @@ packager 发 `div_start`，把 Package 行写到输出 slot `kept+1`，最终状
    三 Bank/K 循环流水与流式引擎的突发搬运；正确性不依赖跨模块流水假设，
    这也是回压仿真能通过的基础。
 3. **资源复用极致**：共享除法器仅 1 个（executor 内三客户端仲裁，服务
-   LN/Softmax 通道）、GELU 1 个顺序单元（2026-08-23 起内置局部 40 拍
-   恢复除法器，见 §7.2/§13.8）、PLAN 1 个、isqrt 1 个、mem_master 2 个
-   （执行器 + GEMM 各一）、softmax_core 2 例（Attention/Selector 封装
-   各一）。
+   LN/Softmax 通道）、GELU 1 个流水单元（2026-08-23 起内置 40 级除法
+   流水线，见 §7.2/§13.8/§13.9）、PLAN 1 个、isqrt 1 个、mem_master
+   2 个（执行器 + GEMM 各一）、softmax_core 2 例（Attention/Selector
+   封装各一）。
 4. **协议安全优先**：所有对外突发经 addr_guard 预检 + mem_master 的
    framing 校验与合法排空；abort 从不破坏内存；错误单周期脉冲、状态机
    自恢复。

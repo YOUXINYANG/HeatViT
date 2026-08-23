@@ -305,13 +305,14 @@ def watchdog_cycles(descs, mm, token_counts):
             memory_beats += (196 * 768 + 7) // 8 * 2
         elif desc.opcode == 2:  # OP_COPY_ADD_POS
             memory_beats += (196 * 192 + 7) // 8 + (197 * 192 + 7) // 8 * 2
-    # Watchdog calibration (2026-08-23, post ShiftGELU RTL): measured e2e
-    # cycle counts are 225,312,221 (STALL_MASK=0) and 249,735,346
+    # Watchdog calibration (2026-08-23, post GELU pipeline): measured e2e
+    # cycle counts are 183,286,499 (STALL_MASK=0) and 207,707,228
     # (STALL_MASK=3). The bound is 4x the measured worst case rounded up,
     # keeping ~4x margin over any valid run while still catching hangs
-    # promptly. (Previous calibration: 175,478,117 / 198,522,559 ->
-    # 795,000,000.)
-    return 1_000_000_000
+    # promptly. (Previous calibrations: 175,478,117 / 198,522,559 ->
+    # 795,000,000; serial-ShiftGELU 225,312,221 / 249,735,346 ->
+    # 1,000,000,000.)
+    return 850_000_000
 
 
 def generate(seed, outdir):

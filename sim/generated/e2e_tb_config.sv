@@ -12,7 +12,7 @@ package e2e_tb_config_pkg;
   localparam int          SCRATCH_BYTES = 1619400;
   localparam logic [31:0] OUTPUT_BASE  = 32'h03000000;
   localparam int          OUTPUT_BYTES = 4000;
-  localparam int WATCHDOG_CYCLES = 1000000000;
+  localparam int WATCHDOG_CYCLES = 850000000;
   localparam int OUTPUT_SCALE_EXP = -14;
 
   localparam int SELECTOR_IN_N [0:2] = '{197, 100, 55};

@@ -51,6 +51,7 @@ try {
       'tb_requant_residual',
       'tb_udiv_isqrt',
       'tb_gelu_plan',
+      'tb_gelu_pipe',
       'tb_softmax',
       'tb_layernorm'
     )

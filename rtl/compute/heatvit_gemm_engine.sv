@@ -61,8 +61,9 @@ module heatvit_gemm_engine
     S_COMPUTE_PRE,
     S_COMPUTE_WARM,
     S_COMPUTE_ACC,
+    S_GELU_SETTLE,
     S_GELU_NEXT,
-    S_GELU_WAIT,
+    S_GELU_DRAIN,
     S_PLAN_NEXT,
     S_PLAN_WAIT,
     S_WB_NEXT,
@@ -127,6 +128,12 @@ module heatvit_gemm_engine
   logic [1:0]  gb;
   logic [2:0]  gr;
   logic [2:0]  gc;
+  // Collect pointers for the pipelined GELU post-op: lanes are fed
+  // back-to-back on (gb,gr,gc) and results are stored in feed order on
+  // (cb,cr,cc), so the drain can overlap the feed of the same tile.
+  logic [1:0]  cb;
+  logic [2:0]  cr;
+  logic [2:0]  cc;
 
   // Tile buffer interface.
   logic [12:0]  tb_fill_addr;
@@ -192,6 +199,10 @@ module heatvit_gemm_engine
   logic        gelu_done;
   heatvit_q8_16_t gelu_in;
   heatvit_q8_16_t gelu_out;
+  // Pipelined GELU: lanes are fed back-to-back while the (gb,gr,gc)
+  // pointer advances in the same cycle, so the fed value must be
+  // latched one cycle ahead of the module's stage-0 sample.
+  heatvit_q8_16_t gelu_x_latched;
 
   heatvit_gelu u_gelu (
     .clk    (clk),
@@ -232,7 +243,7 @@ module heatvit_gemm_engine
   endfunction
 
   always_comb begin
-    gelu_in = acc_q16(int'(gb), int'(gr), int'(gc));
+    gelu_in = gelu_x_latched;
     plan_in = acc_q16(int'(gb), int'(gr), int'(gc));
   end
 
@@ -709,7 +720,11 @@ module heatvit_gemm_engine
       gb               <= 2'd0;
       gr               <= 3'd0;
       gc               <= 3'd0;
+      cb               <= 2'd0;
+      cr               <= 3'd0;
+      cc               <= 3'd0;
       gelu_start       <= 1'b0;
+      gelu_x_latched   <= 24'sd0;
       plan_start       <= 1'b0;
       req_r_ready_r    <= 1'b0;
       for (int b = 0; b < 3; b++) begin
@@ -963,7 +978,18 @@ module heatvit_gemm_engine
               gb    <= 2'd0;
               gr    <= 3'd0;
               gc    <= 3'd0;
-              state <= S_GELU_NEXT;
+              cr    <= 3'd0;
+              cc    <= 3'd0;
+              // Collect starts at the first non-empty bank (mirrors the
+              // feed side, which skips empty banks one cycle each).
+              cb    <= (b_cols[0] != 4'd0) ? 2'd0 :
+                       (b_cols[1] != 4'd0) ? 2'd1 :
+                       (b_cols[2] != 4'd0) ? 2'd2 : 2'd3;
+              // One settle cycle: the MAC bank lands the last K partial
+              // one cycle after the final S_COMPUTE_ACC, so the first
+              // lane's accumulator read must wait (the old serial GELU
+              // had this implicitly via its stage-0 sampling latency).
+              state <= S_GELU_SETTLE;
             end else if (post_op == POST_PLAN) begin
               gb    <= 2'd0;
               gr    <= 3'd0;
@@ -979,22 +1005,45 @@ module heatvit_gemm_engine
           end
         end
 
+        S_GELU_SETTLE: begin
+          state <= S_GELU_NEXT;
+        end
+
         S_GELU_NEXT: begin
+          // Pipelined GELU: feed one lane per cycle on (gb,gr,gc) and
+          // collect finished lanes on (cb,cr,cc) in feed order; results
+          // arrive 41 cycles after their start, possibly while feeding.
+          if (gelu_done) begin
+            gelu_buf[cb][cr][cc] <= gelu_out;
+            if (cc == b_cols[cb] - 4'd1) begin
+              cc <= 3'd0;
+              if (cr == a_rows - 4'd1) begin
+                cr <= 3'd0;
+                // skip empty banks, mirroring the feed order
+                if (cb == 2'd0 && b_cols[1] != 4'd0) cb <= 2'd1;
+                else if (cb != 2'd2 && b_cols[2] != 4'd0) cb <= 2'd2;
+                else cb <= 2'd3;
+              end else begin
+                cr <= cr + 3'd1;
+              end
+            end else begin
+              cc <= cc + 3'd1;
+            end
+          end
           if (gb == 2'd3) begin
-            wb_b  <= 2'd0;
-            wb_r  <= 3'd0;
-            state <= S_WB_NEXT;
+            // Feeding complete; drain the remaining in-flight lanes.
+            if (cb == 2'd3) begin
+              wb_b  <= 2'd0;
+              wb_r  <= 3'd0;
+              state <= S_WB_NEXT;
+            end else begin
+              state <= S_GELU_DRAIN;
+            end
           end else if (b_cols[gb] == 4'd0) begin
             gb <= gb + 2'd1;
           end else begin
+            gelu_x_latched <= acc_q16(int'(gb), int'(gr), int'(gc));
             gelu_start <= 1'b1;
-            state      <= S_GELU_WAIT;
-          end
-        end
-
-        S_GELU_WAIT: begin
-          if (gelu_done) begin
-            gelu_buf[gb][gr][gc] <= gelu_out;
             if (gc == b_cols[gb] - 4'd1) begin
               gc <= 3'd0;
               if (gr == a_rows - 4'd1) begin
@@ -1006,7 +1055,30 @@ module heatvit_gemm_engine
             end else begin
               gc <= gc + 3'd1;
             end
-            state <= S_GELU_NEXT;
+          end
+        end
+
+        S_GELU_DRAIN: begin
+          if (gelu_done) begin
+            gelu_buf[cb][cr][cc] <= gelu_out;
+            if (cc == b_cols[cb] - 4'd1) begin
+              cc <= 3'd0;
+              if (cr == a_rows - 4'd1) begin
+                cr <= 3'd0;
+                if (cb == 2'd0 && b_cols[1] != 4'd0) cb <= 2'd1;
+                else if (cb != 2'd2 && b_cols[2] != 4'd0) cb <= 2'd2;
+                else cb <= 2'd3;
+              end else begin
+                cr <= cr + 3'd1;
+              end
+            end else begin
+              cc <= cc + 3'd1;
+            end
+          end
+          if (cb == 2'd3) begin
+            wb_b  <= 2'd0;
+            wb_r  <= 3'd0;
+            state <= S_WB_NEXT;
           end
         end
 

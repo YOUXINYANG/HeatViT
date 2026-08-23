@@ -100,18 +100,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -
 ```
 
 > 只有显式加 `-RegenerateVectors` 才会重新生成端到端向量，防止失败重跑时误换期望值。
-> 全套回归预计时长：端到端两轮各约 45–55 分钟（实测 225.3M / 249.7M 周期，2026-08-23
-> ShiftGELU 契约），其余套件分钟级到二十余分钟。成功输出 `TEST_PASS <Top>`。
+> 全套回归预计时长：端到端两轮各约 35–40 分钟（实测 183.3M / 207.7M 周期，2026-08-23
+> ShiftGELU 契约 + GELU 流水线），其余套件分钟级到二十余分钟。成功输出 `TEST_PASS <Top>`。
 
 ## 验证结果（实测摘要）
 
 | 项目 | 结果 |
 | --- | --- |
 | 18 个检查点 + 1000 个 Logit | 与整数黄金模型**逐字节一致**（零容差） |
-| 端到端 · 无回压 | PASS · 225,312,221 周期（2026-08-23 ShiftGELU 契约） |
-| 端到端 · 伪随机回压（STALL_MASK=3） | PASS · 249,735,346 周期 |
+| 端到端 · 无回压 | PASS · 183,286,499 周期（2026-08-23 ShiftGELU 契约 + GELU 流水线） |
+| 端到端 · 伪随机回压（STALL_MASK=3） | PASS · 207,707,228 周期 |
 | 错误码 1–7 / 警告位 0–2 | 10 个注入案例全部命中一次并通过 |
-| Watchdog | 1,000,000,000 周期（≈4× 实测最坏情况） |
+| Watchdog | 850,000,000 周期（≈4× 实测最坏情况） |
 | Vivado IP 审计 | `NO_MANUAL_VIVADO_IP_REQUIRED`（0 个手工 IP） |
 | 全套回归 `-Suite all` | 退出码 0 |
 
@@ -135,6 +135,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -
 - [x] **P2** 真实 DeiT-T 权重 + PTQ 量化 + ImageNet 精度验证（机制完成；精度结论见下）
 - [x] **P2 精度优化** I-ViT 整数量化方法融合（ShiftGELU 主导：0.82% → 76.34% @5k；详见 §13.7）
 - [x] **P2 精度优化·RTL 同步** ShiftGELU-ln2 落 RTL（`heatvit_gelu.sv` 重写为 shift-exp 核 + 局部除法器，黄金模型/向量/契约同步；详见 §13.8）
+- [x] **P2 除法时延优化** GELU 40 级除法流水线（吞吐 1 lane/拍）：e2e 225.3M/249.7M → **183.3M/207.7M**（旧契约基线 +4.4%）；详见 §13.9
 - [ ] **P3** 上板验证：ZCU102 + MIG/DDR + 主机接口
 - [ ] **P2+** 补齐剩余 −3.9pp：每通道 LN 输出重参数化（RepQ-ViT 式）或 QAT；Shiftmax/Newton LN 硬件简化项评估；Selector 按新 GELU 契约重训
 
