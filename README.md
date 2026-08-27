@@ -6,7 +6,7 @@
 
 > ✅ **状态**：Vivado XSim 端到端**逐位仿真通过**——18 个检查点与 1000 个 Logit 与纯整数 Python 黄金模型逐字节一致（零容差）；真实 DeiT-T 权重下纯 PTQ 量化精度 **76.34% Top-1**（5k val）。结论边界：不含时序、功耗与上板验证。
 >
-> 🚧 **P3 QAT + P4 剪枝微调**：可微 fake-quant 训练路径 + 位精确验证管线（20 项测试全绿）。未剪枝 **76.06% → 77.86%（+1.80pp，5k val）**，距浮点基线 −2.36pp；剪枝 59.12%（PTQ）→ 68.20%（QAT 主干）→ **72.70%@93/44/37（P4-2A λ=5，计数近目标，当前诚实最优）**；D3 裁定冻结表全程；选择器重训（B）排序增益未兑现。阶段小结与精度总览见 [`docs/heatvit.md`](docs/heatvit.md) 第二部分 §14.13。
+> ✅ **P3 QAT + P4 剪枝微调（完成）**：可微 fake-quant 训练路径 + 位精确验证管线（20 项测试全绿）。未剪枝 **76.06% → 77.86%（+1.80pp，5k val）**，距浮点基线 −2.36pp；剪枝 59.12%（PTQ）→ 68.20%（QAT 主干）→ **72.70%@93/44/37（P4-2A λ=5，计数近目标，当前诚实最优）**；D3 裁定冻结表全程；选择器重训（B）排序增益未兑现。阶段小结与精度总览见 [`docs/heatvit.md`](docs/heatvit.md) 第二部分 §14.13。
 >
 > 🎉 **P5 导出与逐位回归（2026-08-27）**：P4-2A λ=5 权重已导出回 RTL 并通过 XSim 端到端逐位回归（img0..2 × 无回压/回压共 6 轮）。期间定位并修复 `heatvit_layernorm` 连续赋值陈旧尺度敏感度缺陷（QAT 数据流暴露的潜伏 bug，见 docs §14.14）；同缺陷类别的 `heatvit_gemm_engine` 一并加固。训练侧精度收益已在硬件上闭环。
 
@@ -104,6 +104,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -
 | 18 个检查点 + 1000 个 Logit | 与整数黄金模型**逐字节一致**（零容差） |
 | 端到端 · 无回压 | PASS · 183,286,499 周期 |
 | 端到端 · 伪随机回压（STALL_MASK=3） | PASS · 207,707,228 周期 |
+| **QAT 权重端到端（P5）· 6 轮** | img0..2 × 无回压/回压全部 **TEST_PASS**（代表周期 230.8M / 226.4M） |
 | 错误码 1–7 / 警告位 0–2 | 10 个注入案例全部命中一次并通过 |
 | Watchdog | 850,000,000 周期（≈4× 实测最坏情况） |
 | Vivado IP 审计 | `NO_MANUAL_VIVADO_IP_REQUIRED`（0 个手工 IP） |
@@ -191,16 +192,16 @@ I-ViT 融合消融（`tools/p2/p2_ivit.py`；ImageNet val 前 3k/5k 张，float 
 
 ## 范围与非目标
 
-当前范围：XSim 仿真逐位验证 + 真实权重的 PTQ 精度评估 + **QAT（进行中，P3）**。明确排除：
+当前范围：XSim 仿真逐位验证 + 真实权重的 PTQ 精度评估 + **QAT 与剪枝微调（P3/P4，已完成）** + **P5 权重导出与 XSim 逐位回归（已完成）**。明确排除：
 
-- ❌ 常规训练、微调、蒸馏
+- ❌ 常规训练、微调、蒸馏（P3 修正：部署契约下的量化感知训练 QAT 已纳入范围并完成，见 docs §14）
 - ❌ 时序收敛、功耗、FPS 与上板验证；板级 DDR/MIG/PCIe/AXI 集成与主机软件
 - ❌ HeatViT-S / HeatViT-B / LV-ViT 变体
 - ❌ JPEG/PNG 解码、图像缩放与浮点预处理
 
 ## 文档
 
-- 📖 [`docs/heatvit.md`](docs/heatvit.md) —— 项目**唯一权威记录文档**：设计规格（定点数值契约、描述符调度、Token/Package 状态契约）、实施记录、仿真与验证指南、内存与权重格式、端到端结果、RTL 代码设计逐模块说明，以及 PTQ 与 QAT 实施记录（第二部分 §13–§14）
+- 📖 [`docs/heatvit.md`](docs/heatvit.md) —— 项目**唯一权威记录文档**：设计规格（定点数值契约、描述符调度、Token/Package 状态契约）、实施记录、仿真与验证指南、内存与权重格式、端到端结果、RTL 代码设计逐模块说明，以及 PTQ / QAT / P5 导出实施记录（第二部分 §13–§14，P5 见 §14.14）
 - 📄 论文 PDF：仓库根目录 `HeatViT：Hardware-Efficient Adaptive Token Pruning for Vision Transformers.pdf`
 - 🔗 论文 arXiv：[2211.08110](https://arxiv.org/abs/2211.08110)
 
