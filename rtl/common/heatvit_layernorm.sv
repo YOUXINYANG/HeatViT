@@ -54,15 +54,17 @@ module heatvit_layernorm
   heatvit_scale_t beta_scale_r;
   heatvit_scale_t out_scale_r;
 
-  function automatic heatvit_s128_t x_q32_of(input heatvit_s8_t x);
-    return heatvit_s128_t'(x) <<< (int'(x_scale_r) + 32);
+  function automatic heatvit_s128_t x_q32_of(input heatvit_s8_t x,
+                                             input heatvit_scale_t x_scale);
+    return heatvit_s128_t'(x) <<< (int'(x_scale) + 32);
   endfunction
 
-  function automatic heatvit_s128_t square_q32_of(input heatvit_s8_t x);
+  function automatic heatvit_s128_t square_q32_of(input heatvit_s8_t x,
+                                                  input heatvit_scale_t x_scale);
     heatvit_s128_t square;
     int shift;
     square = heatvit_s128_t'(x) * heatvit_s128_t'(x);
-    shift = 2 * int'(x_scale_r) + 32;
+    shift = 2 * int'(x_scale) + 32;
     if (shift >= 0) return square <<< shift;
     return round_shift_away_s128(square, 7'(-shift));
   endfunction
@@ -144,8 +146,8 @@ module heatvit_layernorm
   assign variance_w         = heatvit_s128_t'(e2_q32_r) - mean_square_w;
   assign variance_negative  = (variance_w < 0);
   assign variance_clamped   = variance_negative ? 48'd0 : variance_w[47:0];
-  assign sum_x_next_w       = sum_x_r + x_q32_of(in_x);
-  assign square_in_w        = square_q32_of(in_x);
+  assign sum_x_next_w       = sum_x_r + x_q32_of(in_x, x_scale_r);
+  assign square_in_w        = square_q32_of(in_x, x_scale_r);
   assign sum_x_mag_w        = (sum_x_next_w < 0) ? (128'd0 - sum_x_next_w) : sum_x_next_w;
   assign rounded_quot_w     = div_quot + (((div_rem << 1) >= div_den) ? 64'd1 : 64'd0);
 
@@ -223,7 +225,7 @@ module heatvit_layernorm
             x_buf[idx]     <= in_x;
             gamma_buf[idx] <= in_gamma;
             beta_buf[idx]  <= in_beta;
-            sum_x_r        <= sum_x_r + x_q32_of(in_x);
+            sum_x_r        <= sum_x_r + x_q32_of(in_x, x_scale_r);
             sum_square_r   <= sum_square_r + square_in_w[63:0];
             if (idx == 8'd191) begin
               idx           <= 8'd0;

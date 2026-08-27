@@ -53,7 +53,8 @@ try {
       'tb_gelu_plan',
       'tb_gelu_pipe',
       'tb_softmax',
-      'tb_layernorm'
+      'tb_layernorm',
+      'tb_ln_p5_stale'
     )
     foreach ($Top in $FoundationTops) {
       & powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_xsim.ps1 -Top $Top

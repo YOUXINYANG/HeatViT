@@ -662,12 +662,13 @@ module heatvit_gemm_engine
     input int kind,
     input int bank,
     input int idx,
-    input int useful
+    input int useful,
+    input logic transposed
   );
     case (kind)
       0: return useful * 8 + idx;
       1: begin
-        if (rhs_transpose) return useful * 8 + idx;
+        if (transposed) return useful * 8 + idx;
         else return idx * 8 + useful;
       end
       2: return bank * 32 + useful;
@@ -680,7 +681,8 @@ module heatvit_gemm_engine
       (int'(ld_bi) * 8 + int'(scat_j) < int'(ld_e) + int'(ld_w));
   assign tb_fill_bank = ld_fill_bank;
   assign tb_fill_addr = fill_dest(int'(ld_kind), int'(ld_bank), int'(ld_idx),
-                                  int'(ld_bi) * 8 + int'(scat_j) - int'(ld_e));
+                                  int'(ld_bi) * 8 + int'(scat_j) - int'(ld_e),
+                                  rhs_transpose);
   assign tb_fill_data = ld_beat_data[8*scat_j +: 8];
 
   // Memory master request/read/write drive.
