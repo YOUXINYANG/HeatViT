@@ -420,7 +420,7 @@ def generate(seed, outdir):
     return image, params, result
 
 
-def write_e2e_tb_config(mm, manifest, layout, token_counts):
+def write_e2e_tb_config(mm, manifest, layout, token_counts, cfg_path=None):
     lines = []
     lines.append("`ifndef E2E_TB_CONFIG_PKG_SV")
     lines.append("`define E2E_TB_CONFIG_PKG_SV")
@@ -479,7 +479,10 @@ def write_e2e_tb_config(mm, manifest, layout, token_counts):
     lines.append("endpackage")
     lines.append("")
     lines.append("`endif")
-    cfg_path = REPO_ROOT / "sim" / "generated" / "e2e_tb_config.sv"
+    if cfg_path is None:
+        cfg_path = REPO_ROOT / "sim" / "generated" / "e2e_tb_config.sv"
+    else:
+        cfg_path = Path(cfg_path)
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text("\n".join(lines) + "\n", encoding="utf-8",
                         newline="\n")

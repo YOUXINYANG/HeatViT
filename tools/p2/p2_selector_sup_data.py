@@ -102,13 +102,28 @@ def main():
     parser.add_argument("--max-images", type=int, default=8192)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--table", default="p2_out/ivit/scale_table_legacy.json")
+    parser.add_argument("--backbone-checkpoint", default=None,
+                        help="P4-B: use a QAT checkpoint's floats (HeatViT "
+                             "layout) as the int8 backbone and its float "
+                             "mirror (heatvit_to_timm_state) as the "
+                             "attention teacher, instead of the official "
+                             "DeiT-T checkpoint")
     parser.add_argument("--out", default="p2_out/selector_sup_data.pt")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available()
                           else "cpu")
-    state = load_state_dict()
-    floats = to_heatvit_tensors(state)
+    if args.backbone_checkpoint:
+        ck = torch.load(REPO_ROOT / args.backbone_checkpoint,
+                        map_location="cpu", weights_only=False)
+        floats = {k: v for k, v in ck["floats"].items()}
+        from tools.p2.qat_data import heatvit_to_timm_state
+        state = heatvit_to_timm_state(floats)
+        print(f"backbone: {args.backbone_checkpoint} (QAT floats + float "
+              f"mirror teacher)")
+    else:
+        state = load_state_dict()
+        floats = to_heatvit_tensors(state)
     table = ScaleTable.load(REPO_ROOT / args.table).validate()
     model = build_model(floats, table, device)
 

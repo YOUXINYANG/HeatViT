@@ -88,6 +88,25 @@ def block_input_exp(table, n):
         else table.activation_exp(f"b{n - 1}_out")
 
 
+def selector_input_exp(table, s_idx):
+    """Input token activation scale for selector stage s_idx (1..3)."""
+    return table.activation_exp(f"b{3 * s_idx}_out")
+
+
+def merge_selector_scales(table, payload):
+    """Merge the calibrated per-tensor selector scales from a selector
+    checkpoint into the table (idempotent; mirrors qat_prune_eval.
+    load_selectors). The P4/P5 deployments freeze the backbone PTQ table
+    and only add the s{i}_* entries carried by the selector payload."""
+    if "weight_exps" in payload:
+        for i in (1, 2, 3):
+            for name, exp in payload["weight_exps"][str(i)].items():
+                table.weights[f"s{i}_{name}"] = exp
+            for name, exp in payload["sel_acts"][str(i)].items():
+                table.activations[f"s{i}_{name}"] = exp
+        table.validate()
+
+
 def golden_params_from_real(floats, table, selector_payload):
     patch = PatchParams(
         patch_weight=_q8(floats, "patch_w", table),
@@ -183,8 +202,28 @@ def golden_params_from_real(floats, table, selector_payload):
             w2=[[int(v) for v in row] for row in p["hw_w2"]],
             b2=[int(v) for v in p["hw_b2"]],
         )
-        selectors.append(SelectorParams(local=local, score=score,
-                                        head_weight=head_weight))
+        selectors.append(SelectorParams(
+            local=local, score=score, head_weight=head_weight,
+            in_scale_exp=selector_input_exp(table, s_idx + 1),
+            local_w_scale_exp=table.weights[f"s{s_idx + 1}_local_w"],
+            local_out_scale_exp=table.activation_exp(
+                f"s{s_idx + 1}_local_out"),
+            concat_out_scale_exp=table.activation_exp(
+                f"s{s_idx + 1}_concat_out"),
+            score_w1_scale_exp=table.weights[f"s{s_idx + 1}_score_w1"],
+            score_w2_scale_exp=table.weights[f"s{s_idx + 1}_score_w2"],
+            score_w3_scale_exp=table.weights[f"s{s_idx + 1}_score_w3"],
+            h1_out_scale_exp=table.activation_exp(f"s{s_idx + 1}_h1_out"),
+            h2_out_scale_exp=table.activation_exp(f"s{s_idx + 1}_h2_out"),
+            logits_out_scale_exp=table.activation_exp(
+                f"s{s_idx + 1}_logits_out"),
+            stats_out_scale_exp=table.activation_exp(
+                f"s{s_idx + 1}_stats_out"),
+            hw_w1_scale_exp=table.weights[f"s{s_idx + 1}_hw_w1"],
+            hw_hidden_out_scale_exp=table.activation_exp(
+                f"s{s_idx + 1}_hw_hidden_out"),
+            hw_w2_scale_exp=table.weights[f"s{s_idx + 1}_hw_w2"],
+        ))
 
     params = HeatViTParams(
         patch=patch,
@@ -226,7 +265,7 @@ def checkpoint_layout_real(mm, token_counts, table):
     for s in range(1, 4):
         name = f"selector_{s:02d}"
         layout[name] = (layout[name][0], layout[name][1], layout[name][2],
-                        -7, layout[name][4])
+                        selector_input_exp(table, s), layout[name][4])
     layout["final_ln"] = (layout["final_ln"][0], layout["final_ln"][1],
                           layout["final_ln"][2], act("final_ln_out"),
                           layout["final_ln"][4])
@@ -389,6 +428,11 @@ def export_one(outdir, image, params, table, scale_table):
         json.dump(manifest, handle, indent=2)
         handle.write("\n")
     write_e2e_tb_config(mm, manifest, layout, token_counts)
+    # Per-image TB config copy: XSim compiles sim/generated/e2e_tb_config.sv
+    # (which the last image overwrites), so each image dir carries its own
+    # copy to be staged before its run.
+    write_e2e_tb_config(mm, manifest, layout, token_counts,
+                        outdir / "e2e_tb_config.sv")
     print(f"wrote {outdir}: token_counts={token_counts}")
     return result
 
@@ -397,6 +441,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--table", default="p2_out/scale_table.json")
     parser.add_argument("--selectors", default="p2_out/selectors_8k.pt")
+    parser.add_argument("--checkpoint", default=None,
+                        help="P5: QAT checkpoint carrying a 'floats' key in "
+                             "HeatViT layout (e.g. p2_out/qat/p4a_rate5_16k/"
+                             "best.pt); replaces the official DeiT-T weights")
     parser.add_argument("--images", type=int, default=3)
     parser.add_argument("--output", default="build/vectors/e2e_real")
     parser.add_argument("--device", default="cpu")
@@ -415,8 +463,15 @@ def main():
     table.validate()
     selector_payload = torch.load(REPO_ROOT / args.selectors,
                                   map_location="cpu", weights_only=False)
+    merge_selector_scales(table, selector_payload)
 
-    floats = to_heatvit_tensors(load_state_dict())
+    if args.checkpoint:
+        ckpt = torch.load(REPO_ROOT / args.checkpoint, map_location="cpu",
+                          weights_only=False)
+        floats = {k: v for k, v in ckpt["floats"].items()}
+        print(f"backbone from QAT checkpoint {args.checkpoint}")
+    else:
+        floats = to_heatvit_tensors(load_state_dict())
     params = golden_params_from_real(floats, table, selector_payload)
 
     loader = make_val_loader(args.images)
@@ -424,13 +479,14 @@ def main():
 
     if args.write_rom:
         import tools.generate_descriptors as gd
+        Path(args.output).mkdir(parents=True, exist_ok=True)
         mm, _, _ = gd.build_memory_map()
         descs = gd.build_schedule(mm, table)
         for desc in descs:
             desc.validate()
         gd.emit(descs, mm, REPO_ROOT / "rtl/generated/heatvit_descriptors.mem",
-                REPO_ROOT / "build/vectors/e2e_real/descriptor_listing.csv",
-                REPO_ROOT / "build/vectors/e2e_real/memory_map.json")
+                Path(args.output) / "descriptor_listing.csv",
+                Path(args.output) / "memory_map.json")
         print("descriptor ROM regenerated with per-tensor scale table")
 
     for i, img in enumerate(images):

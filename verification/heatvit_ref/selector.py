@@ -176,7 +176,14 @@ class SelectorHeadWeightParams:
 
 @dataclass(frozen=True)
 class SelectorParams:
-    """Immutable selector tensors, shapes and fixed-point scales."""
+    """Immutable selector tensors, shapes and fixed-point scales.
+
+    Per-tensor scale fields mirror the calibrated selector scale table
+    (P2-C selector extension, docs §13.10; P5 export, docs §14.14): every
+    GEMM input/output carries its own exponent and the bias sits at
+    (input + weight). All defaults are -7 so the synthetic path and
+    legacy uniform-scale callers are unchanged.
+    """
 
     local: SelectorLocalParams
     score: SelectorScoreParams
@@ -187,6 +194,21 @@ class SelectorParams:
     activation_scale_exp: int = -7
     weight_scale_exp: int = -7
     logits_scale_exp: int = -7
+    # Per-tensor selector scales (calibrated selectors / real weights).
+    in_scale_exp: int = -7              # token activation input
+    local_w_scale_exp: int = -7
+    local_out_scale_exp: int = -7
+    concat_out_scale_exp: int = -7
+    score_w1_scale_exp: int = -7
+    score_w2_scale_exp: int = -7
+    score_w3_scale_exp: int = -7
+    h1_out_scale_exp: int = -7
+    h2_out_scale_exp: int = -7
+    logits_out_scale_exp: int = -7
+    stats_out_scale_exp: int = -7
+    hw_w1_scale_exp: int = -7
+    hw_hidden_out_scale_exp: int = -7
+    hw_w2_scale_exp: int = -7
 
     def __post_init__(self):
         if self.heads != 3 or self.head_dim != 64 or self.local_dim != 32:
@@ -228,7 +250,8 @@ class SelectorResult:
     fused_scores: tuple = ()
 
 
-def per_head_local_mlp(candidates, params):
+def per_head_local_mlp(candidates, params, act_exp=-7, wt_exp=-7,
+                       dst_exp=-7):
     """Per-head 64->32 GEMM + GELU: [C][3][64] -> local [3][C][32] int8."""
     if not isinstance(params, SelectorLocalParams):
         raise TypeError("params must be SelectorLocalParams")
@@ -241,7 +264,7 @@ def per_head_local_mlp(candidates, params):
         local.append(tuple(
             tuple(row) for row in _gemm_gelu(
                 a, [list(r) for r in params.w[h]], list(params.b[h]),
-                -7, -7, -7,
+                act_exp, wt_exp, dst_exp,
             )
         ))
     return tuple(local)
@@ -281,7 +304,9 @@ def concat_local_global(local, global_features):
     return tuple(out)
 
 
-def score_mlp_layers(local_global, params):
+def score_mlp_layers(local_global, params, concat_exp=-7, w1_exp=-7,
+                     h1_exp=-7, w2_exp=-7, h2_exp=-7, w3_exp=-7,
+                     logits_exp=-7):
     """Per-head 64->32->16->2 score MLP: returns (h1, h2, logits).
 
     Each list is [3 heads][C][width]: int8 GELU activations for the 32 and
@@ -292,20 +317,17 @@ def score_mlp_layers(local_global, params):
     local_global = tuple(local_global)
     if len(local_global) != 3:
         raise ValueError("local_global must have 3 heads")
-    act_exp = -7
-    wt_exp = -7
-    logits_exp = -7
     h1_all, h2_all, logits_all = [], [], []
     for h in range(3):
         a = [list(row) for row in local_global[h]]
         h1 = _gemm_gelu(a, [list(r) for r in params.w1[h]], list(params.b1[h]),
-                        act_exp, wt_exp, act_exp)
+                        concat_exp, w1_exp, h1_exp)
         h2 = _gemm_gelu(h1, [list(r) for r in params.w2[h]], list(params.b2[h]),
-                        act_exp, wt_exp, act_exp)
+                        h1_exp, w2_exp, h2_exp)
         logits = gemm_writeback(
             gemm_numpy(h2, [list(r) for r in params.w3[h]],
                        list(params.b3[h]), False),
-            act_exp + wt_exp, logits_exp, 8,
+            h2_exp + w3_exp, logits_exp, 8,
         )
         h1_all.append(tuple(tuple(row) for row in h1))
         h2_all.append(tuple(tuple(row) for row in h2))
@@ -313,16 +335,20 @@ def score_mlp_layers(local_global, params):
     return tuple(h1_all), tuple(h2_all), tuple(logits_all)
 
 
-def per_head_score_mlp(local_global, params):
+def per_head_score_mlp(local_global, params, concat_exp=-7, w1_exp=-7,
+                       h1_exp=-7, w2_exp=-7, h2_exp=-7, w3_exp=-7,
+                       logits_exp=-7):
     """Per-head 64->32->16->2 MLP: [3][C][64] -> head keep scores [3][C] Q0.16."""
-    h1, h2, logits = score_mlp_layers(local_global, params)
+    h1, h2, logits = score_mlp_layers(local_global, params, concat_exp,
+                                      w1_exp, h1_exp, w2_exp, h2_exp,
+                                      w3_exp, logits_exp)
     head_scores = []
     for h in range(3):
         rows = []
         for c in range(len(logits[h])):
             q16 = [
-                requant(int(logits[h][c][0]), -7, -16, 24),
-                requant(int(logits[h][c][1]), -7, -16, 24),
+                requant(int(logits[h][c][0]), logits_exp, -16, 24),
+                requant(int(logits[h][c][1]), logits_exp, -16, 24),
             ]
             rows.append(softmax_selector(q16)[1])
         head_scores.append(tuple(rows))
@@ -341,7 +367,8 @@ def mean_over_head_lanes(candidates):
     return tuple(out)
 
 
-def head_weight_mlp(stats, params):
+def head_weight_mlp(stats, params, stats_exp=-7, w1_exp=-7, hidden_exp=-7,
+                    w2_exp=-7):
     """Shared 3->3 GELU then 3->3 PLAN: [C][3] -> head weights [C][3] Q0.16."""
     if not isinstance(params, SelectorHeadWeightParams):
         raise TypeError("params must be SelectorHeadWeightParams")
@@ -349,14 +376,15 @@ def head_weight_mlp(stats, params):
     hidden = _gemm_gelu(
         [list(row) for row in stats],
         [list(r) for r in params.w1], list(params.b1),
-        -7, -7, -7,
+        stats_exp, w1_exp, hidden_exp,
     )
     acc = gemm_numpy(hidden, [list(r) for r in params.w2],
                      list(params.b2), False)
     weights = []
     for row in acc:
         weights.append(tuple(
-            sat_q016(plan_sigmoid(requant(int(v), -14, -16, 24))) for v in row
+            sat_q016(plan_sigmoid(requant(int(v), hidden_exp + w2_exp, -16,
+                                          24))) for v in row
         ))
     return tuple(weights)
 
@@ -488,12 +516,28 @@ def token_selector(tokens, package_present, params):
     package_present = int(bool(package_present))
 
     candidates = _reshape_candidates(tokens[1:])
-    local = per_head_local_mlp(candidates, params.local)
+    local = per_head_local_mlp(candidates, params.local,
+                               act_exp=params.in_scale_exp,
+                               wt_exp=params.local_w_scale_exp,
+                               dst_exp=params.local_out_scale_exp)
     global_features = mean_over_candidates(local)
     local_global = concat_local_global(local, global_features)
-    head_scores = per_head_score_mlp(local_global, params.score)
+    head_scores = per_head_score_mlp(
+        local_global, params.score,
+        concat_exp=params.concat_out_scale_exp,
+        w1_exp=params.score_w1_scale_exp,
+        h1_exp=params.h1_out_scale_exp,
+        w2_exp=params.score_w2_scale_exp,
+        h2_exp=params.h2_out_scale_exp,
+        w3_exp=params.score_w3_scale_exp,
+        logits_exp=params.logits_out_scale_exp)
     head_stats = mean_over_head_lanes(candidates)
-    head_weights = head_weight_mlp(head_stats, params.head_weight)
+    head_weights = head_weight_mlp(
+        head_stats, params.head_weight,
+        stats_exp=params.stats_out_scale_exp,
+        w1_exp=params.hw_w1_scale_exp,
+        hidden_exp=params.hw_hidden_out_scale_exp,
+        w2_exp=params.hw_w2_scale_exp)
     fused_scores, warn_head = fuse_head_scores(head_scores, head_weights)
 
     normals = list(tokens[1:])

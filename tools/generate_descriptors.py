@@ -340,12 +340,20 @@ def block_sequence(block_index, mm, flag4, sc):
     ]
 
 
-def selector_sequence(selector_index, mm, flag4):
-    """12 descriptors; the finalize writes the inactive activation slot."""
+def selector_sequence(selector_index, mm, flag4, sc):
+    """12 descriptors; the finalize writes the inactive activation slot.
+
+    Per-tensor scales (P5): every GEMM input/output exponent comes from
+    the scale table via ``sc`` (uniform -7 on the synthetic path, so the
+    synthetic ROM is byte-identical). The selector input token scale is
+    b3_out (stage 1) / b6_out (stage 2) / b9_out (stage 3); the bias
+    exponent stays (s0 + s1) by construction.
+    """
     s = mm["scratch"]
     w = mm["weight"]
     sel = s["selector"]
     prefix = f"s{selector_index}"
+    sel_in = f"b{3 * selector_index}_out"
     dyn_c = _flag(FLAG_DYNAMIC_M)
     return [
         _desc(OP_GEMM,
@@ -353,56 +361,64 @@ def selector_sequence(selector_index, mm, flag4):
                     FLAG_SRC0_CAND_MAJOR) | (POST_GELU << 8),
               m=196, n=32, k=64, heads=3, src0=192,
               src1=w[f"{prefix}_local_w"], bias=w[f"{prefix}_local_b"],
-              dst=sel["local"], s0=SCALES["activation"],
-              s1=SCALES["weight"], sdst=SCALES["activation"], param0=1),
+              dst=sel["local"], s0=sc(sel_in, "activation"),
+              s1=sc(f"{prefix}_local_w", "weight"),
+              sdst=sc(f"{prefix}_local_out", "activation"), param0=1),
         _desc(OP_REDUCE_MEAN, dyn_c, n=32, heads=3,
               src0=sel["local"], dst=sel["global"],
-              s0=SCALES["activation"], sdst=SCALES["activation"], param0=1),
+              s0=sc(f"{prefix}_local_out", "activation"),
+              sdst=sc(f"{prefix}_local_out", "activation"), param0=1),
         _desc(OP_CONCAT_LOCAL_GLOBAL,
               _flag(FLAG_DYNAMIC_M, FLAG_SRC1_SCRATCH),
               n=64, heads=3, src0=sel["local"], src1=sel["global"],
-              dst=sel["concat"], s0=SCALES["activation"],
-              sdst=SCALES["activation"], param0=1),
+              dst=sel["concat"], s0=sc(f"{prefix}_local_out", "activation"),
+              sdst=sc(f"{prefix}_concat_out", "activation"), param0=1),
         _desc(OP_GEMM,
               _flag(FLAG_HEAD_MODE, FLAG_BIAS_ENABLE, FLAG_DYNAMIC_M) |
                   (POST_GELU << 8),
               m=196, n=32, k=64, heads=3, src0=sel["concat"],
               src1=w[f"{prefix}_score_w1"], bias=w[f"{prefix}_score_b1"],
-              dst=sel["h1"], s0=SCALES["activation"],
-              s1=SCALES["weight"], sdst=SCALES["activation"], param0=1),
+              dst=sel["h1"], s0=sc(f"{prefix}_concat_out", "activation"),
+              s1=sc(f"{prefix}_score_w1", "weight"),
+              sdst=sc(f"{prefix}_h1_out", "activation"), param0=1),
         _desc(OP_GEMM,
               _flag(FLAG_HEAD_MODE, FLAG_BIAS_ENABLE, FLAG_DYNAMIC_M) |
                   (POST_GELU << 8),
               m=196, n=16, k=32, heads=3, src0=sel["h1"],
               src1=w[f"{prefix}_score_w2"], bias=w[f"{prefix}_score_b2"],
-              dst=sel["h2"], s0=SCALES["activation"],
-              s1=SCALES["weight"], sdst=SCALES["activation"], param0=1),
+              dst=sel["h2"], s0=sc(f"{prefix}_h1_out", "activation"),
+              s1=sc(f"{prefix}_score_w2", "weight"),
+              sdst=sc(f"{prefix}_h2_out", "activation"), param0=1),
         _desc(OP_GEMM,
               _flag(FLAG_HEAD_MODE, FLAG_BIAS_ENABLE, FLAG_DYNAMIC_M),
               m=196, n=2, k=16, heads=3, src0=sel["h2"],
               src1=w[f"{prefix}_score_w3"], bias=w[f"{prefix}_score_b3"],
-              dst=sel["logits"], s0=SCALES["activation"],
-              s1=SCALES["weight"], sdst=SCALES["activation"], param0=1),
+              dst=sel["logits"], s0=sc(f"{prefix}_h2_out", "activation"),
+              s1=sc(f"{prefix}_score_w3", "weight"),
+              sdst=sc(f"{prefix}_logits_out", "activation"), param0=1),
         _desc(OP_SELECTOR_SOFTMAX, dyn_c, n=2, heads=3,
               src0=sel["logits"], dst=sel["keep"],
-              s0=SCALES["activation"], sdst=SCALES["selector_q0_16"],
-              param0=1),
+              s0=sc(f"{prefix}_logits_out", "activation"),
+              sdst=SCALES["selector_q0_16"], param0=1),
         _desc(OP_REDUCE_MEAN, dyn_c, n=64, heads=3,
               src0=192, dst=sel["stats"],
-              s0=SCALES["activation"], sdst=SCALES["activation"], param0=5),
+              s0=sc(sel_in, "activation"),
+              sdst=sc(f"{prefix}_stats_out", "activation"), param0=5),
         _desc(OP_GEMM,
               _flag(FLAG_BIAS_ENABLE, FLAG_DYNAMIC_M) | (POST_GELU << 8),
               m=196, n=3, k=3, src0=sel["stats"],
               src1=w[f"{prefix}_hw_w1"], bias=w[f"{prefix}_hw_b1"],
-              dst=sel["hw_hidden"], s0=SCALES["activation"],
-              s1=SCALES["weight"], sdst=SCALES["activation"], param0=1),
+              dst=sel["hw_hidden"], s0=sc(f"{prefix}_stats_out",
+                                          "activation"),
+              s1=sc(f"{prefix}_hw_w1", "weight"),
+              sdst=sc(f"{prefix}_hw_hidden_out", "activation"), param0=1),
         _desc(OP_GEMM,
               _flag(FLAG_BIAS_ENABLE, FLAG_DYNAMIC_M) | (POST_PLAN << 8),
               m=196, n=3, k=3, src0=sel["hw_hidden"],
               src1=w[f"{prefix}_hw_w2"], bias=w[f"{prefix}_hw_b2"],
-              dst=sel["hw"], s0=SCALES["activation"],
-              s1=SCALES["weight"], sdst=SCALES["selector_q0_16"],
-              param0=1),
+              dst=sel["hw"], s0=sc(f"{prefix}_hw_hidden_out", "activation"),
+              s1=sc(f"{prefix}_hw_w2", "weight"),
+              sdst=SCALES["selector_q0_16"], param0=1),
         _desc(OP_HEAD_FUSE, _flag(FLAG_DYNAMIC_M, FLAG_SRC1_SCRATCH),
               n=3, heads=3, src0=sel["keep"], src1=sel["hw"],
               dst=sel["fused"], s0=SCALES["selector_q0_16"],
@@ -412,8 +428,8 @@ def selector_sequence(selector_index, mm, flag4):
               _flag(FLAG_DYNAMIC_M, FLAG_SRC1_SCRATCH) |
                   (_flag(FLAG_SWAP_ACTIVATION) if flag4 else 0),
               m=197, n=192, src0=0, src1=sel["fused"], dst=0,
-              s0=SCALES["activation"], s1=SCALES["selector_q0_16"],
-              sdst=SCALES["activation"], param0=0),
+              s0=sc(sel_in, "activation"), s1=SCALES["selector_q0_16"],
+              sdst=sc(sel_in, "activation"), param0=0),
     ]
 
 
@@ -453,7 +469,8 @@ def build_schedule(memory_map, scale_table=None):
     for block_index in range(1, 13):
         if block_index in (4, 7, 10):
             selector_index = {4: 1, 7: 2, 10: 3}[block_index]
-            descs.extend(selector_sequence(selector_index, memory_map, True))
+            descs.extend(selector_sequence(selector_index, memory_map, True,
+                                           sc))
         descs.extend(block_sequence(block_index, memory_map, True, sc))
     descs.extend(final_layernorm_sequence(memory_map, sc))
     descs.extend(classifier_sequence(memory_map, sc))
