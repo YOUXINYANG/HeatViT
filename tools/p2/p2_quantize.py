@@ -22,6 +22,7 @@ log (p2_out/ is gitignored; the sandbox denies writes under build/).
 
 import argparse
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -43,9 +44,14 @@ from tools.p2.scale_table import (
     ScaleTable,
 )
 
-CHECKPOINT = (r"C:\Users\Youxi\.cache\torch\hub\checkpoints"
-              r"\deit_tiny_patch16_224-a1311bcf.pth")
-DATA_DIR = r"D:\SEU_Liubo\prj\HeatViT\data\imagenet\val"
+# 数据与权重路径：环境变量优先（云端/AutoDL 用），默认保持本机路径不变。
+_IMAGENET_DIR = os.environ.get(
+    "HEATVIT_IMAGENET_DIR", r"D:\SEU_Liubo\prj\HeatViT\data\imagenet")
+DATA_DIR = os.path.join(_IMAGENET_DIR, "val").replace("\\", "/")
+CHECKPOINT = os.environ.get(
+    "HEATVIT_DEIT_CHECKPOINT",
+    r"C:\Users\Youxi\.cache\torch\hub\checkpoints"
+    r"\deit_tiny_patch16_224-a1311bcf.pth")
 
 LN_INPUT_NAMES = {"act_tokens"} | {f"b{n}_y" for n in range(1, 13)} \
     | {f"b{n}_out" for n in range(1, 13)}

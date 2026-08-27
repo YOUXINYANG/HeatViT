@@ -14,13 +14,18 @@ Data loading uses num_workers > 0 (spawn on Windows): callers must run
 under an ``if __name__ == "__main__":`` guard, like p2_qat.py does.
 """
 
+import os
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
-TRAIN_DIR = r"D:\SEU_Liubo\prj\HeatViT\data\imagenet\train"
+# ImageNet 根目录：HEATVIT_IMAGENET_DIR 环境变量优先（云端/AutoDL 用），
+# 默认保持本机 Windows 路径不变。
+_IMAGENET_DIR = os.environ.get(
+    "HEATVIT_IMAGENET_DIR", r"D:\SEU_Liubo\prj\HeatViT\data\imagenet")
+TRAIN_DIR = os.path.join(_IMAGENET_DIR, "train").replace("\\", "/")
 
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
