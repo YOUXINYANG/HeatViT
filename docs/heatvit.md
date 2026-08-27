@@ -4917,6 +4917,13 @@ b11_out=−3）且 in_x 恰好在切换后不变（本行前两个元素都是 �
 **结论**：P4-2A λ=5 权重已部署回 RTL 并通过逐位回归，训练侧精度收益
 在硬件上闭环，验收口径不变（18 检查点 + 1000 Logit 零容差）。
 
+**非 LN cherry-pick 复核（D3 遗留选项）**：以 Q2 重校准表的 13 处非 LN
+激活尺度变化应用于 P4A 权重并双口径评估——未剪枝 5k 76.02% →
+**75.66%（−0.36pp）**、剪枝 5k 72.70% → **72.62%（−0.08pp）**，计数
+不变（93.0/44.2/37.8）。按 D3 门槛（≥ +0.1pp 才采用）**不采用**：
+Q2 权重上 +0.34pp 的收益在 P4A 权重上转为惩罚，印证「训练越充分、
+换尺度惩罚越大」——冻结 PTQ 表纪律贯穿到最终权重。
+
 # 第三部分：仿真与验证指南
 
 本节说明如何从零复现全部仿真验证（环境变量、向量生成、回归命令、日志
@@ -5003,6 +5010,39 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_regression.ps1 -
 e2e 结论严格限定为「合成权重下的**仿真逐位通过**」：未验证 ImageNet
 准确率、时序、功耗、FPS 或上板功能；合成权重无分类意义。详细结果与
 排除项见本文第五部分。
+
+## 9. P5 真实权重回归（QAT 权重导出 + 逐位回归）
+
+把训练产出的 QAT/剪枝权重导出回 RTL 并重跑逐位回归（P5，§14.14）。
+工具链固化在 `scripts/p5_export.ps1`（导出 + 交叉核对）与
+`scripts/p5_run_e2e.ps1`（6 轮回归，断点续跑 + 周期记录）：
+
+```powershell
+# 0. torch venv（p2_export_weights / p5_crosscheck 需要 torch）
+# 1. 导出：黄金模型 ↔ 部署模拟器逐字节核对，再产出每图向量目录 +
+#    每张量尺度描述符 ROM（--write-rom，仅在无 XSim 运行时执行）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/p5_export.ps1 `
+  -Checkpoint p2_out/qat/p4a_rate5_16k/best.pt `
+  -Selectors p2_out/selectors_sup4.pt -Table p2_out/scale_table.json `
+  -Output build/vectors/e2e_p5
+
+# 2. 逐位回归：img0..2 × STALL_MASK=0/3 共 6 轮（每轮 ~40 分钟），
+#    每图配置由脚本自动 staging；周期记录写入
+#    build/reports/p5_e2e_runs.txt，.pass 标记支持中断后续跑
+$env:HEATVIT_VIVADO_BIN = 'D:\vivado\vivado2023.2\Vivado\2023.2\bin'
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/p5_run_e2e.ps1 `
+  -VectorDir build/vectors/e2e_p5
+
+# 3. 恢复合成状态（ROM + e2e 向量 + 共享 TB 配置；确定性生成，
+#    与提交状态逐字节一致）后再跑标准回归
+.\.venv\Scripts\python tools/generate_descriptors.py --config config/heatvit_t.json
+.\.venv\Scripts\python tools/generate_e2e_vectors.py --seed 20260815 --output build/vectors/e2e
+```
+
+验收口径与合成套件相同：18 检查点 + 1000 Logit 与整数黄金模型零容差
+逐字节一致；三图逐图动态 Token 数写入各图 `manifest.json`，TB 配置
+按图 staging。换权重时只需重跑步骤 1–2，步骤 3 恢复合成状态后跑
+`-Suite all` 确认无回归。
 
 # 第四部分：内存与权重格式
 
