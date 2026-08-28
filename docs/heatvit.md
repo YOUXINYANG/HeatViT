@@ -29,11 +29,16 @@ contract softmax/LN）**76.40%@3k / 76.06%@5k**（浮点同子集
 计数近目标 88/45/32）；D3 裁定弃用训练后重校准；选择器重训（B）
 排序增益未兑现。**P5 已把该权重导出回 RTL 并通过 XSim 端到端逐位
 回归**（修复一处 LN 陈旧尺度缺陷，§14.14）。剩余精度提升路径：
-教师 A/B / 全量 QAT / 联合微调。详见第二部分 §14。P6（§15）完成 Vivado
-综合与资源统计：RTL 可综合性验证通过（0 黑盒、0 锁存器、DSP/BRAM 正常
-推断），但综合级 LUT 918,145（opt_design 后 902,658，442.9%）约为
-`xc7k325tfbg900-3` 容量的 4.4 倍，实现未能进行；超标集中在 vector 与
-layout 两引擎的动态字节寻址缓冲 mux 网络，P7 资源优化已规划。
+教师 A/B / 全量 QAT / 联合微调。详见第二部分 §14。
+
+P6（§15）完成 Vivado 综合与资源统计：RTL 可综合性验证通过（0 黑盒、0 锁存器、
+DSP/BRAM 正常推断），但综合级 LUT 918,145（450.5%）约为 `xc7k325tfbg900-3`
+容量的 4.4 倍，实现未能进行；超标集中在动态字节寻址寄存器数组被综合成的
+mux 网络。**P7-1 / P7-2 资源优化已完成**：vector/layout 两引擎与 selector
+侧七模块的寄存器数组全部重构为字节写使能 SDP RAM / 串行化访问，全量逐位
+回归（e2e 两轮 + 错误矩阵）全绿，全量多核综合 LUT **918,145 → 126,459
+（62.05%）**，首次跨过 100% 可布线性门槛；实现与 100 MHz 时序收敛、P7③
+MAC DSP 化为后续步骤。
 
 **关键词：** Vision Transformer；动态 Token 剪枝；定点量化；FPGA；
 SystemVerilog；描述符调度；逐位仿真验证
@@ -5042,6 +5047,131 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_synth.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_impl.ps1 -Jobs 24    # 待 P7 达标后
 .\.venv\Scripts\python tools\p6\p6_summary.py
 ```
+
+### P7-1：bbuf→BRAM 资源优化（2026-08-28）
+
+对 P6 定位的两大 LUT 大户（vector/layout 两引擎动态字节寻址 bbuf，合计 77%）实施
+寄存器数组→字节写使能 SDP RAM 重构。位精确口径不变：全部改动为「时序等价改写」，
+数值通路（舍入/饱和/尺度）未动。每步改动后跑全量逐位回归。
+
+**vector_engine（原 397,419 LUT）**：`bbuf`(2048×8) 拆为 5 个 `heatvit_sdp_ram`：
+
+| RAM | 尺寸 | 用途 |
+| --- | --- | --- |
+| ram_x / ram_g / ram_b | 24×64 | LN x/γ/β 暂存；RESIDUAL 复用 x=main、g=aux、b=输出暂存 |
+| ram_o | 32×64 | LN 输出暂存；ATTN out_row 按 +wr_e 预偏移存放（写出口整字对齐读） |
+| ram_s | 128×64 | ATTN score 原始流 |
+
+- **ATTN score 解包去 mux 化**：原 S_SM_PREP 单拍 197×4=788 次动态字节读（单点最大
+  mux 树）改为**顺序双字窗口解包**：score k 的 4 字节必落在相邻两字内，用
+  `{rdata_s, prev_word}` 16 字节窗口 + 4 个 16:1 mux 逐拍解包（每拍 1 个 score，
+  约 2m 拍/行，e2e 周期开销可忽略）。
+- **寄存读时延补偿**：模板读为寄存读（rdata(T)=mem[raddr(T-1)]），地址必须领先
+  消费拍。S_LN_IN/S_ELEM 数据字节索引与地址字节索引分别超前（地址再 +1）；
+  S_SM_PREP 窗口需**两拍前瞻**地址（raddr_{k+2}）。
+- **写出口背压安全**：S_WR_BEAT 的前瞻地址只在 beat 被接受（req_w_valid &&
+  req_w_ready）的那拍前进，stall 期间保持当前字——否则背压会让前瞻过度前进、
+  突发数据整体错位一个词（STALL_MASK=3 回归捕获并修复）。
+
+**layout_engine（原 310,517 LUT）**：`bbuf`(10752×8) 拆为 6 个 `heatvit_sdp_ram`：
+ram_p 1344×64（PATCHIFY 16 行窗口）、ram_q 72×64、ram_h/m/a/o 各 24×64。
+关键洞察：**PATCHIFY 输出 beat b 的 8 字节映射到输入缓冲的连续对齐 64-bit 字**
+（`word(b) = (b/6)*84 + pc*6 + (b%6)`，由 48 与 8 的整除性质导出），原 wr_byte()
+逐字节 mux 网络整体退化为纯算术地址 + 单字读。QKV/HEAD_CONCAT/COPY_ADD_POS 同理
+全部对齐。写出口同 vector 的背压安全前瞻。
+
+**OOC 综合（模块级，最终代码）**：
+
+| 引擎 | 原 LUT | 新 LUT | 降幅 | RAMB36 | DSP |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| heatvit_vector_engine | 397,419 | **20,114** | −94.9% | 5 | 47 |
+| heatvit_layout_engine | 310,517 | **4,000** | −98.7% | 9 | 3 |
+| 合计 | 707,936 | **24,114** | −96.6% | 14 | 50 |
+
+全设计预估 LUT ≈ 918,145 − 707,936 + 24,114 ≈ **234K（115%）**——P7① 单独仍略超
+容量，**P7②（head_fuse/reduce_mean/selector_softmax/finalize/packager/
+feature_concat/compactor 同类数组转换，~156K）是跨过 100% 门槛的必要条件**；
+P7③ MAC DSP 化（~51K）随后补齐裕量。F7/F8 mux 超标（138%/127%）随之消失
+（OOC 中 F7=2020、F8=774）。
+
+**调试记录（两处潜伏时序缺陷，均由背压/未对齐边界暴露）**：
+
+1. **写出口前瞻 stall 溢出**：S_WR_BEAT 恒定 raddr=wr_bi+1，背压多拍时 rdata
+   提前前进一个词，beat 握手完成时写出错位数据（tb_tensor_executor 的 QKV
+   dynamic-M 检查点首字节即命中，got=0xeb=行内第 8 字节）。修复：仅在 beat 被
+   接受拍前瞻。开发期用独立调试 TB `sim/tb/tb_p7_qkv_dbg.sv`（含背压模型）定位。
+2. **S_SM_PREP 窗口单拍前瞻不足**：窗口上字要求 rdata_s 在 Wk 拍 = word(raddr_k)，
+   而寄存读使 rdata_s(Wk) = word(s_raddr(W{k-1}))，需 s_raddr 领先两拍
+   （raddr_{k+2}）；字地址前进的那一拍读旧词（tb_mhsa 的 prob 检查点命中；
+   rd_e=0 对齐用例侥幸通过，mhsa9 未对齐暴露）。修复：P1 置 raddr_0、P2 置
+   raddr_1、Wk 置 raddr_{k+2}，接收期 raddr_s 恒 0 预热窗口低半字。
+
+**全量综合（-Jobs 24，2026-08-28，38 分钟——mux 树移除后综合本身也大幅加速）**：
+
+| 资源 | P6 综合级 | P7-1 综合级 | 可用 | P7-1 占用率 |
+| --- | ---: | ---: | ---: | ---: |
+| Slice LUTs | 918,145 | **238,271** | 203,800 | **116.9%** |
+| Slice Registers | 229,155 | 125,273 | 407,600 | 30.7% |
+| Block RAM Tile | 12 | **26** | 445 | 5.8% |
+| DSP48E1 | 112 | 88 | 840 | 10.5% |
+| F7 / F8 Muxes | 140,822 / 64,434 | 22,973 / 7,860 | — | 22.5% / 15.4% |
+
+0 黑盒、0 锁存器。分层：u_vector **19,315**（原 397,419）、u_layout **3,998**
+（原 310,517）、u_gemm 87,759（原 87,766，未动）、finalize 等其余引擎未动。
+**结论：P7① 把 LUT 从 450.5% 降至 116.9%（−333.6pp），仍差 ~17pp 无法 place；**
+**P7②（其余引擎同类数组 ~156K）是跨过 100% 门槛的确定性下一步**，预期达标后
+LUT ≈ 100–130K（50–65%），随后 P7③ MAC DSP 化补裕量并重跑 impl + 100 MHz 时序。
+
+**验证**：foundation/gemm/transformer/selector 全量回归 + e2e 无回压/回压两轮 +
+错误矩阵全部 TEST_PASS（Python 单元测试全绿）。综合脚本修复：已完成状态的
+synth_1 run 在源文件变更后需先 `reset_run` 才能重新 launch。
+
+### P7-2：同类数组推广——selector 侧七模块（2026-08-28）
+
+P7① 后全设计 LUT 238,271（116.9%）。P7② 按同一模式推广到 selector 侧七个模块的
+寄存器数组（P7① 后实测基线合计 **124,626 LUT**），OOC 综合（最终代码）：
+
+| 模块 | 基线 LUT | 转换后 LUT | 降幅 | 要点 |
+| --- | ---: | ---: | ---: | --- |
+| heatvit_selector_finalize（含 packager/compactor） | 43,274 | 1,894 | −95.6% | sbuf[788]→128×64；packager wnum/fsum/obuf→3 RAM，接收突发 9 拍/beat 串行 RMW；compactor rbuf→24×64 |
+| heatvit_selector_softmax | 32,903 | 6,158 | −81.3% | lbuf[1182]→148×64（logit 对恒单字）+ obuf[2364]→296×64 |
+| heatvit_head_fuse | 24,264 | 660 | −97.3% | sbuf/wbuf→296×64 + obuf→128×64；6 拍 S_FETCH 预取替代 word_at mux 网络 |
+| heatvit_reduce_mean | 22,309 | 6,434 | −71.2% | 逐字节可变除法 → 寄存器行计数器（beat 恒在单行内）；obuf→128×64 |
+| heatvit_feature_concat | 1,876 | 262 | −86.0% | bbuf[64]→8×64 |
+| 合计 | 124,626 | **15,408** | −87.6% | — |
+
+**全量综合（-Jobs 24，2026-08-28，6 分钟）**：
+
+| 资源 | P6 | P7① | P7② | 占用率 |
+| --- | ---: | ---: | ---: | ---: |
+| Slice LUTs | 918,145 | 238,271 | **126,459** | **62.05%** ✓ |
+| Slice Registers | 229,155 | 125,273 | 47,550 | 11.67% |
+| Block RAM Tile | 12 | 26 | 37 | 8.3% |
+| DSP48E1 | 112 | 88 | 81 | 9.6% |
+| F7 / F8 Muxes | 140,822 / 64,434 | 22,973 / 7,860 | 8,360 / 2,032 | 8.2% / 4.0% |
+
+0 黑盒、0 锁存器。**结论：全设计 LUT 从 450.5% 经 116.9% 降至 62.05%，首次显著
+跨过 100% 可布线性门槛**（目标 ≤203,800 达成，优于 ~129K 预估）。综合脚本修复：
+已完成状态的 synth_1 run 在源文件变更后需先 `reset_run`；Vivado 2023.2 增量
+综合（mimic-skeleton）在大幅重构下 EXCEPTION_ACCESS_VIOLATION，已通过
+HeatViT.xpr 关闭 AutoIncrementalCheckpoint 绕过。
+
+**调试记录（五处缺陷，全部由快速门禁/全量回归捕获并修复）**：
+
+1. head_fuse 捕获字节偏移错位（取 byte1..3 而非 byte0..2）+ S_FETCH 地址需
+   领先一拍（S_DIV_WAIT 预取下一候选 s0 字）+ w1/w2 字地址与偏移随 cc 奇偶
+   变化（w1 字 = w0 字 + cc[0]，偏移 4·(!cc[0])）。
+2. reduce_mean 候选轴行计数器应每 4 拍（一行 = 32B）前进；obuf 字节索引 8 位
+   截断导致 cc_row≥86 回绕（行 85 的 head-1 值覆盖字节 0）。
+3. packager 的 Q0.16 score 1.0（65536）在 17 位 $signed 下变 −65536 →
+   {1'b0, score} 无符号扩展；另：调试探针剥离残留 `if (rd_bi == 5'd0)` 包裹
+   导致 S_ACC_ELEM 在 rd_bi≥1 冻结（限时 tclbatch 运行 + 状态探针定位）。
+4. 全部 RAM 读遵循 P7① 铁律：寄存器读地址领先消费拍、写出口前瞻仅在接受拍
+   前进、动态索引钳位防 X。
+
+**验证**：快速门禁（tb_selector_features/tb_head_fuse/tb_selector_finalize/
+tb_token_selector）+ 全量回归（transformer + e2e 无回压/回压两轮 + 错误矩阵）
+全部 TEST_PASS。
 
 # 第三部分：仿真与验证指南
 

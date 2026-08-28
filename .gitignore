@@ -35,3 +35,6 @@ xelab*.log
 build/
 *.whl
 tmp/
+
+# XSim compiled library (workspace root)
+xil_defaultlib/

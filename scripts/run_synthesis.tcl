@@ -61,11 +61,16 @@ if { ![file exists $pre_tcl] } {
 }
 set_property STEPS.SYNTH_DESIGN.TCL.PRE $pre_tcl [get_runs synth_1]
 
-# Launch synthesis (reset only a half-finished previous run).
+# Launch synthesis (reset any previous run: Vivado refuses to launch a
+# completed run whose sources have changed). Incremental synthesis is
+# bypassed by deleting the reference checkpoint before the launch (the
+# mimic-skeleton phase crashes on heavily rewritten modules).
 set run_status [get_property STATUS [get_runs synth_1]]
-if { $run_status ne "Not started" && $run_status ne "synth_design Complete!" } {
+if { $run_status ne "Not started" } {
   reset_run synth_1
 }
+set incr_dir [file join $repo_root HeatViT.srcs utils_1 imports synth_1]
+file delete -force $incr_dir
 launch_runs synth_1 -jobs $jobs
 wait_on_run synth_1 -timeout 21600
 

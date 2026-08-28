@@ -12,6 +12,22 @@
 // ``fsum[d] / participants`` and pulses warn_package_den_zero. The row is
 // then written to div_addr and the accumulators are cleared for the next
 // descriptor.
+//
+// P7-2 (2026-08-28): the three dynamic byte-addressed register arrays
+// (`wnum`, `fsum`, `obuf`) are replaced by byte-write-enable SDP RAMs:
+//   ram_wnum 192x64  48-bit signed weighted numerator per channel
+//   ram_fsum 192x64  32-bit signed unweighted fallback sum per channel
+//   ram_obuf  24x64  package output byte buffer (one word per beat)
+// The receive burst is serialised: each accepted 64-bit beat is latched and
+// its 8 lanes are folded into ram_wnum/ram_fsum one channel per cycle via a
+// read-then-write pipeline (9 cycles/beat, READ_FIRST guarantees the read
+// sees the pre-update value because raddr leads waddr by one). The divide
+// loop reads one channel per cycle with a one-cycle lookahead address that
+// advances only when div_req is accepted (holding the presentation stable
+// under arbiter backpressure), and clears the consumed wnum/fsum entry in
+// the response cycle, so the accumulators are zeroed by the time the
+// package write-out begins. The write-out reads ram_obuf as whole 64-bit
+// words with a one-beat lookahead. Bit-exact behaviour is unchanged.
 module heatvit_token_packager
   import heatvit_pkg::*;
 #(
@@ -65,7 +81,9 @@ module heatvit_token_packager
     S_IDLE,
     S_ACC_RD_REQ,
     S_ACC_RD_RECV,
+    S_ACC_ELEM,
     S_ACC_DONE,
+    S_DIV_PRIME,
     S_DIV_REQ,
     S_DIV_WAIT,
     S_WR_REQ,
@@ -79,8 +97,6 @@ module heatvit_token_packager
   logic [16:0] acc_score_r;
   logic [31:0] div_addr_r;
 
-  logic signed [47:0] wnum [0:191];
-  logic signed [31:0] fsum [0:191];
   logic [31:0] den_r;
   logic [8:0]  count_r;
 
@@ -89,26 +105,115 @@ module heatvit_token_packager
   logic [7:0]  d;            // channel 0..191
   logic        sign_r;
   logic [63:0] div_den_r;
-  logic [7:0]  obuf [0:191];
   logic [4:0]  wr_bi;
-  logic [63:0] wr_data_c;
 
-  integer bi;
-  initial begin
-    for (bi = 0; bi < 192; bi++) begin
-      wnum[bi] = 48'sd0;
-      fsum[bi] = 32'sd0;
-      obuf[bi] = 8'h00;
-    end
-  end
+  // Serialised accumulate lane state.
+  logic [63:0] acc_beat;     // latched receive beat
+  logic [3:0]  acc_step;     // 0 = prime, 1..8 = write lane (step-1)
+  
+  // Staging RAMs.
+  logic        we_wnum, we_fsum, we_obuf;
+  logic [7:0]  waddr_wnum, waddr_fsum;
+  logic [4:0]  waddr_obuf;
+  logic [63:0] wdata_wnum, wdata_fsum, wdata_obuf;
+  logic [7:0]  wstrb_obuf;
+  logic [7:0]  raddr_wnum, raddr_fsum;
+  logic [4:0]  raddr_obuf;
+  logic [63:0] rdata_wnum, rdata_fsum, rdata_obuf;
+
+  heatvit_sdp_ram #(.WIDTH(64), .DEPTH(192)) u_ram_wnum (
+    .clk(clk), .we(we_wnum), .waddr(waddr_wnum), .wdata(wdata_wnum),
+    .wstrb(8'hFF), .raddr(raddr_wnum), .rdata(rdata_wnum)
+  );
+  heatvit_sdp_ram #(.WIDTH(64), .DEPTH(192)) u_ram_fsum (
+    .clk(clk), .we(we_fsum), .waddr(waddr_fsum), .wdata(wdata_fsum),
+    .wstrb(8'hFF), .raddr(raddr_fsum), .rdata(rdata_fsum)
+  );
+  heatvit_sdp_ram #(.WIDTH(64), .DEPTH(24)) u_ram_obuf (
+    .clk(clk), .we(we_obuf), .waddr(waddr_obuf), .wdata(wdata_obuf),
+    .wstrb(wstrb_obuf), .raddr(raddr_obuf), .rdata(rdata_obuf)
+  );
+
+  // ------------------------------------------------------------------
+  // Accumulate lane arithmetic (S_ACC_ELEM write cycles).
+  // ------------------------------------------------------------------
+  logic [7:0]  acc_ch_w;     // channel being written this cycle
+  logic signed [47:0] wnum_next;
+  logic signed [31:0] fsum_next;
 
   always_comb begin
-    wr_data_c = 64'h0000000000000000;
-    if (state == S_WR_BEAT) begin
-      for (int j = 0; j < 8; j++)
-        wr_data_c[8*j +: 8] = obuf[int'(wr_bi) * 8 + j];
+    logic signed [7:0] b;
+    if (acc_step >= 4'd1) begin
+      acc_ch_w = 8'(int'(rd_bi) * 8 + int'(acc_step) - 1);
+      b        = acc_beat[8*(acc_step - 4'd1) +: 8];
+    end else begin
+      acc_ch_w = 8'd0;
+      b        = 8'sd0;
+    end
+    wnum_next = $signed(rdata_wnum[47:0]) +
+                $signed({1'b0, acc_score_r}) * b;
+    fsum_next = $signed(rdata_fsum[31:0]) + b;
+  end
+
+  // ------------------------------------------------------------------
+  // RAM write ports.
+  // ------------------------------------------------------------------
+  assign we_wnum = ((state == S_ACC_ELEM) && (acc_step >= 4'd1)) ||
+                   ((state == S_DIV_WAIT) && div_rsp_valid);
+  assign we_fsum = ((state == S_ACC_ELEM) && (acc_step >= 4'd1)) ||
+                   ((state == S_DIV_WAIT) && div_rsp_valid);
+
+  assign waddr_wnum = (state == S_ACC_ELEM) ? acc_ch_w : d;
+  assign waddr_fsum = (state == S_ACC_ELEM) ? acc_ch_w : d;
+
+  assign wdata_wnum = (state == S_ACC_ELEM)
+                      ? {{16{wnum_next[47]}}, wnum_next} : 64'd0;
+  assign wdata_fsum = (state == S_ACC_ELEM)
+                      ? {{32{fsum_next[31]}}, fsum_next} : 64'd0;
+
+  // obuf: byte writes during the divide response.
+  logic [7:0] obuf_byte;
+  always_comb begin
+    logic [63:0] rounded;
+    logic [7:0]  res;
+    rounded = div_quot + ((64'd2 * div_rem >= div_den_r) ? 64'd1 : 64'd0);
+    if (!sign_r && rounded > 64'd127)      res = 8'sd127;
+    else if (sign_r && rounded > 64'd128)  res = -8'sd128;
+    else res = sign_r ? -$signed(rounded[7:0]) : $signed(rounded[7:0]);
+    obuf_byte = res;
+  end
+
+  assign we_obuf    = (state == S_DIV_WAIT) && div_rsp_valid;
+  assign waddr_obuf = d[7:3];
+  assign wdata_obuf = {56'd0, obuf_byte} << (8 * int'(d[2:0]));
+  assign wstrb_obuf = 8'b1 << d[2:0];
+
+  // ------------------------------------------------------------------
+  // RAM read ports (registered reads; addresses issued one cycle ahead).
+  // ------------------------------------------------------------------
+  always_comb begin
+    raddr_wnum = 8'd0;
+    if (state == S_ACC_ELEM) begin
+      raddr_wnum = (int'(rd_bi) * 8 + int'(acc_step) > 191)
+                   ? 8'd191 : 8'(int'(rd_bi) * 8 + int'(acc_step));
+    end else if (state == S_DIV_PRIME) begin
+      raddr_wnum = 8'd0;
+    end else if (state == S_DIV_REQ) begin
+      if (div_req_valid && div_req_ready)
+        raddr_wnum = (d == 8'd191) ? 8'd191 : d + 8'd1;
+      else
+        raddr_wnum = d;
+    end else if (state == S_DIV_WAIT) begin
+      raddr_wnum = (d == 8'd191) ? 8'd191 : d + 8'd1;
     end
   end
+  assign raddr_fsum = raddr_wnum;
+
+  wire w_accept = (state == S_WR_BEAT) && req_w_valid && req_w_ready;
+  assign raddr_obuf = (state == S_WR_BEAT)
+                      ? (w_accept ? ((wr_bi == 5'd23) ? 5'd23 : wr_bi + 5'd1)
+                                  : wr_bi)
+                      : 5'd0;
 
   assign req_valid   = (state == S_ACC_RD_REQ) || (state == S_WR_REQ);
   assign req_write   = (state == S_WR_REQ);
@@ -116,26 +221,29 @@ module heatvit_token_packager
   assign req_bytes   = 32'd192;
   assign req_r_ready = r_ready_r;
   assign req_w_valid = (state == S_WR_BEAT);
-  assign req_w_data  = wr_data_c;
+  assign req_w_data  = rdata_obuf;
   assign req_w_strb  = 8'hff;
   assign req_w_last  = (wr_bi == 5'd23);
 
   assign participants   = count_r;
-  assign acc_busy       = (state == S_ACC_RD_REQ) || (state == S_ACC_RD_RECV);
-  assign div_busy       = (state == S_DIV_REQ) || (state == S_DIV_WAIT) ||
+  assign acc_busy       = (state == S_ACC_RD_REQ) || (state == S_ACC_RD_RECV) ||
+                          (state == S_ACC_ELEM);
+  assign div_busy       = (state == S_DIV_PRIME) || (state == S_DIV_REQ) ||
+                          (state == S_DIV_WAIT) ||
                           (state == S_WR_REQ) || (state == S_WR_BEAT);
   assign div_req_valid  = (state == S_DIV_REQ);
 
   always_comb begin
     logic [47:0] num_c;
-    logic [31:0] den_c;
     div_num = 64'd0;
     div_den = 64'd1;
     if (state == S_DIV_REQ) begin
-      num_c = (den_r == 32'd0) ? {{16{fsum[d][31]}}, fsum[d]} : wnum[d];
-      den_c = (den_r == 32'd0) ? {23'd0, count_r} : den_r;
+      if (den_r == 32'd0)
+        num_c = {{16{rdata_fsum[31]}}, rdata_fsum[31:0]};
+      else
+        num_c = rdata_wnum[47:0];
       div_num = {16'd0, (num_c[47] ? -num_c : num_c)};
-      div_den = {32'd0, den_c};
+      div_den = {32'd0, ((den_r == 32'd0) ? {23'd0, count_r} : den_r)};
     end
   end
 
@@ -154,11 +262,9 @@ module heatvit_token_packager
       div_den_r   <= 64'd1;
       den_r       <= 32'd0;
       count_r     <= 9'd0;
+      acc_beat    <= 64'd0;
+      acc_step    <= 4'd0;
       warn_package_den_zero <= 1'b0;
-      for (int k = 0; k < 192; k++) begin
-        wnum[k] <= 48'sd0;
-        fsum[k] <= 32'sd0;
-      end
     end else begin
       acc_done    <= 1'b0;
       div_done    <= 1'b0;
@@ -168,10 +274,6 @@ module heatvit_token_packager
       if (reset_acc) begin
         den_r   <= 32'd0;
         count_r <= 9'd0;
-        for (int k = 0; k < 192; k++) begin
-          wnum[k] <= 48'sd0;
-          fsum[k] <= 32'sd0;
-        end
       end
 
       case (state)
@@ -190,7 +292,7 @@ module heatvit_token_packager
             end else begin
               div_den_r <= {32'd0, den_r};
             end
-            state <= S_DIV_REQ;
+            state <= S_DIV_PRIME;
           end
         end
 
@@ -204,23 +306,27 @@ module heatvit_token_packager
 
         S_ACC_RD_RECV: begin
           if (req_r_valid && r_ready_r) begin
-            for (int j = 0; j < 8; j++) begin
-              wnum[int'(rd_bi) * 8 + j] <=
-                  wnum[int'(rd_bi) * 8 + j] +
-                  $signed({31'd0, acc_score_r}) *
-                  $signed(req_r_data[8*j +: 8]);
-              fsum[int'(rd_bi) * 8 + j] <=
-                  fsum[int'(rd_bi) * 8 + j] +
-                  $signed(req_r_data[8*j +: 8]);
-            end
-            if (rd_bi == 5'd23) begin
-              r_ready_r <= 1'b0;
-              state     <= S_ACC_DONE;
-            end else begin
-              rd_bi <= rd_bi + 5'd1;
-            end
+            acc_beat <= req_r_data;
+            acc_step <= 4'd0;
+            r_ready_r <= 1'b0;
+            state     <= S_ACC_ELEM;
           end else begin
             r_ready_r <= 1'b1;
+          end
+        end
+
+        S_ACC_ELEM: begin
+          if (acc_step == 4'd8) begin
+            if (rd_bi == 5'd23) begin
+              state <= S_ACC_DONE;
+            end else begin
+              rd_bi     <= rd_bi + 5'd1;
+              acc_step  <= 4'd0;
+              r_ready_r <= 1'b1;
+              state     <= S_ACC_RD_RECV;
+            end
+          end else begin
+            acc_step <= acc_step + 4'd1;
           end
         end
 
@@ -231,26 +337,19 @@ module heatvit_token_packager
           state   <= S_IDLE;
         end
 
+        S_DIV_PRIME: begin
+          state <= S_DIV_REQ;
+        end
+
         S_DIV_REQ: begin
           if (div_req_valid && div_req_ready) begin
-            sign_r <= (den_r == 32'd0) ? fsum[d][31] : wnum[d][47];
+            sign_r <= (den_r == 32'd0) ? rdata_fsum[31] : rdata_wnum[47];
             state  <= S_DIV_WAIT;
           end
         end
 
         S_DIV_WAIT: begin
           if (div_rsp_valid) begin
-            begin
-              logic [63:0] rounded;
-              logic [7:0]  res;
-              rounded = div_quot + ((64'd2 * div_rem >= div_den_r) ? 64'd1
-                                                                  : 64'd0);
-              if (!sign_r && rounded > 64'd127) res = 8'sd127;
-              else if (sign_r && rounded > 64'd128) res = -8'sd128;
-              else res = sign_r ? -$signed(rounded[7:0])
-                                : $signed(rounded[7:0]);
-              obuf[d] <= res;
-            end
             if (d == 8'd191) begin
               wr_bi <= 5'd0;
               state <= S_WR_REQ;
@@ -276,7 +375,8 @@ module heatvit_token_packager
         end
 
         S_DIV_DONE: begin
-          // Clear for the next descriptor.
+          // Clear for the next descriptor. wnum/fsum were already cleared
+          // channel-by-channel during the divide loop.
           den_r   <= 32'd0;
           count_r <= 9'd0;
           div_done <= 1'b1;

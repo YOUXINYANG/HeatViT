@@ -8,6 +8,13 @@
 // and one for every kept normal token (slots 1.. in input order), which
 // implements the stable compaction. Each copy is one 192-byte read burst
 // followed by one 192-byte write burst.
+//
+// P7-2 (2026-08-28): the dynamic byte-addressed staging register array
+// (`rbuf`) is replaced by a single 24x64 byte-write-enable SDP RAM
+// (heatvit_sdp_ram). The receive burst writes whole 64-bit words at
+// waddr=rd_bi; the write-out burst reads whole 64-bit words with a
+// one-beat lookahead (rdata(T) = mem[raddr(T-1)]), matching the P7-1
+// write-out idiom. Bit-exact behaviour is unchanged.
 module heatvit_token_compactor
   import heatvit_pkg::*;
 (
@@ -56,19 +63,35 @@ module heatvit_token_compactor
   logic        r_ready_r;
   logic [4:0]  wr_bi;
 
-  logic [7:0]  rbuf [0:191];
-  integer bi;
-  initial begin
-    for (bi = 0; bi < 192; bi++) rbuf[bi] = 8'h00;
-  end
+  // Staging RAM: one 64-bit word per burst beat.
+  logic        we_buf;
+  logic [4:0]  waddr_buf;
+  logic [63:0] wdata_buf;
+  logic [7:0]  wstrb_buf;
+  logic [4:0]  raddr_buf;
+  logic [63:0] rdata_buf;
 
-  always_comb begin
-    req_w_data = 64'h0000000000000000;
-    if (state == S_WR_BEAT) begin
-      for (int j = 0; j < 8; j++)
-        req_w_data[8*j +: 8] = rbuf[int'(wr_bi) * 8 + j];
-    end
-  end
+  heatvit_sdp_ram #(.WIDTH(64), .DEPTH(24)) u_ram_buf (
+    .clk(clk), .we(we_buf), .waddr(waddr_buf), .wdata(wdata_buf),
+    .wstrb(wstrb_buf), .raddr(raddr_buf), .rdata(rdata_buf)
+  );
+
+  // RAM write port: word writes during the receive burst.
+  wire accept_rd = (state == S_RD_RECV) && req_r_valid && r_ready_r;
+  assign we_buf    = accept_rd;
+  assign waddr_buf = rd_bi;
+  assign wdata_buf = req_r_data;
+  assign wstrb_buf = 8'hFF;
+
+  // RAM read port: registered read with one-beat lookahead. The address
+  // advances ONLY on the accepted beat (req_w_valid && req_w_ready); during
+  // backpressure stalls it holds the current word, otherwise the lookahead
+  // would over-advance and shift the burst.
+  wire w_accept = (state == S_WR_BEAT) && req_w_valid && req_w_ready;
+  assign raddr_buf = (state == S_WR_BEAT)
+                     ? (w_accept ? ((wr_bi == 5'd23) ? 5'd23 : wr_bi + 5'd1)
+                                 : wr_bi)
+                     : 5'd0;
 
   assign req_valid   = (state == S_RD_REQ) || (state == S_WR_REQ);
   assign req_write   = (state == S_WR_REQ);
@@ -77,6 +100,7 @@ module heatvit_token_compactor
   assign req_bytes   = 32'd192;
   assign req_r_ready = r_ready_r;
   assign req_w_valid = (state == S_WR_BEAT);
+  assign req_w_data  = rdata_buf;
   assign req_w_strb  = 8'hff;
   assign req_w_last  = (wr_bi == 5'd23);
 
@@ -117,8 +141,6 @@ module heatvit_token_compactor
 
         S_RD_RECV: begin
           if (req_r_valid && r_ready_r) begin
-            for (int j = 0; j < 8; j++)
-              rbuf[int'(rd_bi) * 8 + j] <= req_r_data[8*j +: 8];
             if (rd_bi == 5'd23) begin
               r_ready_r <= 1'b0;
               wr_bi     <= 5'd0;

@@ -14,6 +14,16 @@
 // unweighted mean with a warning) and writes one Package row. The module
 // then atomically produces next_token_count = 1 + kept + package and
 // next_package_present.
+//
+// P7-2 (2026-08-28): the dynamic byte-addressed score buffer (`sbuf`,
+// SCORE_BYTES bytes) is replaced by a 128x64 byte-write-enable SDP RAM
+// (heatvit_sdp_ram). The score receive burst writes whole 64-bit words at
+// waddr=rd_bi with a per-byte strobe masking the trailing bytes past
+// score_field_bytes; each Q0.16 score sits inside one word (offset 4*k is
+// 4k/8 = k/2 words and 4*(k&1) bytes in), so the S_TOKEN read presents a
+// single registered word. The read address (t-1)>>1 is issued during
+// S_CHILD_WAIT (and held through S_TOKEN), one cycle before consumption,
+// matching the registered-read timing. Bit-exact behaviour is unchanged.
 module heatvit_selector_finalize
   import heatvit_pkg::*;
 #(
@@ -90,7 +100,18 @@ module heatvit_selector_finalize
   logic [15:0] score_field_bytes;
   logic        sc_r_ready;
 
-  logic [7:0]  sbuf [0:SCORE_BYTES-1];
+  // Score buffer RAM (one 64-bit word holds two consecutive Q0.16 scores).
+  logic        we_sbuf;
+  logic [6:0]  waddr_sbuf;
+  logic [63:0] wdata_sbuf;
+  logic [7:0]  wstrb_sbuf;
+  logic [6:0]  raddr_sbuf;
+  logic [63:0] rdata_sbuf;
+
+  heatvit_sdp_ram #(.WIDTH(64), .DEPTH(128)) u_ram_sbuf (
+    .clk(clk), .we(we_sbuf), .waddr(waddr_sbuf), .wdata(wdata_sbuf),
+    .wstrb(wstrb_sbuf), .raddr(raddr_sbuf), .rdata(rdata_sbuf)
+  );
 
   logic [7:0]  t;         // current input token index 0..N-1
   logic [7:0]  kept;      // kept normal tokens so far
@@ -210,18 +231,28 @@ module heatvit_selector_finalize
     .div_div_zero  (div_div_zero)
   );
 
-  integer bi;
-  initial begin
-    for (bi = 0; bi < SCORE_BYTES; bi++) sbuf[bi] = 8'h00;
+  // Score buffer RAM write port: word writes during the score receive burst,
+  // masking the trailing bytes beyond score_field_bytes.
+  wire accept_sc = (state == S_SC_RD_RECV) && req_r_valid && sc_r_ready;
+  assign we_sbuf    = accept_sc;
+  assign waddr_sbuf = rd_bi[6:0];
+  assign wdata_sbuf = req_r_data;
+
+  always_comb begin
+    wstrb_sbuf = 8'd0;
+    for (int j = 0; j < 8; j++) begin
+      if (int'(rd_bi) * 8 + j < int'(score_field_bytes))
+        wstrb_sbuf[j] = 1'b1;
+    end
   end
 
-  // Little-endian 4-byte Q0.16 score read from the score buffer.
-  function automatic logic [16:0] score_at(input int base);
-    logic [16:0] v;
-    v = 17'(sbuf[base]) | (17'(sbuf[base + 1]) << 8) |
-        (17'(sbuf[base + 2]) << 16);
-    return v;
-  endfunction
+  // Score buffer RAM read port (registered): the score for token t lives in
+  // word (t-1)>>1, low half for odd t and high half for even t. The address
+  // is issued during S_CHILD_WAIT (and held through S_TOKEN), one cycle
+  // before S_TOKEN consumes rdata.
+  assign raddr_sbuf = ((state == S_CHILD_WAIT) || (state == S_TOKEN))
+                      ? ((t >= 8'd1) ? 7'((t - 8'd1) >> 1) : 7'd0)
+                      : 7'd0;
 
   // Memory routing between the score-read phase and the two children.
   assign req_valid   = (phase_sel == PH_CP) ? cp_req_valid :
@@ -259,7 +290,13 @@ module heatvit_selector_finalize
     pk_acc_score = 17'd0;
     cur_score    = 17'd0;
     if (state == S_TOKEN && t != 8'd0) begin
-      cur_score = score_at((int'(t) - 1) * 4);
+      // Score for token t = Q0.16 at byte offset (t-1)*4 of the score field,
+      // contained in word (t-1)>>1: low half for odd t, high half for even t.
+      cur_score = t[0]
+        ? (17'(rdata_sbuf[7:0])   | (17'(rdata_sbuf[15:8]) << 8) |
+           (17'(rdata_sbuf[23:16]) << 16))
+        : (17'(rdata_sbuf[39:32]) | (17'(rdata_sbuf[47:40]) << 8) |
+           (17'(rdata_sbuf[55:48]) << 16));
       if (pkg_present_r && (int'(t) - 1 == int'(n_r) - 2)) begin
         pk_acc_start = 1'b1;
         pk_acc_addr  = src0_r + 32'({24'd0, t}) * 32'd192;
@@ -339,10 +376,6 @@ module heatvit_selector_finalize
 
         S_SC_RD_RECV: begin
           if (req_r_valid && sc_r_ready) begin
-            for (int j = 0; j < 8; j++) begin
-              if (int'(rd_bi) * 8 + j < int'(score_field_bytes))
-                sbuf[int'(rd_bi) * 8 + j] <= req_r_data[8*j +: 8];
-            end
             if (rd_bi == rd_beats - 9'd1) begin
               sc_r_ready <= 1'b0;
               t          <= 8'd0;

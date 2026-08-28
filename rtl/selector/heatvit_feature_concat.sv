@@ -10,6 +10,12 @@
 // Layouts (row-major): local [3][C][32], global [3][32], dst [3][C][64].
 // Each (head, candidate) slot performs two 32-byte reads then one 64-byte
 // write; the two source halves never interleave.
+//
+// P7-2: the 64-byte staging register array is a byte-write-enable SDP RAM
+// (8 x 64). Both receives write whole aligned words (local at words 0..3,
+// global at words 4..7); the write-out reads one aligned word per beat with
+// an accept-gated lookahead address so backpressure stalls cannot shift the
+// burst. Bit-exact behaviour is unchanged.
 module heatvit_feature_concat
   import heatvit_pkg::*;
 #(
@@ -68,22 +74,39 @@ module heatvit_feature_concat
   logic [1:0]  rd_bi;
   logic        r_ready_r;
 
-  logic [7:0]  bbuf [0:63];
   logic [2:0]  wr_bi;
-  logic [63:0] wr_data_c;
 
-  integer bi;
-  initial begin
-    for (bi = 0; bi < 64; bi++) bbuf[bi] = 8'h00;
-  end
+  // Staging RAM (8 x 64 bytes; local at words 0..3, global at 4..7).
+  logic        we;
+  logic [2:0]  waddr;
+  logic [63:0] wdata;
+  logic [7:0]  wstrb;
+  logic [2:0]  raddr;
+  logic [63:0] rdata;
 
-  always_comb begin
-    wr_data_c = 64'h0000000000000000;
-    if (state == S_WR_BEAT) begin
-      for (int j = 0; j < 8; j++)
-        wr_data_c[8*j +: 8] = bbuf[int'(wr_bi) * 8 + j];
-    end
-  end
+  heatvit_sdp_ram #(.WIDTH(64), .DEPTH(8)) u_ram (
+    .clk(clk), .we(we), .waddr(waddr), .wdata(wdata), .wstrb(wstrb),
+    .raddr(raddr), .rdata(rdata)
+  );
+
+  logic accept_rd;
+  logic w_accept;
+  assign accept_rd = ((state == S_RD1_RECV) || (state == S_RD2_RECV)) &&
+                     req_r_valid && r_ready_r;
+  assign w_accept  = (state == S_WR_BEAT) && req_w_valid && req_w_ready;
+
+  assign we    = accept_rd;
+  assign waddr = (state == S_RD2_RECV) ? {1'b1, rd_bi} : {1'b0, rd_bi};
+  assign wdata = req_r_data;
+  assign wstrb = 8'hFF;
+
+  // Registered read: the write-out beat presents rdata, which holds the word
+  // read in the PREVIOUS cycle. Address = current beat during stalls, next
+  // beat only on the accepted cycle (backpressure-safe lookahead).
+  assign raddr = (state == S_WR_BEAT)
+                 ? (w_accept ? ((wr_bi == 3'd7) ? 3'd7 : wr_bi + 3'd1)
+                             : wr_bi)
+                 : 3'd0;
 
   assign req_valid   = (state == S_RD1_REQ) || (state == S_RD2_REQ) ||
                        (state == S_WR_REQ);
@@ -92,7 +115,7 @@ module heatvit_feature_concat
   assign req_bytes   = (state == S_WR_REQ) ? 32'd64 : 32'd32;
   assign req_r_ready = r_ready_r;
   assign req_w_valid = (state == S_WR_BEAT);
-  assign req_w_data  = wr_data_c;
+  assign req_w_data  = rdata;
   assign req_w_strb  = 8'hff;
   assign req_w_last  = (wr_bi == 3'd7);
 
@@ -145,8 +168,6 @@ module heatvit_feature_concat
 
         S_RD1_RECV: begin
           if (req_r_valid && r_ready_r) begin
-            for (int j = 0; j < 8; j++)
-              bbuf[int'(rd_bi) * 8 + j] <= req_r_data[8*j +: 8];
             if (rd_bi == 2'd3) begin
               r_ready_r <= 1'b0;
               rd_addr   <= src1_r + 32'({6'd0, hh}) * 32'd32;
@@ -170,8 +191,6 @@ module heatvit_feature_concat
 
         S_RD2_RECV: begin
           if (req_r_valid && r_ready_r) begin
-            for (int j = 0; j < 8; j++)
-              bbuf[32 + int'(rd_bi) * 8 + j] <= req_r_data[8*j +: 8];
             if (rd_bi == 2'd3) begin
               r_ready_r <= 1'b0;
               rd_addr   <= dst_r +

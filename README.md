@@ -8,8 +8,10 @@
 >
 > - ✅ **仿真闭环**：XSim 端到端逐位通过——18 个检查点与 1000 个 Logit 与纯整数 Python 黄金模型零容差一致；QAT 权重 6 轮回归全部 PASS
 > - ✅ **精度闭环**：PTQ 76.06% → QAT **77.86%**（未剪枝）；剪枝 **72.70%@93/44/37**（P4-2A λ=5，当前最优），已导出回 RTL
-> - ✅ **可综合性**：Vivado 综合通过（0 黑盒、0 锁存器），但 LUT **902,658（442.9%）** 超 `xc7k325t` 容量 4.4 倍，实现待优化后重跑
-> - ⏳ **下一步（P7）**：资源优化（bbuf→BRAM、MAC bank DSP 化）→ 实现与 100 MHz 时序收敛
+> - ✅ **可综合性**：Vivado 综合通过（0 黑盒、0 锁存器），但 LUT **902,658（442.9%）** 超 `xc7k325t` 容量 4.4 倍
+> - ✅ **P7-1 bbuf→BRAM（2026-08-28）**：vector/layout 两引擎寄存器数组 → 11 个字节写使能 SDP RAM + 流入式解包；**全量综合 LUT 918,145 → 238,271（450.5% → 116.9%）**；全量逐位回归全绿
+> - ✅ **P7-2 同类数组推广（2026-08-28）**：selector 侧七模块（head_fuse/reduce_mean/selector_softmax/finalize/packager/compactor/feature_concat）寄存器数组 → SDP RAM/串行化，OOC 124,626 → 15,408 LUT（−87.6%）；**全量综合 LUT 126,459 = 62.05%，首次跨过 100% 可布线性门槛**；全量逐位回归（e2e 两轮 + 错误矩阵）全绿
+> - ⏳ **下一步**：实现（place+route）与 100 MHz 时序收敛 → P7③ MAC DSP 化补裕量（可选）
 
 ## 简介
 
@@ -92,17 +94,24 @@ flowchart TD
 - **剪枝主线**：剪枝代价从 −16.9pp（PTQ）收窄至 **−5.2pp**（P4-2A，计数近目标）；λ=5 为当前诚实最优并已导出回 RTL 通过逐位回归（P5）。
 - 论文 HeatViT-T 为浮点 **71.9%**（全量 val，端到端训练）。后续精度提升方向：全量 QAT 长训练、教师蒸馏、联合微调（docs §14.13）。
 
-## P6 资源占用（xc7k325tfbg900-3，opt_design 后）
+## 资源占用（xc7k325tfbg900-3，综合级）
 
-| 资源 | 已用 | 可用 | 占用率 |
-| --- | ---: | ---: | ---: |
-| Slice LUTs | 902,658 | 203,800 | **442.9%** |
-| Slice Registers | 229,147 | 407,600 | 56.2% |
-| Block RAM Tile | 12 | 445 | 2.7% |
-| DSP48E1 | 112 | 840 | 13.3% |
-| Bonded IOB | 477 | 500 | 95.4% |
+| 资源 | P6 | P7-1 | **P7-2** | 可用 | P7-2 占用率 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Slice LUTs | 918,145 | 238,271 | **126,459** | 203,800 | **62.05%** ✅ |
+| Slice Registers | 229,155 | 125,273 | 47,550 | 407,600 | 11.67% |
+| Block RAM Tile | 12 | 26 | 37 | 445 | 8.3% |
+| DSP48E1 | 112 | 88 | 81 | 840 | 9.6% |
+| F7 / F8 Muxes | 140,822 / 64,434 | 22,973 / 7,860 | 8,360 / 2,032 | — | 8.2% / 4.0% |
 
-**结论**：可综合性 ✅（0 黑盒、0 锁存器、DSP/BRAM 正常推断、描述符 ROM 初始化成功，综合 5h47m）；但 LUT 超容量 4.4 倍，实现（place）暂无法进行。超标 77% 集中在 vector/layout 两引擎的动态字节寻址 `bbuf` 寄存器数组——被综合成巨型 mux 网络；FF/BRAM/DSP 均富余。**P7 优化计划**：bbuf → 字节写使能 SDP RAM（BRAM）、MAC bank 乘法 DSP 化，预计 LUT 降至 ~140–190K（器件 15–20%）；达标后重跑实现与 100 MHz 时序（docs §15）。
+**演进**：P6 首综合 LUT 超容量 4.4 倍（超标集中在动态字节寻址寄存器数组被
+综合成的 mux 网络）→ **P7-1**（vector/layout 两引擎 bbuf → 11 个字节写使能
+SDP RAM + 流入式解包，397K/311K → 20K/4K）→ **P7-2**（selector 侧七模块
+同类推广，OOC 124,626 → 15,408 LUT）。全程位精确口径不变：每步改动后全量
+逐位回归（含 e2e 两轮 + 错误矩阵）全绿；全量多核综合（-Jobs 24）0 黑盒、
+0 锁存器。**当前 LUT 62.05%，首次跨过 100% 可布线性门槛**；下一步为实现
+（place+route）与 100 MHz 时序收敛，P7③ MAC DSP 化可按需作为裕量优化
+（docs §15）。
 
 ## 仓库结构
 
@@ -150,8 +159,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_python_tests.ps1
 # 5. 全套回归（foundation/gemm/transformer/selector + e2e 两轮 + 错误矩阵）
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -Suite all
 
-# 6. Vivado 综合与资源统计（实现待 P7 资源优化达标后运行）
+# 6. Vivado 综合与资源统计（LUT 62.05%，实现可直接运行）
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_synth.ps1 -Jobs 24
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_impl.ps1 -Jobs 24
 .\.venv\Scripts\python tools\p6\p6_summary.py
 ```
 
@@ -159,13 +169,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_synth.ps1
 
 ## 范围与非目标
 
-- ✅ **已覆盖**：XSim 逐位仿真验证；真实权重 PTQ / QAT / 剪枝精度评估；QAT 权重导出与硬件逐位回归（P5）；Vivado 综合与资源统计（P6）
-- ⏳ **待办**：P7 资源优化 → 实现与 100 MHz 时序收敛
+- ✅ **已覆盖**：XSim 逐位仿真验证；真实权重 PTQ / QAT / 剪枝精度评估；QAT 权重导出与硬件逐位回归（P5）；Vivado 综合与资源统计（P6）；P7-1 / P7-2 资源优化（bbuf→SDP RAM 全量推广，LUT 450.5% → 62.05%）
+- ⏳ **待办**：实现（place+route）与 100 MHz 时序收敛；P7③ MAC DSP 化（可选裕量优化）
 - ❌ **排除**：功耗、FPS 与上板验证；板级 DDR/MIG/PCIe/AXI 集成与主机软件；HeatViT-S / HeatViT-B / LV-ViT 变体；JPEG/PNG 解码、图像缩放与浮点预处理
 
 ## 文档
 
-- 📖 [`docs/heatvit.md`](docs/heatvit.md) —— 项目**唯一权威记录文档**：设计规格、实施记录、仿真与验证指南、内存与权重格式、RTL 逐模块设计说明；PTQ / QAT / P5 导出见第二部分 §13–§14（P5 见 §14.14），P6 综合与资源统计见 §15
+- 📖 [`docs/heatvit.md`](docs/heatvit.md) —— 项目**唯一权威记录文档**：设计规格、实施记录、仿真与验证指南、内存与权重格式、RTL 逐模块设计说明；PTQ / QAT / P5 导出见第二部分 §13–§14（P5 见 §14.14），P6 综合与资源统计、P7-1 / P7-2 资源优化见 §15
 - 📄 论文 PDF：仓库根目录 `HeatViT：Hardware-Efficient Adaptive Token Pruning for Vision Transformers.pdf`
 - 🔗 论文 arXiv：[2211.08110](https://arxiv.org/abs/2211.08110)
 
