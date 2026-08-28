@@ -29,7 +29,11 @@ contract softmax/LN）**76.40%@3k / 76.06%@5k**（浮点同子集
 计数近目标 88/45/32）；D3 裁定弃用训练后重校准；选择器重训（B）
 排序增益未兑现。**P5 已把该权重导出回 RTL 并通过 XSim 端到端逐位
 回归**（修复一处 LN 陈旧尺度缺陷，§14.14）。剩余精度提升路径：
-教师 A/B / 全量 QAT / 联合微调。详见第二部分 §14。
+教师 A/B / 全量 QAT / 联合微调。详见第二部分 §14。P6（§15）完成 Vivado
+综合与资源统计：RTL 可综合性验证通过（0 黑盒、0 锁存器、DSP/BRAM 正常
+推断），但综合级 LUT 918,145（opt_design 后 902,658，442.9%）约为
+`xc7k325tfbg900-3` 容量的 4.4 倍，实现未能进行；超标集中在 vector 与
+layout 两引擎的动态字节寻址缓冲 mux 网络，P7 资源优化已规划。
 
 **关键词：** Vision Transformer；动态 Token 剪枝；定点量化；FPGA；
 SystemVerilog；描述符调度；逐位仿真验证
@@ -43,7 +47,7 @@ SystemVerilog；描述符调度；逐位仿真验证
 - **第二部分 实施计划与实施记录**：五个 RTL 阶段的执行蓝图、任务清单与
   as-built 实施记录（含接口裁定、踩坑与验收证据），以及 P2 真实权重
   精度验证（§13）、P3 量化感知训练 QAT / P4 剪枝微调与 P5 权重导出
-  逐位回归（§14，P5 见 §14.14）
+  逐位回归（§14，P5 见 §14.14）、P6 Vivado 综合与资源统计（§15）
 - **第三部分 仿真与验证指南**：环境准备、向量生成、回归套件、日志与
   失败定位、预计时长
 - **第四部分 内存与权重格式**：四区域映射、逐张量布局、尺度表、`.mem`
@@ -68,6 +72,7 @@ SystemVerilog；描述符调度；逐位仿真验证
 - **想了解真实权重精度、QAT 训练与硬件导出**：读第二部分的 §13（P2
   精度验证）与 §14（P3 QAT / P4 剪枝微调 / P5 导出与逐位回归，
   §14.14）。
+- **想了解 Vivado 综合与资源统计（P6）**：读第二部分的 §15。
 - **想读懂 RTL 代码本身**：读第七部分（RTL 代码设计）——逐模块的设计说明、
   状态机与关键代码引用，与第一部分规格、第二部分实施记录互为补充。
 
@@ -4923,6 +4928,120 @@ b11_out=−3）且 in_x 恰好在切换后不变（本行前两个元素都是 �
 不变（93.0/44.2/37.8）。按 D3 门槛（≥ +0.1pp 才采用）**不采用**：
 Q2 权重上 +0.34pp 的收益在 P4A 权重上转为惩罚，印证「训练越充分、
 换尺度惩罚越大」——冻结 PTQ 表纪律贯穿到最终权重。
+
+## 15. 阶段 8：Vivado 综合与实现（P6，2026-08-28）
+
+### 目标与口径
+
+对 `heatvit`（wrapper → `heatvit_top`）在 `xc7k325tfbg900-3` 上执行 Vivado
+2023.2 综合与实现，统计资源占用；时序目标 100 MHz（`create_clock -period
+10.000`）。综合/资源统计此前被规格明确排除（§17 与 §3 全局工程约束），
+本阶段起修订为：**资源统计纳入验收口径；时序收敛以 100 MHz 为目标**。
+
+### 新增工具
+
+| 文件 | 作用 |
+| --- | --- |
+| `xdc/heatvit.xdc` | 100 MHz 时钟 + 0 延迟 IO 约束（无板级引脚，内部路径为准） |
+| `scripts/run_synthesis.tcl` / `scripts/run_vivado_synth.ps1` | 综合跑批 + 利用率报告导出 + 黑盒扫描 |
+| `scripts/run_implementation.tcl` / `scripts/run_vivado_impl.ps1` | 实现至 route_design + util/timing/power 报告 |
+| `scripts/run_opt_report.tcl` | 综合后 opt_design，取更真实的 LUT 数 |
+| `scripts/p6_pre_synth.tcl` | 综合前把描述符 `.mem` 送入 run 目录（见下） |
+| `tools/p6/p6_summary.py` | 报告解析 → `build/reports/p6_summary.{txt,json}` |
+
+### 综合前修复的两个阻塞
+
+1. **`$readmemh` 相对路径（CRITICAL WARNING [Synth 8-4445]）**：Vivado 综合
+   以 run 目录为 cwd 解析相对路径，`heatvit_descriptor_rom` 的
+   `rtl/generated/heatvit_descriptors.mem` 在 `HeatViT.runs/synth_1` 下找不到，
+   ROM 被静默忽略（网表功能坏、结构完整——资源统计会照常出，坑在不易发现）。
+   修复不改 RTL：`p6_pre_synth.tcl` 经 `STEPS.SYNTH_DESIGN.TCL.PRE` 在
+   elaborate 前把 `.mem` staging 进 run 目录，日志确认
+   `Synth 8-3876 read successfully`。
+2. **变量上界循环（ERROR [Synth 8-3380]）**：`heatvit_vector_engine.sv:484`
+   `for (int i = 0; i < m_r; i++)` 的 `m_r` 为 16 位运行量，Vivado 无法静态
+   收敛循环界。修复：静态上界 `MAX_ROW`（197）+ 运行时守卫 `i < m_r`——对
+   合法输入（m_r ≤ 197，描述符校验保证）逐位等价。全 RTL 排查确认仅此一处
+   变量上界循环。修复后全量回归（foundation/gemm/transformer/selector +
+   e2e 两轮 + 错误矩阵）全部 TEST_PASS，逐位一致性不受影响。
+
+### XDC 踩坑
+
+XDC 不支持设计查询命令：`remove_from_collection` 触发 CRITICAL WARNING
+[Designutils 20-1307]，并连带 `set_input_delay` 失败（输入延迟未生效、
+输出正常）。修复改用 `get_ports -filter {DIRECTION == IN && NAME != clk}`
+排除时钟端口，修复后 XDC 解析 0 警告。
+
+### 综合结果（synth_design，2026-08-28，5h47m）
+
+| 资源 | 已用 | 可用 | 占用率 |
+| --- | ---: | ---: | ---: |
+| Slice LUTs | 918,145 | 203,800 | **450.5%** |
+| Slice Registers | 229,155 | 407,600 | 56.2% |
+| Block RAM Tile (RAMB36) | 12 | 445 | 2.7% |
+| DSP48E1 | 112 | 840 | 13.3% |
+| Bonded IOB | 477 | 500 | 95.4% |
+| F7 / F8 Muxes | 140,822 / 64,434 | 101,900 / 50,950 | 138.2% / 126.5% |
+
+opt_design 后：LUT 902,658（442.9%）、FF 229,147（56.2%）——仅降 1.7%，
+说明这些 mux 是真实逻辑而非冗余。**结论：LUT 超容量 4.4 倍，实现（place）
+无法进行**；FF/BRAM/DSP 全部富余，IOB 95.4% 接近上限。
+
+### 分层剖析（LUT，综合级）
+
+| 实例 | LUT | 占比 |
+| --- | ---: | ---: |
+| u_executor（合计） | 917,251 | 99.9% |
+| ↳ u_vector（heatvit_vector_engine） | 397,419 | 43.3% |
+| ↳ u_layout（heatvit_layout_engine） | 310,517 | 33.8% |
+| ↳ u_gemm（heatvit_gemm_engine） | 87,766 | 9.6% |
+| ↳ u_finalize（含 u_packager 36,430） | 42,885 | 4.7% |
+| ↳ u_selector_softmax | 31,241 | 3.4% |
+| ↳ u_head_fuse | 23,803 | 2.6% |
+| ↳ u_reduce_mean | 19,977 | 2.2% |
+| ↳ 其余（LN/GELU/scheduler/rom/div/concat 等） | ≈ 25,494 | 2.8% |
+
+u_gemm 内部不对称：`gen_bank[0].u_bank`（mac_bank）39,362 LUT，而
+`gen_bank[1]/[2]` 仅 9,093/9,084；且 gemm_engine 只有 13 个 DSP——192 个
+int8 乘法大部分落在 LUT（bank0 疑似多承担路径或乘法未被 DSP 吸收），
+待 P7 查明。
+
+### 根因
+
+两个大户（vector/layout，占 77%）的 `bbuf`（2048×8）等**动态字节寻址
+寄存器数组**被综合成 2048 选 1 级联 mux 网络：读侧每字节一组大 mux +
+写侧全字节译码。FF 总量只有 56% 说明存储本身不贵，贵在组合 mux 树。
+对照：`heatvit_tile_buffer` 的 `heatvit_sdp_ram` 模板正确推断出 12×RAMB36
+——BRAM 推断路径在代码库内已打通，只是 bbuf 类数组没用上。
+
+### 良性警告记录（109 条，逐类）
+
+- **Synth 8-324**（100 条封顶）：`srow[i]` 越界——`m_r ≤ 197` 的运行时
+  有界性无法静态证明（描述符校验 + 逐位回归保证），循环修复后读侧 idx
+  仍有同类噪声，不构成功能风险；
+- **Synth 8-5844**：异步复位寄存器位于 DSP/BRAM 边界（信息性，不影响
+  正确性；同步复位可改善打包，属 P7 可选项）；
+- **Synth 8-7052**：tile buffer BRAM 未合并输出寄存器（信息性时序提示）。
+
+### 结论边界与下一步
+
+综合完成：可综合性 ✅、0 黑盒、0 锁存器、DSP/BRAM 推断 ✅、ROM 初始化 ✅。
+实现未运行：LUT 4.4× 超标，place 必败。**P7 资源优化（已规划）**：
+① vector/layout bbuf → 字节写使能 SDP RAM（BRAM，预估两模块 707K → 数万
+LUT，BRAM 12 → ~30）；② 同类转换推广到 head_fuse/reduce_mean/
+selector_softmax/finalize/packager/feature_concat/compactor（合计 ~156K）；
+③ MAC bank 乘法 DSP 化并查 bank0 不对称（57K → ~6K + ~96 DSP，DSP 仍只
+占 ~25%）。预期总 LUT ~140–190K（15–20% 器件），达标后重跑
+synth + impl + 100 MHz 时序。每步 RTL 改动过全量逐位回归。
+
+### 复现命令
+
+```powershell
+$env:HEATVIT_VIVADO_BIN = 'D:\vivado\vivado2023.2\Vivado\2023.2\bin'
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_synth.ps1 -Jobs 24   # 5h47m
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_impl.ps1 -Jobs 24    # 待 P7 达标后
+.\.venv\Scripts\python tools\p6\p6_summary.py
+```
 
 # 第三部分：仿真与验证指南
 

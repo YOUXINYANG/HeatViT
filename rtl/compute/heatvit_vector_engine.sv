@@ -481,11 +481,19 @@ module heatvit_vector_engine
         S_SM_PREP: begin
           // The last read beat has now been written into bbuf: unpack the N
           // little-endian int32 scores and rescale them to Q8.16.
-          for (int i = 0; i < m_r; i++) begin
-            logic [31:0] w;
-            w = {bbuf[rd_e + i * 4 + 3], bbuf[rd_e + i * 4 + 2],
-                 bbuf[rd_e + i * 4 + 1], bbuf[rd_e + i * 4 + 0]};
-            srow[i] = score_q16($signed(w));
+          //
+          // Static bound + runtime guard: m_r is descriptor-driven and is
+          // legally <= MAX_ROW at runtime, but Vivado synthesis cannot
+          // bound a variable-count loop (Synth 8-3380). Iterating the fixed
+          // MAX_ROW range with an `i < m_r` guard is bit-identical for all
+          // legal inputs (m_r <= MAX_ROW).
+          for (int i = 0; i < MAX_ROW; i++) begin
+            if (i < m_r) begin
+              logic [31:0] w;
+              w = {bbuf[rd_e + i * 4 + 3], bbuf[rd_e + i * 4 + 2],
+                   bbuf[rd_e + i * 4 + 1], bbuf[rd_e + i * 4 + 0]};
+              srow[i] = score_q16($signed(w));
+            end
           end
           sm_start   <= 1'b1;
           sm_row_len <= m_r[7:0];

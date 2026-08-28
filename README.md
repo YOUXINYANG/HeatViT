@@ -9,6 +9,8 @@
 > ✅ **P3 QAT + P4 剪枝微调（完成）**：可微 fake-quant 训练路径 + 位精确验证管线（20 项测试全绿）。未剪枝 **76.06% → 77.86%（+1.80pp，5k val）**，距浮点基线 −2.36pp；剪枝 59.12%（PTQ）→ 68.20%（QAT 主干）→ **72.70%@93/44/37（P4-2A λ=5，计数近目标，当前诚实最优）**；D3 裁定冻结表全程；选择器重训（B）排序增益未兑现。阶段小结与精度总览见 [`docs/heatvit.md`](docs/heatvit.md) 第二部分 §14.13。
 >
 > 🎉 **P5 导出与逐位回归（2026-08-27）**：P4-2A λ=5 权重已导出回 RTL 并通过 XSim 端到端逐位回归（img0..2 × 无回压/回压共 6 轮）。期间定位并修复 `heatvit_layernorm` 连续赋值陈旧尺度敏感度缺陷（QAT 数据流暴露的潜伏 bug，见 docs §14.14）；同缺陷类别的 `heatvit_gemm_engine` 一并加固。训练侧精度收益已在硬件上闭环。
+>
+> 🧪 **P6 Vivado 综合与资源统计（2026-08-28）**：RTL 可综合性验证通过（0 黑盒、0 锁存器、DSP/BRAM 正常推断、描述符 ROM 成功初始化，综合 5h47m）；但综合级 LUT **918,145**（opt_design 后 **902,658 = 442.9%**）约为 `xc7k325t` 容量的 4.4 倍，**实现无法进行**。超标 77% 集中在 vector/layout 两引擎的动态字节寻址缓冲 mux 网络；FF/BRAM/DSP 均富余（56.2% / 2.7% / 13.3%）。P7 资源优化（bbuf→BRAM、MAC bank DSP 化）已规划，达标后重跑完整实现与 100 MHz 时序。详见 docs §15。
 
 ## 简介
 
@@ -60,6 +62,7 @@ HeatViT/
 │  ├─ top/                     # 描述符 ROM、调度器、heatvit_top
 │  └─ generated/               # 198 条描述符 ROM 初始化（由工具生成）
 ├─ config/heatvit_t.json       # 固定模型与量化配置
+├─ xdc/heatvit.xdc             # 时序/IO 约束（P6，100 MHz）
 ├─ sim/                        # 自检式 Testbench、行为存储、单元向量
 │  └─ generated/               # 各 TB 配置（由工具生成）
 ├─ verification/               # 纯整数 Python 黄金模型 + 单元测试（含 P3 QAT 测试）
@@ -92,6 +95,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_python_tests.ps1
 
 # 5. 全套回归（foundation/gemm/transformer/selector + e2e 两轮 + 错误矩阵）
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -Suite all
+
+# 6. P6 Vivado 综合与资源统计（实现待 P7 资源优化达标后运行，见 docs §15）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_synth.ps1 -Jobs 24
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_impl.ps1 -Jobs 24
+.\.venv\Scripts\python tools\p6\p6_summary.py
 ```
 
 > 只有显式加 `-RegenerateVectors` 才会重新生成端到端向量，防止失败重跑时误换期望值。
@@ -190,18 +198,46 @@ I-ViT 融合消融（`tools/p2/p2_ivit.py`；ImageNet val 前 3k/5k 张，float 
 .\.venv-torch\Scripts\python tools\p2\p2_qat.py recalib --checkpoint p2_out\qat\quick32k\best.pt --out p2_out\qat\quick32k\scale_table_after.json
 ```
 
+## P6：Vivado 综合与资源统计（2026-08-28）
+
+100 MHz 约束（`xdc/heatvit.xdc`）下对 `heatvit` 完成 Vivado 2023.2 综合（5h47m）：
+
+| 资源 | 综合级 | opt 后 | 可用 | 占用率 |
+| --- | ---: | ---: | ---: | ---: |
+| Slice LUTs | 918,145 | 902,658 | 203,800 | **442.9%** |
+| Slice Registers | 229,155 | 229,147 | 407,600 | 56.2% |
+| Block RAM Tile | 12 | 12 | 445 | 2.7% |
+| DSP48E1 | 112 | 112 | 840 | 13.3% |
+| Bonded IOB | 477 | 477 | 500 | 95.4% |
+
+**结论**：可综合性 ✅（0 黑盒、0 锁存器、DSP/BRAM 推断正常）；LUT 超容量
+4.4 倍，实现（place）无法进行——纯 mux 受限而非全面超标。分层剖析：
+vector_engine 397K + layout_engine 311K（合计 77%）的动态字节寻址 `bbuf`
+寄存器数组被综合成巨型 mux 树；对照之下 tile buffer 的 `heatvit_sdp_ram`
+模板正确推断 12×RAMB36。修复的两个综合阻塞（`.mem` 相对路径、
+`vector_engine` 变量上界循环）与 P7 优化计划详见 docs §15。
+
+运行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_synth.ps1 -Jobs 24
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_impl.ps1 -Jobs 24   # 待 P7 资源优化达标后
+.\.venv\Scripts\python tools\p6\p6_summary.py
+```
+
 ## 范围与非目标
 
-当前范围：XSim 仿真逐位验证 + 真实权重的 PTQ 精度评估 + **QAT 与剪枝微调（P3/P4，已完成）** + **P5 权重导出与 XSim 逐位回归（已完成）**。明确排除：
+当前范围：XSim 仿真逐位验证 + 真实权重的 PTQ 精度评估 + **QAT 与剪枝微调（P3/P4，已完成）** + **P5 权重导出与 XSim 逐位回归（已完成）** + **P6 Vivado 综合与资源统计（已完成：可综合性 ✅，LUT 4.4× 超标待优化，见 docs §15）**。明确排除：
 
 - ❌ 常规训练、微调、蒸馏（P3 修正：部署契约下的量化感知训练 QAT 已纳入范围并完成，见 docs §14）
-- ❌ 时序收敛、功耗、FPS 与上板验证；板级 DDR/MIG/PCIe/AXI 集成与主机软件
+- ✅ 综合与资源统计（P6 新纳入）；⏳ 实现与 100 MHz 时序收敛——当前 LUT 超标，待 P7 资源优化后重跑
+- ❌ 功耗、FPS 与上板验证；板级 DDR/MIG/PCIe/AXI 集成与主机软件
 - ❌ HeatViT-S / HeatViT-B / LV-ViT 变体
 - ❌ JPEG/PNG 解码、图像缩放与浮点预处理
 
 ## 文档
 
-- 📖 [`docs/heatvit.md`](docs/heatvit.md) —— 项目**唯一权威记录文档**：设计规格（定点数值契约、描述符调度、Token/Package 状态契约）、实施记录、仿真与验证指南、内存与权重格式、端到端结果、RTL 代码设计逐模块说明，以及 PTQ / QAT / P5 导出实施记录（第二部分 §13–§14，P5 见 §14.14）
+- 📖 [`docs/heatvit.md`](docs/heatvit.md) —— 项目**唯一权威记录文档**：设计规格（定点数值契约、描述符调度、Token/Package 状态契约）、实施记录、仿真与验证指南、内存与权重格式、端到端结果、RTL 代码设计逐模块说明，以及 PTQ / QAT / P5 导出实施记录（第二部分 §13–§14，P5 见 §14.14）、P6 综合与资源统计（§15）
 - 📄 论文 PDF：仓库根目录 `HeatViT：Hardware-Efficient Adaptive Token Pruning for Vision Transformers.pdf`
 - 🔗 论文 arXiv：[2211.08110](https://arxiv.org/abs/2211.08110)
 
