@@ -1,0 +1,26 @@
+%% HeatViT RTL 框架图 · 图 4/4：Token Selector 链（时间分时，经 scratch 区级联）
+%% 注意：模块间没有直接连线——每个模块对应一条描述符，经 mem_master 读写 scratch 区
+%% 分时级联；箭头表示数据依赖顺序，而非物理连线。
+flowchart LR
+  REDM["heatvit_reduce_mean<br/>Selector 特征两轴均值规约（candidate / head-lane）"]
+  CONC["heatvit_feature_concat<br/>Local/Global 特征拼接（32+32→64 字节）"]
+  HFU["heatvit_head_fuse<br/>三 Head keep 分数加权融合（零分母回退等权）"]
+  SSM["heatvit_selector_softmax<br/>int8 logits → Keep 概率 Q0.16"]
+  FINZ["heatvit_selector_finalize<br/>单遍扫描 + 0.5 阈值：压缩/打包编排，唯一状态更新输出"]
+  COMP["heatvit_token_compactor<br/>CLS→slot0 稳定顺序 Token 压缩"]
+  PKG["heatvit_token_packager<br/>Package Token 加权平均（零分母回退算术平均）"]
+  SELS["heatvit_softmax_selector<br/>Selector 封装：δ2=1.0 · 输出 17-bit Q0.16"]
+  SMC["heatvit_softmax_core<br/>三遍行 Softmax 共享核（max 减 / exp 和 / 除法归一）"]
+  SCHED["heatvit_scheduler<br/>回收状态更新，维护 Token 计数 197→88→45→32"]
+
+  REDM -->|均值特征 · 经 scratch 区| CONC
+  CONC -->|拼接特征 · 经 scratch 区| HFU
+  HFU -->|keep 分数 · 经 scratch 区| SSM
+  SSM -->|keep 概率 Q0.16 · 经 scratch 区| FINZ
+  FINZ -->|保留位图| COMP
+  FINZ -->|被剪 Token| PKG
+  COMP -->|压缩后 tokens 写回 scratch| FINZ
+  PKG -->|Package Token 写回 scratch| FINZ
+  FINZ -->|state_update_valid · next_token_count<br/>next_package_present| SCHED
+  SSM -->|例化| SELS
+  SELS -->|例化| SMC

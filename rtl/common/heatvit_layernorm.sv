@@ -4,6 +4,24 @@
 // external shared divider, and the internal 48-bit isqrt produces the
 // standard deviation. Gamma/Beta are aligned, summed, rounded once, and
 // saturated to int8 at the output scale exponent.
+//
+// P7-4 timing rewrite: the normalize pass is a 4-stage stallable pipeline
+// that streams its outputs directly (the old out_buf[192] byte-addressed
+// register array and its per-byte write mux network are gone). The
+// arithmetic is bit-exact with the former single-cycle normalize_channel
+// function, only narrowed to the minimal proven widths:
+//
+//   stage0: x_q32 = x << (x_scale+32)  (40-bit signed), diff = x_q32 - mean
+//           (49-bit signed); gamma/beta forwarded.
+//   stage1: prod = diff * inv_std_q32 (49x48 -> 97-bit signed).
+//   stage2: norm_wide = round_shift_away(prod, 48) -> sat to 24-bit Q8.16.
+//   stage3: product = norm_q16 * gamma (24x8), sum_w = align + beta,
+//           final scale shift, sat_s8 -> out byte.
+//
+// Width proofs (see docs, P7-4): |x_q32| < 2^39, |diff| < 2^48,
+// |prod| < 2^96, aligned sum intermediates < 2^95, final affine value
+// < 2^78, so every intermediate fits its container without truncation and
+// every rounding matches the 128-bit original exactly.
 module heatvit_layernorm
   import heatvit_pkg::*;
 (
@@ -43,11 +61,13 @@ module heatvit_layernorm
   localparam logic [3:0] S_SQRT       = 4'd4;
   localparam logic [3:0] S_RECIP      = 4'd5;
   localparam logic [3:0] S_NORMALIZE  = 4'd6;
-  localparam logic [3:0] S_DRAIN      = 4'd7;
   localparam logic [3:0] S_DONE       = 4'd8;
 
   localparam int D = 192;
   localparam int EPS_Q32 = 4295;
+
+  // 2^47: nearest-rounding half-LSB for the >>48 product shift.
+  localparam logic signed [96:0] ROUND_HALF_48 = 97'sd140737488355328;
 
   heatvit_scale_t x_scale_r;
   heatvit_scale_t gamma_scale_r;
@@ -69,46 +89,25 @@ module heatvit_layernorm
     return round_shift_away_s128(square, 7'(-shift));
   endfunction
 
-  function automatic heatvit_s8_t normalize_channel(
-    input heatvit_s8_t    x,
-    input heatvit_s8_t    gamma,
-    input heatvit_s8_t    beta,
-    input heatvit_s48_t   mean_q32,
-    input logic [47:0]    inv_std_q32
+  // Nearest-ties-away-from-zero right shift on a 96-bit signed value.
+  // |value| fits signed 96 by construction (max |value| < 2^94), so the
+  // magnitude, the half-LSB add and the shifted result never overflow.
+  function automatic logic signed [95:0] round_shift_away_96(
+    input logic signed [95:0] value,
+    input int shift
   );
-    heatvit_s128_t x_q32;
-    heatvit_s128_t diff;
-    heatvit_s128_t prod;
-    heatvit_s128_t norm_wide;
-    heatvit_s128_t norm_q16;
-    heatvit_s128_t product;
-    heatvit_s128_t sum_w;
-    int common_exp;
-    int final_shift;
-    begin
-      x_q32 = heatvit_s128_t'(x) <<< (int'(x_scale_r) + 32);
-      diff = x_q32 - heatvit_s128_t'(mean_q32);
-      prod = diff * heatvit_s128_t'(inv_std_q32);
-      norm_wide = round_shift_away_s128(prod, 7'd48);
-      if (norm_wide > 128'sd8388607) norm_q16 = 128'sd8388607;
-      else if (norm_wide < -128'sd8388608) norm_q16 = -128'sd8388608;
-      else norm_q16 = norm_wide;
-
-      product = norm_q16 * heatvit_s128_t'(gamma);
-      common_exp = ((int'(gamma_scale_r) - 16) < int'(beta_scale_r))
-                     ? (int'(gamma_scale_r) - 16) : int'(beta_scale_r);
-      sum_w = (product <<< (int'(gamma_scale_r) - 16 - common_exp))
-            + (heatvit_s128_t'(beta) <<< (int'(beta_scale_r) - common_exp));
-      final_shift = common_exp - int'(out_scale_r);
-      if (final_shift >= 0) sum_w = sum_w <<< final_shift;
-      else sum_w = round_shift_away_s128(sum_w, 7'(-final_shift));
-      return sat_s8(sum_w);
-    end
+    logic signed [95:0] magnitude;
+    logic signed [95:0] rounded_mag;
+    if (shift == 0) return value;
+    magnitude = value[95] ? -value : value;
+    rounded_mag = (magnitude + (96'sd1 << (shift - 1))) >>> shift;
+    return value[95] ? -rounded_mag : rounded_mag;
   endfunction
 
   logic [3:0]      state;
   logic [7:0]      idx;
-  logic [7:0]      out_idx;
+  logic            mean_phase;
+  logic            req_sent;
   heatvit_s128_t   sum_x_r;
   logic [63:0]     sum_square_r;
   heatvit_s48_t    mean_q32_r;
@@ -116,13 +115,10 @@ module heatvit_layernorm
   logic [47:0]     variance_q32_r;
   logic [23:0]     std_q16_r;
   logic [47:0]     inv_std_q32_r;
-  logic            mean_phase;
-  logic            req_sent;
 
   heatvit_s8_t x_buf [D];
   heatvit_s8_t gamma_buf [D];
   heatvit_s8_t beta_buf [D];
-  heatvit_s8_t out_buf [D];
 
   logic        isqrt_start;
   logic        isqrt_busy;
@@ -153,7 +149,83 @@ module heatvit_layernorm
 
   assign cfg_ready = (state == S_IDLE);
   assign in_ready  = (state == S_LOAD_ACCUM);
-  assign out_data  = out_buf[out_idx];
+
+  // ------------------------------------------------------------------
+  // Normalize pipeline (4 stages, stallable on the output handshake).
+  // ------------------------------------------------------------------
+  logic             s1_valid_r;
+  logic signed [48:0] diff_r;        // stage0 -> stage1
+  heatvit_s8_t     gamma1_r;
+  heatvit_s8_t     beta1_r;
+
+  logic             s2_valid_r;
+  logic signed [96:0] prod_r;        // stage1 -> stage2
+  heatvit_s8_t     gamma2_r;
+  heatvit_s8_t     beta2_r;
+
+  logic             s3_valid_r;
+  heatvit_q8_16_t  norm_q16_r;       // stage2 -> stage3
+  heatvit_s8_t     gamma3_r;
+  heatvit_s8_t     beta3_r;
+
+  heatvit_s8_t     out_byte_r;       // stage3 output register
+  logic [7:0]      out_count_r;
+
+  assign out_data = out_byte_r;
+
+  // Stage 0 combinational: read x/gamma/beta at idx, form diff.
+  heatvit_s48_t    x_q32_w;
+  logic signed [48:0] diff_w;
+  assign x_q32_w = heatvit_s48_t'(x_buf[idx]) <<< (int'(x_scale_r) + 32);
+  assign diff_w  = $signed({x_q32_w[47], x_q32_w})
+                 - $signed({mean_q32_r[47], mean_q32_r});
+
+  // Stage 1 combinational: 49x48 signed multiply (inv_std_q32 is positive).
+  (* use_dsp = "yes" *)
+  logic signed [96:0] prod_w;
+  assign prod_w = diff_r * $signed({1'b0, inv_std_q32_r});
+
+  // Stage 2 combinational: round_shift_away(prod, 48) then saturate Q8.16.
+  logic signed [96:0] mag_w;
+  logic signed [96:0] sum_half_w;
+  logic signed [49:0] norm_wide_w;
+  heatvit_q8_16_t     norm_q16_w;
+  assign mag_w      = prod_r[96] ? -prod_r : prod_r;
+  assign sum_half_w = mag_w + ROUND_HALF_48;
+  assign norm_wide_w = prod_r[96]
+    ? -$signed(50'($unsigned(sum_half_w[96:48])))
+    :  $signed(50'($unsigned(sum_half_w[96:48])));
+  always_comb begin
+    if (norm_wide_w > 50'sd8388607)       norm_q16_w = 24'sd8388607;
+    else if (norm_wide_w < -50'sd8388608) norm_q16_w = -24'sd8388608;
+    else                                  norm_q16_w = 24'(norm_wide_w);
+  end
+
+  // Stage 3 combinational: gamma/beta affine with scale alignment.
+  logic signed [31:0] product_w;
+  logic signed [95:0] sum_align_w;
+  logic signed [95:0] final_w;
+  int  common_exp_w;
+  int  final_shift_w;
+  heatvit_s8_t out_byte_w;
+  always_comb begin
+    product_w = $signed(norm_q16_r) * $signed(gamma3_r);
+    common_exp_w = ((int'(gamma_scale_r) - 16) < int'(beta_scale_r))
+                     ? (int'(gamma_scale_r) - 16) : int'(beta_scale_r);
+    sum_align_w = ($signed(96'(product_w)) <<< (int'(gamma_scale_r) - 16 - common_exp_w))
+                + ($signed(96'($signed(beta3_r))) <<< (int'(beta_scale_r) - common_exp_w));
+    final_shift_w = common_exp_w - int'(out_scale_r);
+    if (final_shift_w >= 0)
+      final_w = sum_align_w <<< final_shift_w;
+    else
+      final_w = round_shift_away_96(sum_align_w, -final_shift_w);
+    out_byte_w = sat_s8(heatvit_s128_t'(final_w));
+  end
+
+  // Pipeline control: advance when the output stage is empty or accepted.
+  wire out_accept = out_valid && out_ready;
+  wire advance    = !out_valid || out_accept;
+  wire feeding    = (idx < 8'd192);
 
   heatvit_isqrt #(.RAD_W(48)) u_isqrt (
     .clk       (clk),
@@ -173,7 +245,6 @@ module heatvit_layernorm
       done             <= 1'b0;
       warn_negative_variance <= 1'b0;
       idx              <= 8'd0;
-      out_idx          <= 8'd0;
       x_scale_r        <= 6'sd0;
       gamma_scale_r    <= 6'sd0;
       beta_scale_r     <= 6'sd0;
@@ -192,12 +263,25 @@ module heatvit_layernorm
       div_den          <= 64'd0;
       isqrt_start      <= 1'b0;
       isqrt_radicand   <= 48'd0;
+      s1_valid_r       <= 1'b0;
+      diff_r           <= 49'sd0;
+      gamma1_r         <= 8'sd0;
+      beta1_r          <= 8'sd0;
+      s2_valid_r       <= 1'b0;
+      prod_r           <= 97'sd0;
+      gamma2_r         <= 8'sd0;
+      beta2_r          <= 8'sd0;
+      s3_valid_r       <= 1'b0;
+      norm_q16_r       <= 24'sd0;
+      gamma3_r         <= 8'sd0;
+      beta3_r          <= 8'sd0;
       out_valid        <= 1'b0;
+      out_byte_r       <= 8'sd0;
+      out_count_r      <= 8'd0;
       for (int i = 0; i < D; i++) begin
         x_buf[i]     <= 8'sd0;
         gamma_buf[i] <= 8'sd0;
         beta_buf[i]  <= 8'sd0;
-        out_buf[i]   <= 8'sd0;
       end
     end else begin
       done <= 1'b0;
@@ -286,30 +370,40 @@ module heatvit_layernorm
           if (div_rsp_valid) begin
             inv_std_q32_r <= rounded_quot_w[47:0];
             idx           <= 8'd0;
+            out_valid     <= 1'b0;
+            s1_valid_r    <= 1'b0;
+            s2_valid_r    <= 1'b0;
+            s3_valid_r    <= 1'b0;
+            out_count_r   <= 8'd0;
             state         <= S_NORMALIZE;
           end
         end
         S_NORMALIZE: begin
-          out_buf[idx] <= normalize_channel(
-            x_buf[idx], gamma_buf[idx], beta_buf[idx],
-            mean_q32_r, inv_std_q32_r
-          );
-          if (idx == 8'd191) begin
-            out_idx   <= 8'd0;
-            out_valid <= 1'b1;
-            state     <= S_DRAIN;
+          // Stage 0 loads channels idx=0..191; the pipeline then flushes.
+          // out_valid is the stage-3 slot's valid flag; it holds during an
+          // output stall and clears on the final accepted beat.
+          if (out_accept && out_count_r == 8'd191) begin
+            out_valid <= 1'b0;
+            state     <= S_DONE;
           end else begin
-            idx <= idx + 8'd1;
-          end
-        end
-        S_DRAIN: begin
-          if (out_valid && out_ready) begin
-            if (out_idx == 8'd191) begin
-              out_valid <= 1'b0;
-              state     <= S_DONE;
-            end else begin
-              out_idx <= out_idx + 8'd1;
+            if (advance) begin
+              if (feeding) idx <= idx + 8'd1;
+              s1_valid_r <= feeding;
+              diff_r     <= diff_w;
+              gamma1_r   <= gamma_buf[idx];
+              beta1_r    <= beta_buf[idx];
+              s2_valid_r <= s1_valid_r;
+              prod_r     <= prod_w;
+              gamma2_r   <= gamma1_r;
+              beta2_r    <= beta1_r;
+              s3_valid_r <= s2_valid_r;
+              norm_q16_r <= norm_q16_w;
+              gamma3_r   <= gamma2_r;
+              beta3_r    <= beta2_r;
+              out_valid  <= s3_valid_r;
+              out_byte_r <= out_byte_w;
             end
+            if (out_accept) out_count_r <= out_count_r + 8'd1;
           end
         end
         S_DONE: begin

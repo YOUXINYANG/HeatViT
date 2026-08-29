@@ -68,6 +68,7 @@ module heatvit_gemm_engine
     S_PLAN_WAIT,
     S_WB_NEXT,
     S_WB_REQ,
+    S_WB_COMPOSE,
     S_WB_BEAT,
     S_DONE
   } state_t;
@@ -125,6 +126,50 @@ module heatvit_gemm_engine
   logic [2:0]  wb_e;
   logic [5:0]  wb_w;
   logic [2:0]  wb_bi;
+  // P7-4: write-back beat path is a two-stage registered composition that
+  // fills an 8-deep staging RAM, then streams the beats out of the RAM.
+  // This breaks the old ~90-level single-cycle cone (accumulator read mux
+  // + 128-bit requant + byte assembly) into short stages.
+  logic [7:0]  wb_hit_a;        // stage A comb: per-byte in-range flags
+  logic [4:0]  wb_c_a [0:7];    // stage A comb: output column index per byte
+  logic [1:0]  wb_lane_a [0:7]; // stage A comb: byte lane within 32-bit word
+  logic [1:0]  wb_kind_a [0:7]; // 0=int8, 1=gelu, 2=int32, 3=plan
+  logic [7:0]  wb_hit_r;
+  logic [4:0]  wb_c_r [0:7];
+  logic [1:0]  wb_lane_r [0:7];
+  logic [1:0]  wb_kind_r [0:7];
+  logic        wb_comp_valid_r;   // stage B has a valid beat to write
+  logic [2:0]  wb_comp_idx_r;     // beat index being composed at stage B
+  logic [71:0] wb_ram_wdata;      // {64-bit data, 8-bit strb}
+  logic [2:0]  wb_ram_raddr;
+  logic [71:0] wb_ram_rdata;
+  logic        wb_valid_r;
+  logic        wb_exit_d;         // compose exit armed: last beat write captured
+  logic [2:0]  wb_rd;             // streaming read index
+  logic [2:0]  wb_last_idx;       // last beat index (wb_len-1, clamped to 3 bits)
+  // Registered staging-RAM write port: the stage-B composition cone is deep
+  // and its routing to the scattered distributed-RAM cells was the critical
+  // path (route-dominated); registering the port collapses it to a short
+  // reg->RAM hop.
+  logic        wb_ram_we_r;
+  logic [2:0]  wb_ram_waddr_r;
+  logic [71:0] wb_ram_wdata_r;
+  // Guard settle registers: the load/write-back address guards are deep
+  // (multiplies + bounds checks), so the state machine registers their
+  // results for one cycle before deciding.
+  logic        g_ok_r;
+  logic [7:0]  g_code_r;
+  logic [63:0] wb_addr64_r;
+  logic [15:0] wb_len_c_r;
+  logic [2:0]  wb_e_c_r;
+  logic [5:0]  wb_w_c_r;
+  logic        wb_guard_phase;
+  logic        ld_guard_phase;
+  logic [31:0] ld_addr_r;
+  logic [15:0] ld_len_r;
+  logic [2:0]  ld_e_r;
+  logic [15:0] ld_w_r;
+  logic [2:0]  ld_fill_bank_r;
   logic [1:0]  gb;
   logic [2:0]  gr;
   logic [2:0]  gc;
@@ -595,7 +640,42 @@ module heatvit_gemm_engine
   assign wb_end64_c = (wb_cover64_c < wb_region_end64_c) ? wb_cover64_c : wb_region_end64_c;
   assign wb_len_c = 16'((wb_end64_c - wb_aligned64_c) >> 3);
 
-  // Per-byte writeback composition.
+  // Per-byte writeback composition: stage A computes each byte's column
+  // index / lane / kind for the current beat and registers them; stage B
+  // re-selects the values from the accumulator and buffer arrays with the
+  // registered indices and runs the original requant functions verbatim
+  // (bit-exact by construction).
+
+  always_comb begin
+    wb_hit_a = 8'd0;
+    for (int j = 0; j < 8; j++) begin
+      int p;
+      int c;
+      wb_c_a[j]    = 5'd0;
+      wb_lane_a[j] = 2'd0;
+      wb_kind_a[j] = 2'd0;
+      p = int'(wb_bi) * 8 + j;
+      if ((p >= int'(wb_e)) && (p < int'(wb_e) + int'(wb_w))) begin
+        wb_hit_a[j] = 1'b1;
+        if (out_int32) begin
+          c = (p - int'(wb_e)) / 4;
+          wb_c_a[j]    = 5'(c);
+          wb_lane_a[j] = 2'((p - int'(wb_e)) % 4);
+          wb_kind_a[j] = 2'd2;
+        end else if (post_op == POST_PLAN) begin
+          c = (p - int'(wb_e)) / 4;
+          wb_c_a[j]    = 5'(c);
+          wb_lane_a[j] = 2'((p - int'(wb_e)) % 4);
+          wb_kind_a[j] = 2'd3;
+        end else begin
+          c = p - int'(wb_e);
+          wb_c_a[j]    = 5'(c);
+          wb_kind_a[j] = (post_op == POST_GELU) ? 2'd1 : 2'd0;
+        end
+      end
+    end
+  end
+
   function automatic heatvit_s8_t gemm_out8(input int b, input int r, input int c);
     heatvit_s128_t wide;
     int shift;
@@ -625,36 +705,39 @@ module heatvit_gemm_engine
     return sat_s8(scaled);
   endfunction
 
+  // Stage B: byte assembly from the registered indices, reusing the
+  // original requant functions.
   always_comb begin
-    wb_data_c = 64'h0000000000000000;
-    wb_strb_c = 8'h00;
-    if (state == S_WB_BEAT) begin
-      for (int j = 0; j < 8; j++) begin
-        int p;
-        int c;
-        heatvit_s32_t word_value;
-        heatvit_s8_t byte_value;
-        p = int'(wb_bi) * 8 + j;
-        if ((p >= int'(wb_e)) && (p < int'(wb_e) + int'(wb_w))) begin
-          wb_strb_c[j] = 1'b1;
-          if (out_int32 || post_op == POST_PLAN) begin
-            c = (p - int'(wb_e)) / 4;
-            if (post_op == POST_PLAN)
-              word_value = {15'd0, plan_buf[int'(wb_b)][int'(wb_r)][c]};
-            else
-              word_value = gemm_out32(int'(wb_b), int'(wb_r), c);
-            wb_data_c[8*j +: 8] = word_value[8 * ((p - int'(wb_e)) % 4) +: 8];
-          end else begin
-            c = p - int'(wb_e);
-            if (post_op == POST_GELU)
-              byte_value = gelu_out8(int'(wb_b), int'(wb_r), c);
-            else
-              byte_value = gemm_out8(int'(wb_b), int'(wb_r), c);
-            wb_data_c[8*j +: 8] = byte_value;
+    logic [7:0]  strb;
+    logic [63:0] data;
+    strb = 8'd0;
+    data = 64'd0;
+    for (int j = 0; j < 8; j++) begin
+      heatvit_s8_t  byte_value;
+      heatvit_s32_t word_value;
+      if (wb_hit_r[j]) begin
+        strb[j] = 1'b1;
+        case (wb_kind_r[j])
+          2'd0: begin
+            byte_value = gemm_out8(int'(wb_b), int'(wb_r), int'(wb_c_r[j]));
+            data[8*j +: 8] = byte_value;
           end
-        end
+          2'd1: begin
+            byte_value = gelu_out8(int'(wb_b), int'(wb_r), int'(wb_c_r[j]));
+            data[8*j +: 8] = byte_value;
+          end
+          2'd2: begin
+            word_value = gemm_out32(int'(wb_b), int'(wb_r), int'(wb_c_r[j]));
+            data[8*j +: 8] = word_value[8*wb_lane_r[j] +: 8];
+          end
+          default: begin
+            word_value = {15'd0, plan_buf[int'(wb_b)][int'(wb_r)][int'(wb_c_r[j])]};
+            data[8*j +: 8] = word_value[8*wb_lane_r[j] +: 8];
+          end
+        endcase
       end
     end
+    wb_ram_wdata = {strb, data};
   end
 
   // Scatter one beat byte per cycle into the tile buffer.
@@ -692,10 +775,45 @@ module heatvit_gemm_engine
   assign req_bytes   = (state == S_WB_REQ) ? (32'(wb_len) << 3) :
                                               (32'(ld_len) << 3);
   assign req_r_ready = req_r_ready_r;
-  assign req_w_valid = (state == S_WB_BEAT);
-  assign req_w_data  = wb_data_c;
-  assign req_w_strb  = wb_strb_c;
-  assign req_w_last  = (wb_bi == wb_len[6:0] - 7'd1);
+  assign req_w_valid = wb_valid_r;
+  assign req_w_data  = wb_ram_rdata[63:0];
+  assign req_w_strb  = wb_ram_rdata[71:64];
+  assign req_w_last  = (state == S_WB_BEAT) && (wb_rd == wb_last_idx);
+
+  // Write-back staging RAM: composed beats are written during
+  // S_WB_COMPOSE and streamed combinationally during S_WB_BEAT (the RAM
+  // read is registered, so rdata = mem[raddr of the previous cycle]).
+  // raddr points at the beat being presented; it advances only on the
+  // accepted beat (backpressure-safe) and warms up as 0 during the
+  // compose phase, so the first S_WB_BEAT cycle already shows mem[0].
+  heatvit_sdp_ram #(.WIDTH(72), .DEPTH(8)) u_wb_ram (
+    .clk   (clk),
+    .we    (wb_ram_we_r),
+    .waddr (wb_ram_waddr_r),
+    .wdata (wb_ram_wdata_r),
+    .wstrb (9'h1FF),
+    .raddr (wb_ram_raddr),
+    .rdata (wb_ram_rdata)
+  );
+
+  assign wb_last_idx = wb_len[2:0] - 3'd1;
+  wire wb_accept_w = (state == S_WB_BEAT) && wb_valid_r && req_w_ready;
+  assign wb_ram_raddr = (state == S_WB_BEAT)
+    ? (wb_accept_w ? ((wb_rd == wb_last_idx) ? wb_last_idx : (wb_rd + 3'd1))
+                   : wb_rd)
+    : 3'd0;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      wb_ram_we_r    <= 1'b0;
+      wb_ram_waddr_r <= 3'd0;
+      wb_ram_wdata_r <= 72'd0;
+    end else begin
+      wb_ram_we_r    <= (state == S_WB_COMPOSE) && wb_comp_valid_r;
+      wb_ram_waddr_r <= wb_comp_idx_r;
+      wb_ram_wdata_r <= wb_ram_wdata;
+    end
+  end
 
   // Guard input mux for per-window runtime checks.
   assign g_base  = (state == S_WB_NEXT) ? dst_region_base : ld_region_base_c;
@@ -729,6 +847,19 @@ module heatvit_gemm_engine
       gelu_x_latched   <= 24'sd0;
       plan_start       <= 1'b0;
       req_r_ready_r    <= 1'b0;
+      wb_hit_r         <= 8'd0;
+      for (int j = 0; j < 8; j++) begin
+        wb_c_r[j]    <= 5'd0;
+        wb_lane_r[j] <= 2'd0;
+        wb_kind_r[j] <= 2'd0;
+      end
+      wb_comp_valid_r  <= 1'b0;
+      wb_comp_idx_r    <= 3'd0;
+      wb_valid_r       <= 1'b0;
+      wb_exit_d        <= 1'b0;
+      wb_rd            <= 3'd0;
+      wb_guard_phase   <= 1'b0;
+      ld_guard_phase   <= 1'b0;
       for (int b = 0; b < 3; b++) begin
         col_mask[b]  <= 8'hff;
         a_rd_addr[b] <= 13'd0;
@@ -811,7 +942,21 @@ module heatvit_gemm_engine
           end
         end
 
+        // Load window selection with a one-cycle guard settle: the first
+        // phase registers the guard result and the derived addresses, the
+        // second phase decides from the registered values.
         S_LOAD_SETUP: begin
+          if (!ld_guard_phase) begin
+            ld_guard_phase <= 1'b1;
+            g_ok_r   <= g_ok;
+            g_code_r <= g_code;
+            ld_addr_r <= ld_aligned64_c[31:0];
+            ld_len_r  <= ld_len_c;
+            ld_e_r    <= ld_e_c;
+            ld_w_r    <= ld_w_c;
+            ld_fill_bank_r <= ld_fill_bank_c;
+          end else begin
+          ld_guard_phase <= 1'b0;
           case (ld_kind)
             2'd0: begin
               if (head_mode ? (ld_bank == 2'd3) : (ld_idx == {12'd0, a_rows})) begin
@@ -819,15 +964,15 @@ module heatvit_gemm_engine
                 ld_bank <= 2'd0;
                 ld_idx  <= 16'd0;
               end else begin
-                if (g_ok) begin
-                  ld_addr <= ld_aligned64_c[31:0];
-                  ld_len  <= ld_len_c;
-                  ld_e    <= ld_e_c;
-                  ld_w    <= ld_w_c;
-                  ld_fill_bank <= ld_fill_bank_c;
+                if (g_ok_r) begin
+                  ld_addr <= ld_addr_r;
+                  ld_len  <= ld_len_r;
+                  ld_e    <= ld_e_r;
+                  ld_w    <= ld_w_r;
+                  ld_fill_bank <= ld_fill_bank_r;
                   state   <= S_LOAD_REQ;
                 end else begin
-                  error_code  <= ERR_ADDRESS;
+                  error_code  <= g_code_r;
                   error_valid <= 1'b1;
                   busy        <= 1'b0;
                   state       <= S_IDLE;
@@ -845,15 +990,15 @@ module heatvit_gemm_engine
               end else if (b_cols[ld_bank] == 4'd0) begin
                 ld_bank <= ld_bank + 2'd1;
               end else begin
-                if (g_ok) begin
-                  ld_addr <= ld_aligned64_c[31:0];
-                  ld_len  <= ld_len_c;
-                  ld_e    <= ld_e_c;
-                  ld_w    <= ld_w_c;
-                  ld_fill_bank <= ld_fill_bank_c;
+                if (g_ok_r) begin
+                  ld_addr <= ld_addr_r;
+                  ld_len  <= ld_len_r;
+                  ld_e    <= ld_e_r;
+                  ld_w    <= ld_w_r;
+                  ld_fill_bank <= ld_fill_bank_r;
                   state   <= S_LOAD_REQ;
                 end else begin
-                  error_code  <= ERR_ADDRESS;
+                  error_code  <= g_code_r;
                   error_valid <= 1'b1;
                   busy        <= 1'b0;
                   state       <= S_IDLE;
@@ -866,15 +1011,15 @@ module heatvit_gemm_engine
               end else if (b_cols[ld_bank] == 4'd0) begin
                 ld_bank <= ld_bank + 2'd1;
               end else begin
-                if (g_ok) begin
-                  ld_addr <= ld_aligned64_c[31:0];
-                  ld_len  <= ld_len_c;
-                  ld_e    <= ld_e_c;
-                  ld_w    <= ld_w_c;
-                  ld_fill_bank <= ld_fill_bank_c;
+                if (g_ok_r) begin
+                  ld_addr <= ld_addr_r;
+                  ld_len  <= ld_len_r;
+                  ld_e    <= ld_e_r;
+                  ld_w    <= ld_w_r;
+                  ld_fill_bank <= ld_fill_bank_r;
                   state   <= S_LOAD_REQ;
                 end else begin
-                  error_code  <= ERR_ADDRESS;
+                  error_code  <= g_code_r;
                   error_valid <= 1'b1;
                   busy        <= 1'b0;
                   state       <= S_IDLE;
@@ -882,6 +1027,7 @@ module heatvit_gemm_engine
               end
             end
           endcase
+          end
         end
 
         S_LOAD_REQ: begin
@@ -1115,72 +1261,129 @@ module heatvit_gemm_engine
           end
         end
 
+        // Write-back window selection. The address guard is deep
+        // (multiplies + bounds checks), so the first phase registers the
+        // guard result and the derived addresses, and the second phase
+        // makes the decision from the registered values.
         S_WB_NEXT: begin
-          if (wb_b == 2'd3) begin
-            // Advance to the next column group / row tile.
-            if (head_mode) begin
-              if (n0 + 16'd8 < nph) n0 <= n0 + 16'd8;
-              else begin
-                n0 <= 16'd0;
-                m0 <= m0 + 16'd8;
+          if (!wb_guard_phase) begin
+            wb_guard_phase <= 1'b1;
+            g_ok_r     <= g_ok;
+            g_code_r   <= g_code;
+            wb_addr64_r <= wb_aligned64_c;
+            wb_len_c_r  <= wb_len_c;
+            wb_e_c_r    <= wb_e_c;
+            wb_w_c_r    <= wb_w_c;
+          end else begin
+            wb_guard_phase <= 1'b0;
+            if (wb_b == 2'd3) begin
+              // Advance to the next column group / row tile.
+              if (head_mode) begin
+                if (n0 + 16'd8 < nph) n0 <= n0 + 16'd8;
+                else begin
+                  n0 <= 16'd0;
+                  m0 <= m0 + 16'd8;
+                end
+              end else begin
+                if (n0 + 16'd24 < n_eff) n0 <= n0 + 16'd24;
+                else begin
+                  n0 <= 16'd0;
+                  m0 <= m0 + 16'd8;
+                end
               end
-            end else begin
-              if (n0 + 16'd24 < n_eff) n0 <= n0 + 16'd24;
-              else begin
-                n0 <= 16'd0;
-                m0 <= m0 + 16'd8;
-              end
-            end
-            if ((head_mode && (n0 + 16'd8 >= nph)) || (!head_mode && (n0 + 16'd24 >= n_eff))) begin
-              if (m0 + 16'd8 >= m_eff) begin
-                state <= S_DONE;
+              if ((head_mode && (n0 + 16'd8 >= nph)) || (!head_mode && (n0 + 16'd24 >= n_eff))) begin
+                if (m0 + 16'd8 >= m_eff) begin
+                  state <= S_DONE;
+                end else begin
+                  ld_kind <= 2'd0;
+                  ld_bank <= 2'd0;
+                  ld_idx  <= 16'd0;
+                  state   <= S_LOAD_SETUP;
+                end
               end else begin
                 ld_kind <= 2'd0;
                 ld_bank <= 2'd0;
                 ld_idx  <= 16'd0;
                 state   <= S_LOAD_SETUP;
               end
+            end else if (b_cols[wb_b] == 4'd0) begin
+              wb_b <= wb_b + 2'd1;
+            end else if (wb_r < a_rows) begin
+              if (g_ok_r) begin
+                wb_bi   <= 3'd0;
+                wb_addr <= wb_addr64_r[31:0];
+                wb_len  <= wb_len_c_r;
+                wb_e    <= wb_e_c_r;
+                wb_w    <= wb_w_c_r;
+                state   <= S_WB_REQ;
+              end else begin
+                error_code  <= g_code_r;
+                error_valid <= 1'b1;
+                busy        <= 1'b0;
+                state       <= S_IDLE;
+              end
             end else begin
-              ld_kind <= 2'd0;
-              ld_bank <= 2'd0;
-              ld_idx  <= 16'd0;
-              state   <= S_LOAD_SETUP;
+              wb_b <= wb_b + 2'd1;
+              wb_r <= 3'd0;
             end
-          end else if (b_cols[wb_b] == 4'd0) begin
-            wb_b <= wb_b + 2'd1;
-          end else if (wb_r < a_rows) begin
-            if (g_ok) begin
-              wb_addr <= wb_aligned64_c[31:0];
-              wb_len  <= wb_len_c;
-              wb_e    <= wb_e_c;
-              wb_w    <= wb_w_c;
-              state   <= S_WB_REQ;
-            end else begin
-              error_code  <= ERR_ADDRESS;
-              error_valid <= 1'b1;
-              busy        <= 1'b0;
-              state       <= S_IDLE;
-            end
-          end else begin
-            wb_b <= wb_b + 2'd1;
-            wb_r <= 3'd0;
           end
         end
 
         S_WB_REQ: begin
           if (req_valid && req_ready) begin
             wb_bi <= 3'd0;
-            state <= S_WB_BEAT;
+            state <= S_WB_COMPOSE;
           end
         end
 
+        // Compose the burst into the staging RAM: two registered stages
+        // (stage A raw select, stage B scale/pack) at one beat per cycle.
+        // The RAM write port itself is registered, so the last beat's write
+        // lands one edge after its stage-B value is captured; the exit is
+        // therefore armed first (wb_exit_d) and the state leaves one cycle
+        // later, keeping the final RAM write ahead of the first stream read.
+        S_WB_COMPOSE: begin
+          wb_comp_valid_r <= (wb_bi <= wb_last_idx);
+          wb_comp_idx_r   <= wb_bi;
+          wb_hit_r        <= wb_hit_a;
+          for (int j = 0; j < 8; j++) begin
+            wb_c_r[j]    <= wb_c_a[j];
+            wb_lane_r[j] <= wb_lane_a[j];
+            wb_kind_r[j] <= wb_kind_a[j];
+          end
+          if (wb_comp_valid_r && (wb_comp_idx_r == wb_last_idx)) begin
+            wb_exit_d        <= 1'b1;
+            wb_comp_valid_r  <= 1'b0;
+            wb_bi            <= 3'd0;
+          end else if (wb_exit_d) begin
+            wb_exit_d        <= 1'b0;
+            wb_rd            <= 3'd0;
+            wb_valid_r       <= 1'b0;
+            wb_comp_valid_r  <= 1'b0;
+            state            <= S_WB_BEAT;
+            wb_bi            <= 3'd0;
+          end else if (wb_bi == wb_last_idx || wb_bi == 3'd7) begin
+            wb_bi <= 3'd0;
+          end else begin
+            wb_bi <= wb_bi + 3'd1;
+          end
+        end
+
+        // Stream the composed beats out of the staging RAM. The presented
+        // beat is wb_rd; the RAM read is registered with raddr tracking the
+        // presented beat (advanced only on the accepted beat), so the data
+        // holds under backpressure. The first cycle is a warm-up: valid
+        // rises at its edge together with rdata = mem[0].
         S_WB_BEAT: begin
-          if (req_w_valid && req_w_ready) begin
-            if (wb_bi == (wb_len[6:0] - 7'd1)) begin
+          if (!wb_valid_r) begin
+            wb_valid_r <= 1'b1;
+          end else if (req_w_ready) begin
+            if (wb_rd == wb_last_idx) begin
+              wb_valid_r <= 1'b0;
               wb_r  <= wb_r + 3'd1;
               state <= S_WB_NEXT;
             end else begin
-              wb_bi <= wb_bi + 3'd1;
+              wb_rd <= (wb_rd == wb_last_idx) ? wb_last_idx : (wb_rd + 3'd1);
             end
           end
         end

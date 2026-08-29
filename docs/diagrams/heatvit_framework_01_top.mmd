@@ -1,0 +1,21 @@
+%% HeatViT RTL 框架图 · 图 1/4：顶层控制与数据面
+%% 模块级联 + 关键信号（非全部信号）。渲染：mermaid.live / GitHub / VSCode Mermaid 插件。
+flowchart TD
+  HOST["Host · 外部存储控制器（行为模型 / 板上 DDR）"]
+  TOP["heatvit_top<br/>协议层：start 锁存四区域基址、错误/中止协议、警告与输出尺度锁存"]
+  SCHED["heatvit_scheduler<br/>8 态 FSM 顺序调度 198 条描述符：slot 重定位、K/V 步长补丁、Token 状态维护"]
+  ROM["heatvit_descriptor_rom<br/>198 × 320-bit 描述符只读存储（$readmemh 加载）"]
+  EXEC["heatvit_tensor_executor<br/>按 opcode 分发单一描述符到 8 个子引擎，区域/地址预检与动态 M/N/K 解析"]
+
+  HOST -->|clk · rst_n · start| TOP
+  HOST -->|input_base/bytes · weight_base/bytes<br/>scratch_base/bytes · output_base/bytes| TOP
+  TOP -->|busy · done · error_valid · error_code<br/>warning_flags · output_scale_exp| HOST
+  HOST -->|64-bit 三通道 mem_cmd/mem_w/mem_r<br/>valid/ready · last · strb（经 top 直通）| EXEC
+  TOP -->|start · abort| SCHED
+  SCHED -->|busy · done · error_valid/code<br/>current_desc_index| TOP
+  ROM -->|rom_desc 320-bit| SCHED
+  SCHED -->|exec_desc_valid · exec_desc 320-bit<br/>current_token_count · current_package_present| EXEC
+  EXEC -->|exec_desc_ready · exec_done · exec_error_valid/code| SCHED
+  EXEC -->|state_update_valid · next_token_count<br/>next_package_present| SCHED
+  TOP -->|abort · 锁存后的四区域基址/长度| EXEC
+  EXEC -->|error_valid/code · warning_pulse · abort_done| TOP

@@ -1,0 +1,19 @@
+%% HeatViT RTL 框架图 · 图 3/4：统一 GEMM 引擎内部
+flowchart LR
+  MMG["heatvit_mem_master<br/>GEMM 自备存储主机：单笔在途 64-bit 突发"]
+  GUARD5["heatvit_addr_guard × 5<br/>突发级 ×1 + 全张量级 ×4 区域越界预检"]
+  TILE["heatvit_tile_buffer<br/>3×A + 3×B + Bias 片上 tile 存储（A/B 为可推断 SDP RAM）"]
+  MAC["3 × heatvit_mac_bank<br/>8×8 int8 外积累加原语（clear/accum · 行列掩码）"]
+  GELU["heatvit_gelu<br/>I-ViT ShiftGELU：40 级除法流水，Q8.16→Q8.16"]
+  PLAN["heatvit_plan_sigmoid<br/>PLAN 分段线性 Sigmoid：Q8.16 → Q0.16"]
+  EXT["外部 64-bit 三通道<br/>（执行器内 2:1 mux）"]
+
+  MMG -->|mem_cmd/mem_w/mem_r| EXT
+  MMG -->|cmd_addr/len 预检| GUARD5
+  GUARD5 -->|addr_ok / error_code| MMG
+  MMG -->|加载 A/B/Bias：r_data 64-bit| TILE
+  TILE -->|a_rd_data · b_rd_data · bias| MAC
+  MAC -->|bank_accum int32 + bias → 尺度对齐 Q8.16| GELU
+  MAC -->|bank_accum int32 → 尺度对齐 Q8.16| PLAN
+  GELU -->|int8 结果回写 req_*| MMG
+  PLAN -->|uq0.16 结果回写 req_*| MMG

@@ -37,8 +37,14 @@ DSP/BRAM 正常推断），但综合级 LUT 918,145（450.5%）约为 `xc7k325tf
 mux 网络。**P7-1 / P7-2 资源优化已完成**：vector/layout 两引擎与 selector
 侧七模块的寄存器数组全部重构为字节写使能 SDP RAM / 串行化访问，全量逐位
 回归（e2e 两轮 + 错误矩阵）全绿，全量多核综合 LUT **918,145 → 126,459
-（62.05%）**，首次跨过 100% 可布线性门槛；实现与 100 MHz 时序收敛、P7③
-MAC DSP 化为后续步骤。
+（62.05%）**，首次跨过 100% 可布线性门槛。**P7-4 实现与 50 MHz 时序收敛
+已完成**：LayerNorm/softmax 流水化与 GEMM 写回 staging RAM 写端口寄存器化
+（全量逐位回归全绿）后 place+route 0 未布线；100 MHz 实测不收敛（place 后
+WNS = −7.2 ns、route 拥塞，残余集中在 GEMM 写回 128 位重定标锥）按计划
+回退，50 MHz signoff **WNS = +0.323 ns、TNS = 0、WHS = +0.073 ns**
+（`All user specified timing constraints are met.`），路由后资源
+LUT 118,453（58.12%）、FF 46,834、DSP 65、BRAM 37。100 MHz 攻坚与
+P7③ MAC DSP 化为后续可选优化。
 
 **关键词：** Vision Transformer；动态 Token 剪枝；定点量化；FPGA；
 SystemVerilog；描述符调度；逐位仿真验证
@@ -118,7 +124,8 @@ SystemVerilog；描述符调度；逐位仿真验证
   实施中，见第二部分 §14）。
 - 不复现 ImageNet Top-1 准确率，也不声称随机测试权重具有分类意义。
 - 不集成板级 DDR、MIG、PCIe、AXI、摄像头、显示、串口或主机软件。
-- 不执行上板、功耗测试、时序收敛或实测吞吐验证。
+- 不执行上板、功耗测试或实测吞吐验证（P7 修正：时序收敛已纳入范围，
+  50 MHz signoff 达标，见 §15 P7-4）。
 - 不支持 HeatViT-S、HeatViT-B 或 LV-ViT 变体。
 - 不实现 JPEG/PNG 解码、图像缩放和浮点均值方差预处理。
 
@@ -4942,12 +4949,13 @@ Q2 权重上 +0.34pp 的收益在 P4A 权重上转为惩罚，印证「训练越
 2023.2 综合与实现，统计资源占用；时序目标 100 MHz（`create_clock -period
 10.000`）。综合/资源统计此前被规格明确排除（§17 与 §3 全局工程约束），
 本阶段起修订为：**资源统计纳入验收口径；时序收敛以 100 MHz 为目标**。
+（P7-4 实测 100 MHz 不收敛后按计划回退，**最终收敛口径为 50 MHz**，见 P7-4。）
 
 ### 新增工具
 
 | 文件 | 作用 |
 | --- | --- |
-| `xdc/heatvit.xdc` | 100 MHz 时钟 + 0 延迟 IO 约束（无板级引脚，内部路径为准） |
+| `xdc/heatvit.xdc` | 时钟 + 0 延迟 IO 约束（无板级引脚，内部路径为准；P7-4 起为 50 MHz） |
 | `scripts/run_synthesis.tcl` / `scripts/run_vivado_synth.ps1` | 综合跑批 + 利用率报告导出 + 黑盒扫描 |
 | `scripts/run_implementation.tcl` / `scripts/run_vivado_impl.ps1` | 实现至 route_design + util/timing/power 报告 |
 | `scripts/run_opt_report.tcl` | 综合后 opt_design，取更真实的 LUT 数 |
@@ -5038,13 +5046,14 @@ selector_softmax/finalize/packager/feature_concat/compactor（合计 ~156K）；
 ③ MAC bank 乘法 DSP 化并查 bank0 不对称（57K → ~6K + ~96 DSP，DSP 仍只
 占 ~25%）。预期总 LUT ~140–190K（15–20% 器件），达标后重跑
 synth + impl + 100 MHz 时序。每步 RTL 改动过全量逐位回归。
+（P7-4 实际收敛口径为 50 MHz：100 MHz 不收敛后按计划回退，见 P7-4。）
 
 ### 复现命令
 
 ```powershell
 $env:HEATVIT_VIVADO_BIN = 'D:\vivado\vivado2023.2\Vivado\2023.2\bin'
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_synth.ps1 -Jobs 24   # 5h47m
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_impl.ps1 -Jobs 24    # 待 P7 达标后
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_impl.ps1 -Jobs 24    # P7-4 已运行：50 MHz 收敛（WNS +0.323 ns）
 .\.venv\Scripts\python tools\p6\p6_summary.py
 ```
 
@@ -5172,6 +5181,93 @@ HeatViT.xpr 关闭 AutoIncrementalCheckpoint 绕过。
 **验证**：快速门禁（tb_selector_features/tb_head_fuse/tb_selector_finalize/
 tb_token_selector）+ 全量回归（transformer + e2e 无回压/回压两轮 + 错误矩阵）
 全部 TEST_PASS。
+
+### P7-4：实现与 50 MHz 时序收敛（2026-08-29）
+
+P7② 后资源达标（LUT 62.05%），按计划重跑实现并进入 100 MHz 时序收敛尝试
+（实测不收敛，回退 50 MHz 收敛，完整过程与结果见下）。
+首次实现即布线成功（0 未布线网、全局布线利用率 ~25%、拥塞热点 87–97%
+仅局部），但时序未收敛：**WNS = −30.19 ns、TNS = −377.5 µs、33,383 个
+违例端点**（Hold 通过）。违例分布剖析（routed DCP 全量 33,383 条路径的
+slack/层次聚合）定位出四个结构性问题与一个布局型问题：
+
+| 家族 | 端点规模 | 典型违例 | 根因 |
+| --- | ---: | ---: | --- |
+| u_ln/out_buf（LayerNorm normalize 通路） | 1,576+ | −30 ns / 187 级 | idx 字节读 mux → 52 位减 → 7 级 DSP 级联（128×128 乘）→ 舍入 → γ/β 仿射 → 字节写回寄存器数组，全组合单拍 |
+| u_sm/u_core（softmax emit 通路） | 239+ | −29..−20 ns | exp_element+scale_element 四次 48 位乘法单拍串联 |
+| mem_w_data 端口（GEMM 写回） | 64+ | −24 ns / 97 级 | 累加器读 mux + gemm_out8 重定标 + 8 字节组装 + master/mux 到 pad 全组合 |
+| IO mux→pad（child_sel 选择两 master） | ~130 | −1..−2 ns | 顶层组合 mux 后直达 OBUF/pad，寄存器远在片内 |
+| n_r[3]/rd_e[1] 大扇出（其余 19.7K） | 19,687 | −10..−20 ns（78% 路由） | Token 数寄存器与读尾指针的高扇出 + 地址算术锥；路由延迟为主，布线器因 WNS=−30 放弃优化 |
+
+**RTL 修改（全部为时序等价改写，数值通路逐位不变；改动后全量回归全绿）：**
+
+1. **heatvit_layernorm**：S_NORMALIZE 由「每拍组合计算 + 字节写寄存器数组」
+   改为 4 级可停顿流水（diff → 49×48 乘 → 舍入/饱和 → γ/β 仿射），结果
+   直接流式输出（out_buf[192] 寄存器数组及其字节写 mux 网络删除）。位宽从
+   128 位收窄到 97/96 位，并给出宽度证明（|x_q32|<2^39、|diff|<2^48、
+   |prod|<2^96、对齐中间量<2^95、最终仿射值<2^78），每个舍入点与原 128 位
+   版本逐位一致。踩坑：valid 链必须与数据级数相同（4 级数据需 4 级 valid，
+   少一级会让 out_valid 提前一拍带着垃圾数据，tb_layernorm 停顿检查捕获）。
+2. **heatvit_softmax_core**：exp_element 拆 4 级、scale_element 拆 2 级
+   流水，S_EXP_SUM 复用同一 exp 流水线求和。踩坑三处：① valid 链少一级
+   （与 LN 同类，tb_softmax 停顿检查捕获）；② z 与 square 错位一级——e 用
+   了下一个元素的 z（需 z2_r 对齐寄存器，最大幅值行才暴露）；③ flush 期
+   idx 停在 row_len 造成 buffer[row_len] 越界读把 X 注入流水线（读索引钳位
+   到 0 修复）。
+3. **heatvit_gemm_engine**：写回拍由「当前拍组合直通」改为「两级寄存组合 +
+   8 深 staging RAM + 流式读出」——stage A 逐字节寄存输出列索引/字内 lane/
+   类型，stage B 用寄存索引重新选择累加器/缓冲数组并逐字调用原重定标函数
+   （逐位一致由构造保证），组装后的拍写入 RAM；S_WB_BEAT 按 P7① 的背压
+   安全纪律从 RAM 组合呈现（raddr 仅在接受拍前进）。load/write-back 两处
+   地址守卫的深算术（64 位乘 + 边界检查）加一拍寄存（guard settle phase），
+   截断 42 级的 ld_bank→state 决策锥。踩坑五处：① `3'd8` 三位截断为 0 导致
+   组合 valid 恒假（FIX：冗余守卫删除）；② 流式 valid 早一拍呈现 RAM 旧读值
+   （暖机拍修复）；③ 组合退出条件在最后一拍写回前触发（改为「当前写入拍 ==
+   最后一拍」）；④ 上一 burst 的 comp_valid 残留使 1 拍 burst 进入即误退出
+   （退出时清零）；⑤ 声明赋值型 wire 的三元表达式出现异常求值（内联表达式
+   修复，经验教训：动态索引推进用内联表达式）。P7-4 时序轮再追一步：**staging
+   RAM 写端口（we/waddr/wdata 72 位）整体寄存器化**——首版路由后全部 10 条
+   违例路径都终止于 u_wb_ram 的 RAMD32 写输入（87 级组合锥 + 11.4 ns 散布路由），
+   寄存器化后该锥改为 reg→reg 且路由坍缩到 RAM 单元本地。配套纪律：compose 退出
+   先置 wb_exit_d 再延迟一拍离开（RAM 同步写必须落在首读之前），arm 拍与退出
+   延迟拍都清 comp_valid（防下一 burst 首拍对 RAM 伪写——CASE=ordinary 捕获）。
+4. **heatvit_top / XDC（IO 策略）**：mem 接口边界寄存器方案经三轮实验全部回退——
+   ① 全通道打拍：读通道 r_last 与 master 消费错一拍（e2e 报协议错误 5）；② 仅
+   输出打拍：模型永远看不到最后一拍的 `mem_w_last`（master 的 w_last 由其
+   beat_count 寄存器产生，与 child 的 valid 在同一拍内天然错开，寄存后配对
+   破坏）；③ 仅命令通道打拍：模型 ready 为 LFSR 脉冲时，master 与模型的命令
+   接受拍错开（master 已进 ST_DATA 而模型仍在 ST_IDLE），e2e 回压轮死锁
+   （watchdog）。结论：无板级引脚时 0 延迟 IO 约束本身无法诚实收敛（实测
+   mem_cmd_* 寄存器→mux→pad 路径仅因固定 pad 布线即违例 ~1–2 ns），改为
+   **XDC 把非时钟 IO 路径标记 false path**（rst_n 保留恢复/移除检查），内部
+   clk→clk 路径承载真实时钟预算作为本阶段收敛口径（P7-4 最终为 50 MHz）；
+   上板时随引脚约束
+   一起重引。该结论已写入 `xdc/heatvit.xdc` 注释。
+
+**验证**：foundation/gemm/transformer/selector 全量回归 + e2e 无回压/回压
+两轮 + 错误矩阵全部 TEST_PASS（逐位口径不变）。
+
+**实现与 100 MHz 收敛尝试（写端口寄存器化后重跑）**：opt→place→phys_opt→
+route 全流程跑通，但 place 后 phys_opt 只到 **WNS = −7.203 ns**（TNS
+−119,525），route 中间摘要 WNS −8.0..−9.1 ns 且报 `Route 35-447` 拥塞
+（路由器放弃时序优化保布线完成）。最差路径即 wb_b_reg → wb_ram_wdata_r
+锥（51 级、路由占比 ~78%：8 字节 × 128 位重定标 mux 散布在 MAC bank 与
+RAM 单元之间）。判定 100 MHz 不收敛，按计划终止并回退 50 MHz。
+
+**50 MHz 收敛（P7-4 最终口径）**：`create_clock -period 20.000`，重跑综合+实现：
+
+| 阶段 | 结果 |
+| --- | --- |
+| place 后 | WNS = +0.508 ns；phys_opt 直接跳过（无 setup 违例可优化） |
+| route 后 signoff | **WNS = +0.323 ns、TNS = 0、0 违例端点（98,342 总）** |
+| hold（min） | **WHS = +0.073 ns、THS = 0**（`All user specified timing constraints are met.`） |
+| 布线 | 0 未布线 / 0 部分布线；全局布线利用率 V 22.3%、H 23.1% |
+| 最差路径 | wb_b_reg[0]/C → wb_ram_wdata_r_reg[42]/D：51 级（CARRY4×27），逻辑 4.16 ns + 路由 15.24 ns = 19.41 ns / 20 ns 预算 |
+| 路由后资源 | LUT 118,453（58.12%）、FF 46,834（11.49%）、DSP 65、BRAM 37、LUT-as-DistRAM 116、0 黑盒 |
+
+**结论**：100 MHz 的残余差距集中在 GEMM 写回 stage-B 的 128 位重定标锥
+（后续可劈级或收窄容器位宽，属可选优化项）；50 MHz 已达成 P7-4 收敛目标，
+功能口径不变（本轮 RTL 改动后全量回归全绿）。
 
 # 第三部分：仿真与验证指南
 

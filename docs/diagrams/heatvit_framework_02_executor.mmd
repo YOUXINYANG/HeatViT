@@ -1,0 +1,34 @@
+%% HeatViT RTL 框架图 · 图 2/4：Tensor Executor 内部——opcode 分发与存储复用
+flowchart TD
+  EXEC["heatvit_tensor_executor<br/>单描述符执行器：opcode 分发、区域/地址预检、动态 M/N/K 解析"]
+  GUARD["heatvit_addr_guard × 4<br/>src0/src1/aux/dst 四操作数区域越界组合预检"]
+  MM["heatvit_mem_master（执行器自备）<br/>单笔在途 64-bit 突发协议机（含 abort drain）"]
+  ARB["heatvit_div_arbiter<br/>三客户端固定优先级（0＞1＞2）除法仲裁"]
+  UDIV["heatvit_udiv<br/>64/64 恢复无符号除法器（1 商位/拍）"]
+  EXT["外部 64-bit 三通道"]
+
+  subgraph CHILDREN["8 个子引擎 —— 每描述符经 opcode 只激活 1 个"]
+    GEMM["heatvit_gemm_engine<br/>统一 int8 GEMM：tile 装载 / MAC 累加 / 回写与后处理"]
+    LAY["heatvit_layout_engine<br/>流式布局引擎：PATCHIFY / COPY_ADD_POS / QKV_UNPACK / HEAD_CONCAT"]
+    VEC["heatvit_vector_engine<br/>流式向量引擎：LayerNorm / 残差 / 注意力 Softmax"]
+    RED["heatvit_reduce_mean<br/>Selector 特征规约：candidate 轴 / head-lane 轴均值"]
+    CON["heatvit_feature_concat<br/>Local/Global 特征拼接"]
+    HF["heatvit_head_fuse<br/>三 Head keep 分数加权融合"]
+    FIN["heatvit_selector_finalize<br/>单遍扫描：压缩/打包编排 + 唯一状态更新输出"]
+    SS["heatvit_selector_softmax<br/>二分 Softmax：int8 logits → Keep 概率 Q0.16"]
+  end
+
+  EXEC -->|child_sel 译码 · start 脉冲 · busy/done/error<br/>绝对基址 src0/1/aux/dst · m_eff · scale_exp| CHILDREN
+  EXEC -->|区域基址/长度 + 绝对地址 + beats| GUARD
+  GUARD -->|addr_ok / error_code| EXEC
+  CHILDREN -->|7 个流式子引擎的 req_* 通道 7:1 mux<br/>valid/ready/write/addr/bytes + w/r 数据| MM
+  MM -->|mem_cmd/mem_w/mem_r| EXT
+  GEMM -->|GEMM 自备 master 的 mem_* 通道 2:1 mux| EXT
+  VEC -->|client 0 · AttnSoftmax（与 SS 二选一）| ARB
+  SS -->|client 0 · SelectorSoftmax（与 VEC 二选一）| ARB
+  VEC -->|client 1 · LayerNorm 除法| ARB
+  RED -->|client 2 · RED/HF/FIN 三选一| ARB
+  HF -->|client 2| ARB
+  FIN -->|client 2| ARB
+  ARB -->|num/den · 单除法器分时| UDIV
+  UDIV -->|quot/rem/div_zero| ARB
