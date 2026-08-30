@@ -1,81 +1,86 @@
-<?xml version="1.0" encoding="UTF-8"?>
 <mxfile host="app.diagrams.net" type="device">
-  <diagram id="fw-03-gemm" name="03 · 统一 GEMM 引擎内部">
-    <mxGraphModel dx="1422" dy="794" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="600" math="0" shadow="0">
-      <root>
-        <mxCell id="0" />
-        <mxCell id="1" parent="0" />
-        <mxCell id="n_mmg" value="heatvit_mem_master&lt;br&gt;GEMM 自备存储主机：单笔在途 64-bit 突发" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="60" y="200" width="240" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_guard5" value="heatvit_addr_guard × 5&lt;br&gt;突发级 ×1 + 全张量级 ×4 区域越界预检" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="60" y="340" width="200" height="50" as="geometry" />
-        </mxCell>
-        <mxCell id="n_tile" value="heatvit_tile_buffer&lt;br&gt;3×A + 3×B + Bias 片上 tile 存储（A/B 为可推断 SDP RAM）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="420" y="200" width="260" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_mac" value="3 × heatvit_mac_bank&lt;br&gt;8×8 int8 外积累加原语（clear/accum · 行列掩码）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="760" y="200" width="260" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_gelu" value="heatvit_gelu&lt;br&gt;I-ViT ShiftGELU：40 级除法流水，Q8.16→Q8.16" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="760" y="340" width="260" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_plan" value="heatvit_plan_sigmoid&lt;br&gt;PLAN 分段线性 Sigmoid：Q8.16 → Q0.16" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="760" y="460" width="240" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_ext" value="外部 64-bit 三通道&lt;br&gt;（执行器内 2:1 mux）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="1100" y="200" width="220" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="e_mem" value="mem_cmd/mem_w/mem_r" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_mmg" target="n_ext" exitX="0.5" exitY="0" entryX="0.5" entryY="0">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="180" y="120" />
-              <mxPoint x="1210" y="120" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_g1" value="cmd_addr/len 预检" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_mmg" target="n_guard5" exitX="0.375" exitY="1" entryX="0.45" entryY="0">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_g2" value="addr_ok / error_code" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_guard5" target="n_mmg" exitX="0.75" exitY="0" entryX="0.625" entryY="1">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_load" value="加载 A/B/Bias：r_data 64-bit" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_mmg" target="n_tile" exitX="1" exitY="0.5" entryX="0" entryY="0.5">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_tm" value="a_rd_data · b_rd_data · bias" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_tile" target="n_mac" exitX="1" exitY="0.5" entryX="0" entryY="0.5">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_mg" value="bank_accum int32 + bias → 尺度对齐 Q8.16" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_mac" target="n_gelu" exitX="0.5" exitY="1" entryX="0.5" entryY="0">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_mp" value="bank_accum int32 → 尺度对齐 Q8.16" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_mac" target="n_plan" exitX="0.962" exitY="1" entryX="1" entryY="0">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="1010" y="300" />
-              <mxPoint x="1100" y="300" />
-              <mxPoint x="1100" y="460" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_gw" value="int8 结果回写 req_*" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_gelu" target="n_mmg" exitX="0" exitY="0.5" entryX="0.917" entryY="1">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="720" y="370" />
-              <mxPoint x="720" y="520" />
-              <mxPoint x="280" y="520" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_pw" value="uq0.16 结果回写 req_*" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_plan" target="n_mmg" exitX="0" exitY="0.5" entryX="0" entryY="0.75">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="40" y="490" />
-              <mxPoint x="40" y="245" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-      </root>
-    </mxGraphModel>
-  </diagram>
+    <diagram id="fw-03-gemm" name="03 · 统一 GEMM 引擎内部">
+        <mxGraphModel dx="1422" dy="794" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="600" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="n_mmg" value="heatvit_mem_master&lt;br&gt;GEMM 自备存储主机：单笔在途 64-bit 突发" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="200" width="240" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_guard5" value="heatvit_addr_guard × 5&lt;br&gt;突发级 ×1 + 全张量级 ×4 区域越界预检" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="340" width="200" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_tile" value="heatvit_tile_buffer&lt;br&gt;3×A + 3×B + Bias 片上 tile 存储（A/B 为可推断 SDP RAM）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="420" y="200" width="260" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_mac" value="3 × heatvit_mac_bank&lt;br&gt;8×8 int8 外积累加原语（clear/accum · 行列掩码）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="760" y="200" width="260" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_gelu" value="heatvit_gelu&lt;br&gt;I-ViT ShiftGELU：40 级除法流水，Q8.16→Q8.16" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="760" y="340" width="260" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_plan" value="heatvit_plan_sigmoid&lt;br&gt;PLAN 分段线性 Sigmoid：Q8.16 → Q0.16" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="760" y="460" width="240" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_ext" value="外部 64-bit 三通道&lt;br&gt;（执行器内 2:1 mux）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="1100" y="200" width="220" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_mem" value="外部存储三通道" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_mmg" target="n_ext" edge="1" exitX="0.5" exitY="0" entryX="0.5" entryY="0">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="180" y="120"/>
+                            <mxPoint x="1210" y="120"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_g1" value="突发地址预检" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_mmg" target="n_guard5" edge="1" exitX="0.375" exitY="1" entryX="0.45" entryY="0">
+                    <mxGeometry relative="1" as="geometry">
+                        <mxPoint x="0" y="-20" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_g2" value="越界检查结果" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_guard5" target="n_mmg" edge="1" exitX="0.75" exitY="0" entryX="0.625" entryY="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <mxPoint x="0" y="20" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_load" value="加载 A/B/Bias" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_mmg" target="n_tile" edge="1" exitX="1" exitY="0.5" entryX="0" entryY="0.5">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_tm" value="操作数读取" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_tile" target="n_mac" edge="1" exitX="1" exitY="0.5" entryX="0" entryY="0.5">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_mg" value="累加结果 → GELU" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_mac" target="n_gelu" edge="1" exitX="0.5" exitY="1" entryX="0.5" entryY="0">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_mp" value="累加结果 → Sigmoid" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_mac" target="n_plan" edge="1" exitX="0.962" exitY="1" entryX="1" entryY="0">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="1010" y="300"/>
+                            <mxPoint x="1100" y="300"/>
+                            <mxPoint x="1100" y="460"/>
+                        </Array>
+                        <mxPoint x="120" y="-60" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_gw" value="GELU 结果回写" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_gelu" target="n_mmg" edge="1" exitX="0" exitY="0.5" entryX="0.917" entryY="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="720" y="370"/>
+                            <mxPoint x="720" y="520"/>
+                            <mxPoint x="280" y="520"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_pw" value="Sigmoid 结果回写" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_plan" target="n_mmg" edge="1" exitX="0" exitY="0.5" entryX="0" entryY="0.75">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="40" y="490"/>
+                            <mxPoint x="40" y="245"/>
+                        </Array>
+                        <mxPoint x="-40" y="0" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
 </mxfile>

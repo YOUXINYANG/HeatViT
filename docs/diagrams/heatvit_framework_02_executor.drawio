@@ -1,154 +1,146 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<mxfile host="app.diagrams.net" type="device">
-  <diagram id="fw-02-executor" name="02 · Tensor Executor：分发与资源复用">
-    <mxGraphModel dx="1422" dy="794" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="700" math="0" shadow="0">
-      <root>
-        <mxCell id="0" />
-        <mxCell id="1" parent="0" />
-        <mxCell id="n_exec" value="heatvit_tensor_executor&lt;br&gt;单描述符执行器：opcode 分发、区域/地址预检、动态 M/N/K 解析" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="400" y="40" width="300" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="c1" value="8 个子引擎 —— 每描述符经 opcode 只激活 1 个" style="rounded=1;dashed=1;fillColor=#f5f5f5;strokeColor=#9673a6;verticalAlign=top;fontSize=11;fontStyle=1;fontColor=#333333;whiteSpace=wrap;html=1;" vertex="1" parent="1">
-          <mxGeometry x="60" y="130" width="770" height="220" as="geometry" />
-        </mxCell>
-        <mxCell id="n_gemm" value="heatvit_gemm_engine&lt;br&gt;统一 int8 GEMM：tile 装载 / MAC 累加 / 回写与后处理" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="c1">
-          <mxGeometry x="70" y="150" width="170" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_lay" value="heatvit_layout_engine&lt;br&gt;流式布局引擎：PATCHIFY / COPY_ADD_POS / QKV_UNPACK / HEAD_CONCAT" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="c1">
-          <mxGeometry x="260" y="150" width="170" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_vec" value="heatvit_vector_engine&lt;br&gt;流式向量引擎：LayerNorm / 残差 / 注意力 Softmax" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="c1">
-          <mxGeometry x="450" y="150" width="170" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_red" value="heatvit_reduce_mean&lt;br&gt;Selector 特征规约：candidate 轴 / head-lane 轴均值" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="c1">
-          <mxGeometry x="640" y="150" width="170" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_con" value="heatvit_feature_concat&lt;br&gt;Local/Global 特征拼接" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="c1">
-          <mxGeometry x="70" y="260" width="170" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_hf" value="heatvit_head_fuse&lt;br&gt;三 Head keep 分数加权融合" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="c1">
-          <mxGeometry x="260" y="260" width="170" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_fin" value="heatvit_selector_finalize&lt;br&gt;单遍扫描：压缩/打包编排 + 唯一状态更新输出" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="c1">
-          <mxGeometry x="450" y="260" width="170" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_ss" value="heatvit_selector_softmax&lt;br&gt;二分 Softmax：int8 logits → Keep 概率 Q0.16" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="c1">
-          <mxGeometry x="640" y="260" width="170" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_guard" value="heatvit_addr_guard × 4&lt;br&gt;src0/src1/aux/dst 四操作数区域越界组合预检" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="60" y="380" width="220" height="50" as="geometry" />
-        </mxCell>
-        <mxCell id="n_mm" value="heatvit_mem_master（执行器自备）&lt;br&gt;单笔在途 64-bit 突发协议机（含 abort drain）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="800" y="380" width="220" height="50" as="geometry" />
-        </mxCell>
-        <mxCell id="n_ext" value="外部 64-bit 三通道" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="800" y="500" width="220" height="50" as="geometry" />
-        </mxCell>
-        <mxCell id="n_arb" value="heatvit_div_arbiter&lt;br&gt;三客户端固定优先级（0＞1＞2）除法仲裁" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="300" y="500" width="220" height="50" as="geometry" />
-        </mxCell>
-        <mxCell id="n_udiv" value="heatvit_udiv&lt;br&gt;64/64 恢复无符号除法器（1 商位/拍）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="560" y="500" width="200" height="50" as="geometry" />
-        </mxCell>
-        <mxCell id="e_disp" value="child_sel 译码 · start 脉冲 · busy/done/error&lt;br&gt;绝对基址 src0/1/aux/dst · m_eff · scale_exp" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_exec" target="c1" exitX="0.5" exitY="1" entryX="0.636" entryY="0">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_gd1" value="区域基址/长度 + 绝对地址 + beats" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_exec" target="n_guard" exitX="0" exitY="0.25" entryX="0" entryY="0">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="30" y="55" />
-              <mxPoint x="30" y="380" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_gd2" value="addr_ok / error_code" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_guard" target="n_exec" exitX="0" exitY="0.8" entryX="0" entryY="1">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="50" y="420" />
-              <mxPoint x="50" y="100" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_req" value="7 个流式子引擎的 req_* 通道 7:1 mux&lt;br&gt;valid/ready/write/addr/bytes + w/r 数据" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="c1" target="n_mm" exitX="1" exitY="0.773" entryX="0.455" entryY="0">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="900" y="300" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_mem" value="mem_cmd/mem_w/mem_r" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_mm" target="n_ext" exitX="0.5" exitY="1" entryX="0.5" entryY="0">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_gemmem" value="GEMM 自备 master 的 mem_* 通道 2:1 mux" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_gemm" target="n_ext" exitX="1" exitY="0.5" entryX="0" entryY="0.5">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="245" y="180" />
-              <mxPoint x="245" y="230" />
-              <mxPoint x="1050" y="230" />
-              <mxPoint x="1050" y="560" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_c0v" value="client 0 · AttnSoftmax（与 SS 二选一）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_vec" target="n_arb" exitX="0.294" exitY="1" entryX="0.227" entryY="0">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="500" y="235" />
-              <mxPoint x="440" y="235" />
-              <mxPoint x="440" y="430" />
-              <mxPoint x="350" y="430" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_c1v" value="client 1 · LayerNorm 除法" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_vec" target="n_arb" exitX="0.647" exitY="1" entryX="0.591" entryY="0">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="560" y="235" />
-              <mxPoint x="630" y="235" />
-              <mxPoint x="630" y="450" />
-              <mxPoint x="430" y="450" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_c2r" value="client 2 · RED/HF/FIN 三选一" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_red" target="n_arb" exitX="1" exitY="0.5" entryX="0.864" entryY="0">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="850" y="180" />
-              <mxPoint x="850" y="490" />
-              <mxPoint x="490" y="490" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_c2h" value="client 2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_hf" target="n_arb" exitX="0.5" exitY="1" entryX="0" entryY="0.5">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="345" y="470" />
-              <mxPoint x="300" y="470" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_c0s" value="client 0 · SelectorSoftmax（与 VEC 二选一）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_ss" target="n_arb" exitX="0.5" exitY="1" entryX="0.409" entryY="0">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="725" y="470" />
-              <mxPoint x="390" y="470" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_c2f" value="client 2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_fin" target="n_arb" exitX="0.5" exitY="1" entryX="0.909" entryY="0">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="535" y="480" />
-              <mxPoint x="500" y="480" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_au" value="num/den · 单除法器分时" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_arb" target="n_udiv" exitX="1" exitY="0.5" entryX="0" entryY="0.5">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_ua" value="quot/rem/div_zero" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_udiv" target="n_arb" exitX="0" exitY="0.7" entryX="1" entryY="0.7">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-      </root>
-    </mxGraphModel>
-  </diagram>
+<mxfile host="65bd71144e">
+    <diagram id="fw-02-executor" name="02 · Tensor Executor：分发与资源复用">
+        <mxGraphModel dx="2913" dy="1543" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="700" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="n_exec" value="heatvit_tensor_executor&lt;br&gt;单描述符执行器：opcode 分发、区域/地址预检、动态 M/N/K 解析" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="400" y="40" width="300" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="c1" value="8 个子引擎 —— 每描述符经 opcode 只激活 1 个" style="rounded=1;dashed=1;fillColor=#f5f5f5;strokeColor=#9673a6;verticalAlign=top;fontSize=11;fontStyle=1;fontColor=#333333;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="130" width="770" height="220" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_gemm" value="heatvit_gemm_engine&lt;br&gt;统一 int8 GEMM：tile 装载 / MAC 累加 / 回写与后处理" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="c1" vertex="1">
+                    <mxGeometry x="70" y="150" width="170" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_lay" value="heatvit_layout_engine&lt;br&gt;流式布局引擎：PATCHIFY / COPY_ADD_POS / QKV_UNPACK / HEAD_CONCAT" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="c1" vertex="1">
+                    <mxGeometry x="260" y="150" width="170" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_vec" value="heatvit_vector_engine&lt;br&gt;流式向量引擎：LayerNorm / 残差 / 注意力 Softmax" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="c1" vertex="1">
+                    <mxGeometry x="450" y="150" width="170" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_red" value="heatvit_reduce_mean&lt;br&gt;Selector 特征规约：candidate 轴 / head-lane 轴均值" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="c1" vertex="1">
+                    <mxGeometry x="640" y="150" width="170" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_con" value="heatvit_feature_concat&lt;br&gt;Local/Global 特征拼接" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="c1" vertex="1">
+                    <mxGeometry x="70" y="260" width="170" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_hf" value="heatvit_head_fuse&lt;br&gt;三 Head keep 分数加权融合" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="c1" vertex="1">
+                    <mxGeometry x="260" y="260" width="170" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_fin" value="heatvit_selector_finalize&lt;br&gt;单遍扫描：压缩/打包编排 + 唯一状态更新输出" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="c1" vertex="1">
+                    <mxGeometry x="450" y="260" width="170" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_ss" value="heatvit_selector_softmax&lt;br&gt;二分 Softmax：int8 logits → Keep 概率 Q0.16" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="c1" vertex="1">
+                    <mxGeometry x="640" y="260" width="170" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_guard" value="heatvit_addr_guard × 4&lt;br&gt;src0/src1/aux/dst 四操作数区域越界组合预检" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="60" y="380" width="220" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_mm" value="heatvit_mem_master（执行器自备）&lt;br&gt;单笔在途 64-bit 突发协议机（含 abort drain）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="800" y="380" width="220" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_ext" value="外部 64-bit 三通道" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="800" y="500" width="220" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_arb" value="heatvit_div_arbiter&lt;br&gt;三客户端固定优先级（0＞1＞2）除法仲裁" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="300" y="500" width="220" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_udiv" value="heatvit_udiv&lt;br&gt;64/64 恢复无符号除法器（1 商位/拍）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="560" y="500" width="200" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_disp" value="opcode 分发与握手" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_exec" target="c1" edge="1" exitX="0.5" exitY="1" entryX="0.636" entryY="0">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_gd1" value="地址预检请求" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_exec" target="n_guard" edge="1" exitX="0" exitY="0.25" entryX="0" entryY="0">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="15" y="55"/>
+                            <mxPoint x="15" y="380"/>
+                        </Array>
+                        <mxPoint x="-177" y="-67" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_gd2" value="越界检查结果" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_guard" target="n_exec" edge="1" exitX="0" exitY="0.8" entryX="0" entryY="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="48" y="420"/>
+                            <mxPoint x="48" y="100"/>
+                        </Array>
+                        <mxPoint x="-194" y="70" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_req" value="7:1 存储请求复用" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="c1" target="n_mm" edge="1" exitX="1" exitY="0.773" entryX="0.455" entryY="0">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="900" y="300"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_mem" value="外部存储三通道" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_mm" target="n_ext" edge="1" exitX="0.5" exitY="1" entryX="0.5" entryY="0">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_gemmem" value="GEMM 自备通道（2:1）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_gemm" target="n_ext" edge="1" exitX="1" exitY="0.5" entryX="0" entryY="0.5">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="245" y="180"/>
+                            <mxPoint x="245" y="230"/>
+                            <mxPoint x="1050" y="230"/>
+                            <mxPoint x="1050" y="560"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_c0v" value="除法客户端 0/1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_vec" target="n_arb" edge="1" exitX="0.294" exitY="1" entryX="0.636" entryY="0">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="500" y="235"/>
+                            <mxPoint x="440" y="235"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_c2r" value="除法客户端 2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_red" target="n_arb" edge="1" exitX="1" exitY="0.5" entryX="0.864" entryY="0">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="850" y="180"/>
+                            <mxPoint x="850" y="490"/>
+                            <mxPoint x="490" y="490"/>
+                        </Array>
+                        <mxPoint y="40" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_c2h" value="除法客户端 2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_hf" target="n_arb" edge="1" exitX="0.5" exitY="1" entryX="0" entryY="0.5">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="345" y="470"/>
+                            <mxPoint x="300" y="470"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_c0s" value="除法客户端 0" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_ss" target="n_arb" edge="1" exitX="0.5" exitY="1" entryX="0.409" entryY="0">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="725" y="470"/>
+                            <mxPoint x="390" y="470"/>
+                        </Array>
+                        <mxPoint y="-45" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_c2f" value="除法客户端 2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_fin" target="n_arb" edge="1" exitX="0.5" exitY="1" entryX="0.909" entryY="0">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="535" y="480"/>
+                            <mxPoint x="500" y="480"/>
+                        </Array>
+                        <mxPoint y="45" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_au" value="被除数 / 除数" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_arb" target="n_udiv" edge="1" exitX="1" exitY="0.24" entryX="0" entryY="0.24">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_ua" value="商 / 余数 / 除零" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_udiv" target="n_arb" edge="1" exitX="0" exitY="0.96" entryX="1" entryY="0.96">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
 </mxfile>

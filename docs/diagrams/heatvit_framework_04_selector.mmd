@@ -13,14 +13,14 @@ flowchart LR
   SMC["heatvit_softmax_core<br/>三遍行 Softmax 共享核（max 减 / exp 和 / 除法归一）"]
   SCHED["heatvit_scheduler<br/>回收状态更新，维护 Token 计数 197→88→45→32"]
 
-  REDM -->|均值特征 · 经 scratch 区| CONC
-  CONC -->|拼接特征 · 经 scratch 区| HFU
-  HFU -->|keep 分数 · 经 scratch 区| SSM
-  SSM -->|keep 概率 Q0.16 · 经 scratch 区| FINZ
-  FINZ -->|保留位图| COMP
+  REDM -->|均值特征（scratch）| CONC
+  CONC -->|拼接特征（scratch）| HFU
+  HFU -->|keep 分数（scratch）| SSM
+  SSM -->|keep 概率（scratch）| FINZ
+  FINZ -->|保留 Token| COMP
   FINZ -->|被剪 Token| PKG
-  COMP -->|压缩后 tokens 写回 scratch| FINZ
-  PKG -->|Package Token 写回 scratch| FINZ
-  FINZ -->|state_update_valid · next_token_count<br/>next_package_present| SCHED
+  COMP -->|压缩结果写回| FINZ
+  PKG -->|Package 写回| FINZ
+  FINZ -->|Token 状态更新| SCHED
   SSM -->|例化| SELS
   SELS -->|例化| SMC

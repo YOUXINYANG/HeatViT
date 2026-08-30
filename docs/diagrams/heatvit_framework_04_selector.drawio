@@ -1,89 +1,94 @@
-<?xml version="1.0" encoding="UTF-8"?>
 <mxfile host="app.diagrams.net" type="device">
-  <diagram id="fw-04-selector" name="04 · Token Selector 链（时间分时 · 经 scratch 级联）">
-    <mxGraphModel dx="1422" dy="794" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1850" pageHeight="700" math="0" shadow="0">
-      <root>
-        <mxCell id="0" />
-        <mxCell id="1" parent="0" />
-        <mxCell id="n_redm" value="heatvit_reduce_mean&lt;br&gt;Selector 特征两轴均值规约（candidate / head-lane）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="40" y="200" width="240" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_conc" value="heatvit_feature_concat&lt;br&gt;Local/Global 特征拼接（32+32→64 字节）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="340" y="200" width="240" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_hfu" value="heatvit_head_fuse&lt;br&gt;三 Head keep 分数加权融合（零分母回退等权）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="640" y="200" width="240" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_ssm" value="heatvit_selector_softmax&lt;br&gt;int8 logits → Keep 概率 Q0.16" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="940" y="200" width="240" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_finz" value="heatvit_selector_finalize&lt;br&gt;单遍扫描 + 0.5 阈值：压缩/打包编排，唯一状态更新输出" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="1240" y="200" width="250" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_comp" value="heatvit_token_compactor&lt;br&gt;CLS→slot0 稳定顺序 Token 压缩" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="1240" y="380" width="240" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_pkg" value="heatvit_token_packager&lt;br&gt;Package Token 加权平均（零分母回退算术平均）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="1540" y="380" width="250" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_sched" value="heatvit_scheduler&lt;br&gt;回收状态更新，维护 Token 计数 197→88→45→32" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="1540" y="80" width="250" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_sels" value="heatvit_softmax_selector&lt;br&gt;Selector 封装：δ2=1.0 · 输出 17-bit Q0.16" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="940" y="380" width="240" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="n_smc" value="heatvit_softmax_core&lt;br&gt;三遍行 Softmax 共享核（max 减 / exp 和 / 除法归一）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="940" y="560" width="240" height="60" as="geometry" />
-        </mxCell>
-        <mxCell id="e_r2c" value="均值特征 · 经 scratch 区" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_redm" target="n_conc" exitX="1" exitY="0.5" entryX="0" entryY="0.5">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_c2h" value="拼接特征 · 经 scratch 区" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_conc" target="n_hfu" exitX="1" exitY="0.5" entryX="0" entryY="0.5">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_h2s" value="keep 分数 · 经 scratch 区" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_hfu" target="n_ssm" exitX="1" exitY="0.5" entryX="0" entryY="0.5">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_s2f" value="keep 概率 Q0.16 · 经 scratch 区" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_ssm" target="n_finz" exitX="1" exitY="0.5" entryX="0" entryY="0.5">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_f2c" value="保留位图" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_finz" target="n_comp" exitX="0.48" exitY="1" entryX="0.5" entryY="0">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_f2p" value="被剪 Token" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_finz" target="n_pkg" exitX="0.72" exitY="1" entryX="0.5" entryY="0">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="1420" y="320" />
-              <mxPoint x="1665" y="320" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_c2f" value="压缩后 tokens 写回 scratch" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_comp" target="n_finz" exitX="0.208" exitY="0" entryX="0.2" entryY="1">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_p2f" value="Package Token 写回 scratch" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_pkg" target="n_finz" exitX="0.18" exitY="0" entryX="0.92" entryY="1">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="1585" y="340" />
-              <mxPoint x="1470" y="340" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_f2s" value="state_update_valid · next_token_count&lt;br&gt;next_package_present" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_finz" target="n_sched" exitX="0.72" exitY="0" entryX="0.5" entryY="1">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="1420" y="110" />
-              <mxPoint x="1665" y="110" />
-            </Array>
-          </mxGeometry>
-        </mxCell>
-        <mxCell id="e_i1" value="例化" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_ssm" target="n_sels" exitX="0.5" exitY="1" entryX="0.5" entryY="0">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-        <mxCell id="e_i2" value="例化" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="n_sels" target="n_smc" exitX="0.5" exitY="1" entryX="0.5" entryY="0">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
-      </root>
-    </mxGraphModel>
-  </diagram>
+    <diagram id="fw-04-selector" name="04 · Token Selector 链（时间分时 · 经 scratch 级联）">
+        <mxGraphModel dx="1422" dy="794" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1850" pageHeight="700" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="n_redm" value="heatvit_reduce_mean&lt;br&gt;Selector 特征两轴均值规约（candidate / head-lane）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="200" width="240" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_conc" value="heatvit_feature_concat&lt;br&gt;Local/Global 特征拼接（32+32→64 字节）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="340" y="200" width="240" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_hfu" value="heatvit_head_fuse&lt;br&gt;三 Head keep 分数加权融合（零分母回退等权）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="640" y="200" width="240" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_ssm" value="heatvit_selector_softmax&lt;br&gt;int8 logits → Keep 概率 Q0.16" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="940" y="200" width="240" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_finz" value="heatvit_selector_finalize&lt;br&gt;单遍扫描 + 0.5 阈值：压缩/打包编排，唯一状态更新输出" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="1240" y="200" width="250" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_comp" value="heatvit_token_compactor&lt;br&gt;CLS→slot0 稳定顺序 Token 压缩" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="1240" y="380" width="240" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_pkg" value="heatvit_token_packager&lt;br&gt;Package Token 加权平均（零分母回退算术平均）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="1540" y="380" width="250" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_sched" value="heatvit_scheduler&lt;br&gt;回收状态更新，维护 Token 计数 197→88→45→32" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="1540" y="80" width="250" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_sels" value="heatvit_softmax_selector&lt;br&gt;Selector 封装：δ2=1.0 · 输出 17-bit Q0.16" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="940" y="380" width="240" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="n_smc" value="heatvit_softmax_core&lt;br&gt;三遍行 Softmax 共享核（max 减 / exp 和 / 除法归一）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#333333;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="940" y="560" width="240" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_r2c" value="均值特征（scratch）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_redm" target="n_conc" edge="1" exitX="1" exitY="0.5" entryX="0" entryY="0.5">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_c2h" value="拼接特征（scratch）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_conc" target="n_hfu" edge="1" exitX="1" exitY="0.5" entryX="0" entryY="0.5">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_h2s" value="keep 分数（scratch）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_hfu" target="n_ssm" edge="1" exitX="1" exitY="0.5" entryX="0" entryY="0.5">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_s2f" value="keep 概率（scratch）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_ssm" target="n_finz" edge="1" exitX="1" exitY="0.5" entryX="0" entryY="0.5">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_f2c" value="保留 Token" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_finz" target="n_comp" edge="1" exitX="0.48" exitY="1" entryX="0.5" entryY="0">
+                    <mxGeometry relative="1" as="geometry">
+                        <mxPoint x="0" y="-25" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_f2p" value="被剪 Token" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_finz" target="n_pkg" edge="1" exitX="0.72" exitY="1" entryX="0.5" entryY="0">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="1420" y="310"/>
+                            <mxPoint x="1665" y="310"/>
+                        </Array>
+                        <mxPoint x="0" y="-45" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_c2f" value="压缩结果写回" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_comp" target="n_finz" edge="1" exitX="0.208" exitY="0" entryX="0.2" entryY="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <mxPoint x="0" y="25" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_p2f" value="Package 写回" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_pkg" target="n_finz" edge="1" exitX="0.18" exitY="0" entryX="0.92" entryY="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="1585" y="350"/>
+                            <mxPoint x="1470" y="350"/>
+                        </Array>
+                        <mxPoint x="0" y="45" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_f2s" value="Token 状态更新" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_finz" target="n_sched" edge="1" exitX="0.72" exitY="0" entryX="0.5" entryY="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="1420" y="110"/>
+                            <mxPoint x="1665" y="110"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e_i1" value="例化" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_ssm" target="n_sels" edge="1" exitX="0.5" exitY="1" entryX="0.5" entryY="0">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e_i2" value="例化" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;fontSize=10;labelBackgroundColor=#ffffff;" parent="1" source="n_sels" target="n_smc" edge="1" exitX="0.5" exitY="1" entryX="0.5" entryY="0">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
 </mxfile>

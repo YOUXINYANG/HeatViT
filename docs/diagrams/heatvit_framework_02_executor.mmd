@@ -18,17 +18,16 @@ flowchart TD
     SS["heatvit_selector_softmax<br/>二分 Softmax：int8 logits → Keep 概率 Q0.16"]
   end
 
-  EXEC -->|child_sel 译码 · start 脉冲 · busy/done/error<br/>绝对基址 src0/1/aux/dst · m_eff · scale_exp| CHILDREN
-  EXEC -->|区域基址/长度 + 绝对地址 + beats| GUARD
-  GUARD -->|addr_ok / error_code| EXEC
-  CHILDREN -->|7 个流式子引擎的 req_* 通道 7:1 mux<br/>valid/ready/write/addr/bytes + w/r 数据| MM
-  MM -->|mem_cmd/mem_w/mem_r| EXT
-  GEMM -->|GEMM 自备 master 的 mem_* 通道 2:1 mux| EXT
-  VEC -->|client 0 · AttnSoftmax（与 SS 二选一）| ARB
-  SS -->|client 0 · SelectorSoftmax（与 VEC 二选一）| ARB
-  VEC -->|client 1 · LayerNorm 除法| ARB
-  RED -->|client 2 · RED/HF/FIN 三选一| ARB
-  HF -->|client 2| ARB
-  FIN -->|client 2| ARB
-  ARB -->|num/den · 单除法器分时| UDIV
-  UDIV -->|quot/rem/div_zero| ARB
+  EXEC -->|opcode 分发与握手| CHILDREN
+  EXEC -->|地址预检请求| GUARD
+  GUARD -->|越界检查结果| EXEC
+  CHILDREN -->|7:1 存储请求复用| MM
+  MM -->|外部存储三通道| EXT
+  GEMM -->|GEMM 自备通道（2:1）| EXT
+  VEC -->|除法客户端 0/1| ARB
+  SS -->|除法客户端 0| ARB
+  RED -->|除法客户端 2| ARB
+  HF -->|除法客户端 2| ARB
+  FIN -->|除法客户端 2| ARB
+  ARB -->|被除数 / 除数| UDIV
+  UDIV -->|商 / 余数 / 除零| ARB

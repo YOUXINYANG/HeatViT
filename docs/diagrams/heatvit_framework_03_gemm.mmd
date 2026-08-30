@@ -8,12 +8,12 @@ flowchart LR
   PLAN["heatvit_plan_sigmoid<br/>PLAN 分段线性 Sigmoid：Q8.16 → Q0.16"]
   EXT["外部 64-bit 三通道<br/>（执行器内 2:1 mux）"]
 
-  MMG -->|mem_cmd/mem_w/mem_r| EXT
-  MMG -->|cmd_addr/len 预检| GUARD5
-  GUARD5 -->|addr_ok / error_code| MMG
-  MMG -->|加载 A/B/Bias：r_data 64-bit| TILE
-  TILE -->|a_rd_data · b_rd_data · bias| MAC
-  MAC -->|bank_accum int32 + bias → 尺度对齐 Q8.16| GELU
-  MAC -->|bank_accum int32 → 尺度对齐 Q8.16| PLAN
-  GELU -->|int8 结果回写 req_*| MMG
-  PLAN -->|uq0.16 结果回写 req_*| MMG
+  MMG -->|外部存储三通道| EXT
+  MMG -->|突发地址预检| GUARD5
+  GUARD5 -->|越界检查结果| MMG
+  MMG -->|加载 A/B/Bias| TILE
+  TILE -->|操作数读取| MAC
+  MAC -->|累加结果 → GELU| GELU
+  MAC -->|累加结果 → Sigmoid| PLAN
+  GELU -->|GELU 结果回写| MMG
+  PLAN -->|Sigmoid 结果回写| MMG
