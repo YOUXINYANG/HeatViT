@@ -105,9 +105,15 @@ module heatvit_tensor_executor
   // P7-5: S_CHECK settles the deep validation cone into registers before
   // the state decision, so the child start pulses and the child-register
   // clock enables (which used to fan out from v_error / the guards) are
-  // register-driven.
+  // register-driven.  Three phases: 0 captures the field-byte products
+  // (the DSP cone), 1 runs the guards from the captured products, 2
+  // decides and starts the child.
   logic [7:0]  v_error_r;
-  logic        s_check_phase;
+  logic [1:0]  s_check_phase;
+  logic [31:0] src0_fb_r;
+  logic [31:0] src1_fb_r;
+  logic [31:0] aux_fb_r;
+  logic [31:0] dst_fb_r;
 
   logic [63:0] src0_abs64;
   logic [63:0] src1_abs64;
@@ -945,10 +951,13 @@ module heatvit_tensor_executor
     src1_abs64 = {32'd0, src1_base_c} + {32'd0, desc_reg.src1_offset};
     aux_abs64  = {32'd0, aux_base_c} + {32'd0, desc_reg.aux_offset};
     dst_abs64  = {32'd0, dst_base_c} + {32'd0, desc_reg.dst_offset};
-    src0_beats = 16'((src0_field_bytes + 32'd7) >> 3);
-    src1_beats = 16'((src1_field_bytes + 32'd7) >> 3);
-    aux_beats  = 16'((aux_field_bytes + 32'd7) >> 3);
-    dst_beats  = 16'((dst_field_bytes + 32'd7) >> 3);
+    // P7-5: the beats derive from the registered field-byte products, so
+    // the guard comb is a register-to-register cone (the DSP products are
+    // captured in S_CHECK phase 0).
+    src0_beats = 16'((src0_fb_r + 32'd7) >> 3);
+    src1_beats = 16'((src1_fb_r + 32'd7) >> 3);
+    aux_beats  = 16'((aux_fb_r + 32'd7) >> 3);
+    dst_beats  = 16'((dst_fb_r + 32'd7) >> 3);
     addr_ok_all =
       (!src0_en || ((src0_abs64[63:32] == 32'd0) && ga_ok)) &&
       (!src1_en || ((src1_abs64[63:32] == 32'd0) && gb_ok)) &&
@@ -1113,24 +1122,25 @@ module heatvit_tensor_executor
   end
 
   // Child start/command pulses (P7-5: driven from the registered S_CHECK
-  // phase and v_error_r, so no guard/validation cone reaches the children).
-  assign lay_start = (state == S_CHECK) && s_check_phase &&
+  // phase 2 and v_error_r, so no guard/validation cone reaches the
+  // children).
+  assign lay_start = (state == S_CHECK) && (s_check_phase == 2'd2) &&
                      (v_error_r == ERR_NONE) && (child_sel == CHILD_LAYOUT);
-  assign vec_start = (state == S_CHECK) && s_check_phase &&
+  assign vec_start = (state == S_CHECK) && (s_check_phase == 2'd2) &&
                      (v_error_r == ERR_NONE) && (child_sel == CHILD_VECTOR);
-  assign red_start = (state == S_CHECK) && s_check_phase &&
+  assign red_start = (state == S_CHECK) && (s_check_phase == 2'd2) &&
                      (v_error_r == ERR_NONE) && (child_sel == CHILD_REDUCE);
-  assign con_start = (state == S_CHECK) && s_check_phase &&
+  assign con_start = (state == S_CHECK) && (s_check_phase == 2'd2) &&
                      (v_error_r == ERR_NONE) && (child_sel == CHILD_CONCAT);
-  assign hf_start = (state == S_CHECK) && s_check_phase &&
+  assign hf_start = (state == S_CHECK) && (s_check_phase == 2'd2) &&
                     (v_error_r == ERR_NONE) && (child_sel == CHILD_HEAD_FUSE);
-  assign fin_start = (state == S_CHECK) && s_check_phase &&
+  assign fin_start = (state == S_CHECK) && (s_check_phase == 2'd2) &&
                      (v_error_r == ERR_NONE) &&
                      (child_sel == CHILD_SELECTOR_FINALIZE);
-  assign ss_start = (state == S_CHECK) && s_check_phase &&
+  assign ss_start = (state == S_CHECK) && (s_check_phase == 2'd2) &&
                     (v_error_r == ERR_NONE) &&
                     (child_sel == CHILD_SELECTOR_SOFTMAX);
-  assign gemm_cmd_valid = (state == S_CHECK) && s_check_phase &&
+  assign gemm_cmd_valid = (state == S_CHECK) && (s_check_phase == 2'd2) &&
                           (v_error_r == ERR_NONE) && (child_sel == CHILD_GEMM);
 
   // Reduce axis from the descriptor: 0 candidate axis, 1 head-lane axis.
@@ -1294,7 +1304,11 @@ module heatvit_tensor_executor
       state      <= S_IDLE;
       child_sel  <= CHILD_NONE;
       v_error_r  <= 8'd0;
-      s_check_phase <= 1'b0;
+      s_check_phase <= 2'd0;
+      src0_fb_r  <= 32'd0;
+      src1_fb_r  <= 32'd0;
+      aux_fb_r   <= 32'd0;
+      dst_fb_r   <= 32'd0;
       busy       <= 1'b0;
       done       <= 1'b0;
       error_valid <= 1'b0;
@@ -1331,15 +1345,16 @@ module heatvit_tensor_executor
         end
 
         S_CHECK: begin
-          if (!s_check_phase) begin
-            // P7-5: phase 0 registers the validation result and decodes the
-            // child selector unconditionally.  The deep desc_reg -> guards
-            // -> v_error cone ends at v_error_r; the children are started
-            // one phase later from registered values only.  On the error
-            // path the decoded selector is never consumed (the next
-            // descriptor reloads it).
-            s_check_phase <= 1'b1;
-            v_error_r     <= v_error;
+          case (s_check_phase)
+          2'd0: begin
+            // P7-5 phase 0: capture the field-byte DSP products and decode
+            // the child selector unconditionally.  The products end the
+            // desc_reg -> multiply cone here.
+            s_check_phase <= 2'd1;
+            src0_fb_r <= src0_field_bytes;
+            src1_fb_r <= src1_field_bytes;
+            aux_fb_r  <= aux_field_bytes;
+            dst_fb_r  <= dst_field_bytes;
             case (desc_reg.opcode)
               OP_GEMM:          child_sel <= CHILD_GEMM;
               OP_PATCHIFY,
@@ -1356,11 +1371,17 @@ module heatvit_tensor_executor
               OP_SELECTOR_SOFTMAX:  child_sel <= CHILD_SELECTOR_SOFTMAX;
               default:          child_sel <= CHILD_NONE;
             endcase
-          end else begin
-            // Phase 1: decide from the registered validation result.  The
-            // child start pulses (lay_start/vec_start/... and
-            // gemm_cmd_valid) assert during this phase.
-            s_check_phase <= 1'b0;
+          end
+          2'd1: begin
+            // Phase 1: the guards run from the registered products (and
+            // shallow address adds); the full validation cone ends here.
+            s_check_phase <= 2'd2;
+            v_error_r     <= v_error;
+          end
+          default: begin
+            // Phase 2: decide from the registered validation result.  The
+            // child start pulses assert during this phase.
+            s_check_phase <= 2'd0;
             if (v_error_r != ERR_NONE) begin
               error_code  <= v_error_r;
               error_valid <= 1'b1;
@@ -1370,6 +1391,7 @@ module heatvit_tensor_executor
               state <= S_RUN;
             end
           end
+          endcase
         end
 
         S_RUN: begin

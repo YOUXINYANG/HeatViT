@@ -326,14 +326,49 @@ module heatvit_vector_engine
     for (bi = 0; bi < MAX_ROW; bi++) srow[bi] = 24'sd0;
   end
 
+  // P7-5 narrow rewrite (bit-exact, same proof as the GEMM engine's
+  // activation_q16): wide = score is 33-bit exact; scale_to_exp_s128 with
+  // src_exp = src0_scale_r and dst_exp = -16 gives
+  // diff = -16 - src0_scale_r in [-47..16].
+  //   diff == 0 -> clamp24(wide)
+  //   diff >  0 (<=16): round-away -> 34-bit cone -> clamp24
+  //   diff <  0: k = -diff in [1..47]; k >= 23 saturates
+  //     (|wide| >= 1 -> |wide<<k| >= 2^23); k <= 22 -> 55-bit cone
+  //     (31+22 = 53 < 55, exact).  The 128-bit overflow check is dead:
+  //     31+47 = 78 < 127.
   function automatic heatvit_q8_16_t score_q16(input logic [31:0] score);
-    heatvit_s128_t wide;
-    heatvit_s128_t scaled;
-    wide   = $signed({{96{score[31]}}, score});
-    scaled = scale_to_exp_s128(wide, src0_scale_r, -6'sd16);
-    if (scaled > 128'sd8388607) return 24'sd8388607;
-    if (scaled < -128'sd8388608) return -24'sd8388608;
-    return heatvit_q8_16_t'(scaled);
+    logic signed [32:0] wide;
+    int diff;
+    logic [5:0]  d;
+    logic [33:0] mag_u;
+    logic [33:0] rounded;
+    logic signed [33:0] rsigned;
+    wide = $signed({score[31], score});
+    diff = -16 - int'(src0_scale_r);
+    if (diff == 0) begin
+      if (wide > 33'sd8388607)  return 24'sd8388607;
+      if (wide < -33'sd8388608) return -24'sd8388608;
+      return heatvit_q8_16_t'(wide[23:0]);
+    end else if (diff > 0) begin
+      d = diff[5:0];  // diff in [1..16] -> d == diff
+      mag_u = (wide < 33'sd0) ? (34'h200000000 - {1'b0, wide}) : {1'b0, wide};
+      rounded = (mag_u + (34'd1 << (d - 6'd1))) >> d;
+      rsigned = (wide < 33'sd0) ? -$signed(rounded) : $signed(rounded);
+      if (rsigned > 34'sd8388607)  return 24'sd8388607;
+      if (rsigned < -34'sd8388608) return -24'sd8388608;
+      return heatvit_q8_16_t'(rsigned[23:0]);
+    end else begin
+      if (-diff >= 23) begin
+        return (wide == 33'sd0) ? 24'sd0 :
+               ((wide < 33'sd0) ? -24'sd8388608 : 24'sd8388607);
+      end else begin
+        logic signed [54:0] sh_c;
+        sh_c = $signed({{22{wide[32]}}, wide}) <<< (-diff);
+        if (sh_c > 55'sd8388607)  return 24'sd8388607;
+        if (sh_c < -55'sd8388608) return -24'sd8388608;
+        return heatvit_q8_16_t'(sh_c[23:0]);
+      end
+    end
   endfunction
 
   function automatic logic [63:0] clamp64(

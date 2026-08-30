@@ -63,6 +63,7 @@ module heatvit_layernorm
   localparam logic [3:0] S_NORMALIZE  = 4'd6;
   localparam logic [3:0] S_VARIANCE2  = 4'd7;
   localparam logic [3:0] S_DONE       = 4'd8;
+  localparam logic [3:0] S_VARIANCE3  = 4'd9;
 
   localparam int D = 192;
   localparam int EPS_Q32 = 4295;
@@ -128,33 +129,28 @@ module heatvit_layernorm
   logic [23:0] isqrt_root;
   logic [47:0] isqrt_remainder;
 
-  heatvit_s128_t mean_wide;
-  heatvit_s128_t mean_square_w;
-  heatvit_s128_t variance_w;
-  logic          variance_negative;
-  logic [47:0]   variance_clamped;
   heatvit_s128_t sum_x_next_w;
   heatvit_s128_t square_in_w;
   logic [63:0]   sum_x_mag_w;
   logic [63:0]   rounded_quot_w;
 
-  assign mean_wide          = $signed({{80 {mean_q32_r[47]}}, mean_q32_r});
-  assign mean_square_w      = round_shift_away_s128(mean_wide * mean_wide, 7'd32);
-  // P7-5: the variance cone (128-bit mean^2 multiply + round + subtract +
-  // clamp + epsilon add) is split into two register stages: the multiply
-  // round lands in mean_square_r, the subtract/clamp/add lands in the
-  // isqrt radicand register one cycle later.
+  // P7-5: the variance cone is split into three register stages:
+  //   (1) mean^2 on 96 bits (|mean| < 2^39 -> square < 2^78, exact)
+  //   (2) the fixed-shift round (square >= 0 -> (square + 2^31) >> 32)
+  //   (3) subtract / clamp / epsilon-add into the isqrt radicand.
+  // The 128-bit mean_wide path is replaced; round_shift_away_s128 of a
+  // non-negative value equals (square + 2^31) >> 32 bit-for-bit.
+  logic signed [95:0] sq_w;
+  logic signed [95:0] sq_r;
   logic signed [47:0] mean_square_r;
   logic signed [47:0] variance_w2;
   logic               variance_negative2;
   logic [47:0]        radicand_w2;
-  assign variance_w2         = heatvit_s48_t'(e2_q32_r) - mean_square_r;
-  assign variance_negative2  = (variance_w2 < 0);
-  assign radicand_w2         = (variance_negative2 ? 48'd0 : variance_w2[47:0])
-                               + 48'd4295;
-  assign variance_w         = heatvit_s128_t'(e2_q32_r) - mean_square_w;
-  assign variance_negative  = (variance_w < 0);
-  assign variance_clamped   = variance_negative ? 48'd0 : variance_w[47:0];
+  assign sq_w             = $signed(96'(mean_q32_r)) * $signed(96'(mean_q32_r));
+  assign variance_w2      = heatvit_s48_t'(e2_q32_r) - mean_square_r;
+  assign variance_negative2 = (variance_w2 < 0);
+  assign radicand_w2      = (variance_negative2 ? 48'd0 : variance_w2[47:0])
+                            + 48'd4295;
   assign sum_x_next_w       = sum_x_r + x_q32_of(in_x, x_scale_r);
   assign square_in_w        = square_q32_of(in_x, x_scale_r);
   assign sum_x_mag_w        = (sum_x_next_w < 0) ? (128'd0 - sum_x_next_w) : sum_x_next_w;
@@ -193,7 +189,12 @@ module heatvit_layernorm
   logic signed [95:0] sum_align_r;   // stage3b -> stage3c
   logic signed [7:0]  final_shift_r;
 
-  heatvit_s8_t     out_byte_r;       // stage3c output register
+  logic             s6_valid_r;
+  logic signed [95:0] sum3c_r;       // stage3c1 -> stage3c2
+  logic signed [95:0] mag3c_r;
+  logic signed [7:0]  fshift3c_r;
+
+  heatvit_s8_t     out_byte_r;       // stage3c2 output register
   logic [7:0]      out_count_r;
 
   assign out_data = out_byte_r;
@@ -256,13 +257,21 @@ module heatvit_layernorm
     final_shift_w = 8'(common_exp4_r - int'(out_scale_r));
   end
 
+  // P7-5: stage 3c is split further: 3c1 registers a full slot
+  // {sum, magnitude, final shift} so the 96-bit negation leaves the final
+  // comb, 3c2 adds the half-LSB one-hot, shifts and saturates.
+  logic signed [95:0] mag3c_w;
+  assign mag3c_w = sum_align_r[95] ? -sum_align_r : sum_align_r;
+
   logic signed [95:0] final_w;
   heatvit_s8_t out_byte_w;
   always_comb begin
-    if (final_shift_r >= 0)
-      final_w = sum_align_r <<< final_shift_r;
-    else
-      final_w = round_shift_away_96(sum_align_r, -final_shift_r);
+    if (fshift3c_r >= 0) begin
+      final_w = sum3c_r <<< fshift3c_r;
+    end else begin
+      final_w = (mag3c_r + (96'sd1 << (-fshift3c_r - 1))) >>> (-fshift3c_r);
+      if (sum3c_r[95]) final_w = -final_w;
+    end
     out_byte_w = sat_s8(heatvit_s128_t'(final_w));
   end
 
@@ -296,6 +305,7 @@ module heatvit_layernorm
       sum_x_r          <= 128'sd0;
       sum_square_r     <= 64'd0;
       mean_q32_r       <= 48'sd0;
+      sq_r             <= 96'sd0;
       mean_square_r    <= 48'sd0;
       e2_q32_r         <= 48'd0;
       variance_q32_r   <= 48'd0;
@@ -329,6 +339,10 @@ module heatvit_layernorm
       s5_valid_r       <= 1'b0;
       sum_align_r      <= 96'sd0;
       final_shift_r    <= 8'sd0;
+      s6_valid_r       <= 1'b0;
+      sum3c_r          <= 96'sd0;
+      mag3c_r          <= 96'sd0;
+      fshift3c_r       <= 8'sd0;
       out_valid        <= 1'b0;
       out_byte_r       <= 8'sd0;
       out_count_r      <= 8'd0;
@@ -400,12 +414,17 @@ module heatvit_layernorm
           end
         end
         S_VARIANCE: begin
-          // P7-5 stage 1 of the variance cone: register the mean^2 round.
-          mean_square_r <= mean_square_w[47:0];
-          state         <= S_VARIANCE2;
+          // P7-5 stage 1 of the variance cone: register the 96-bit square.
+          sq_r   <= sq_w;
+          state  <= S_VARIANCE2;
         end
         S_VARIANCE2: begin
-          // P7-5 stage 2: subtract / clamp / epsilon-add from registers.
+          // P7-5 stage 2: fixed-shift round of the non-negative square.
+          mean_square_r <= 48'((sq_r + 96'sd2147483648) >> 32);
+          state         <= S_VARIANCE3;
+        end
+        S_VARIANCE3: begin
+          // P7-5 stage 3: subtract / clamp / epsilon-add from registers.
           variance_q32_r <= variance_negative2 ? 48'd0 : variance_w2[47:0];
           if (variance_negative2) warn_negative_variance <= 1'b1;
           isqrt_radicand <= radicand_w2;
@@ -436,6 +455,7 @@ module heatvit_layernorm
             s3_valid_r    <= 1'b0;
             s4_valid_r    <= 1'b0;
             s5_valid_r    <= 1'b0;
+            s6_valid_r    <= 1'b0;
             out_count_r   <= 8'd0;
             state         <= S_NORMALIZE;
           end
@@ -471,7 +491,11 @@ module heatvit_layernorm
               s5_valid_r    <= s4_valid_r;
               sum_align_r   <= sum_align_w;
               final_shift_r <= final_shift_w;
-              out_valid  <= s5_valid_r;
+              s6_valid_r    <= s5_valid_r;
+              sum3c_r       <= sum_align_r;
+              mag3c_r       <= mag3c_w;
+              fshift3c_r    <= final_shift_r;
+              out_valid  <= s6_valid_r;
               out_byte_r <= out_byte_w;
             end
             if (out_accept) out_count_r <= out_count_r + 8'd1;
