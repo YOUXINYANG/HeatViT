@@ -165,21 +165,34 @@ module heatvit_gemm_engine
   logic [2:0]  wb_ram_waddr_r;
   logic [71:0] wb_ram_wdata_r;
   // Guard settle registers: the load/write-back address guards are deep
-  // (multiplies + bounds checks), so the state machine registers their
-  // results for one cycle before deciding.
+  // (multiplies + bounds checks), so the state machine pipelines each
+  // window check into four phases (P7-5): stage 0 registers the address
+  // multiply cone, stage 1 the cover/end/len 64-bit add chain, stage 2 the
+  // addr-guard compare, stage 3 decides.  Each stage is register-to-
+  // register and stays within the 100 MHz budget.
   logic        g_ok_r;
   logic [7:0]  g_code_r;
-  logic [63:0] wb_addr64_r;
-  logic [15:0] wb_len_c_r;
-  logic [2:0]  wb_e_c_r;
-  logic [5:0]  wb_w_c_r;
-  logic        wb_guard_phase;
-  logic        ld_guard_phase;
-  logic [31:0] ld_addr_r;
-  logic [15:0] ld_len_r;
-  logic [2:0]  ld_e_r;
-  logic [15:0] ld_w_r;
+  logic [63:0] wb_addr64_r;    // wb stage 0: aligned window start
+  logic [15:0] wb_len_c_r;     // wb stage 1: derived burst length
+  logic [2:0]  wb_e_c_r;       // wb stage 0: captured byte offset
+  logic [5:0]  wb_w_c_r;       // wb stage 0: captured useful width
+  logic [31:0] wb_rbase_r;     // wb stage 0: captured dst region base
+  logic [31:0] wb_rbytes_r;    // wb stage 0: captured dst region bytes
+  logic [1:0]  wb_settle;      // wb guard pipeline phase
+  logic [63:0] ld_aligned64_r; // ld stage 0: aligned window start
+  logic [2:0]  ld_e_c_r;       // ld stage 0: captured byte offset
+  logic [15:0] ld_w_c_r;       // ld stage 0: captured useful width
+  logic [31:0] ld_rbase_r;     // ld stage 0: captured region base
+  logic [31:0] ld_rbytes_r;    // ld stage 0: captured region bytes
+  logic [15:0] ld_len_r;       // ld stage 1: derived burst length
   logic [2:0]  ld_fill_bank_r;
+  logic [1:0]  ld_settle;      // ld guard pipeline phase
+  // P7-5: S_CHECK registers the validation result before deciding, so the
+  // deep descriptor -> addr_ok_all -> v_error cone no longer fans out to
+  // the config-register clock enables.
+  logic [7:0]  v_error_r;
+  logic        v_shallow_r;
+  logic        s_check_phase;
   logic [1:0]  gb;
   logic [2:0]  gr;
   logic [2:0]  gc;
@@ -291,18 +304,104 @@ module heatvit_gemm_engine
     .y_out  (plan_out)
   );
 
+  // ------------------------------------------------------------------
+  // P7-5: narrow bit-exact saturators / clamps.
+  //
+  // The original requant code ran on 128-bit containers, which the
+  // synthesizer turned into ~65-CARRY4 shift/add cones (the P7-4 residual
+  // violation).  Every value range proves a far narrower container (see the
+  // width proofs below), so each saturation below is bit-exact with
+  // sat_s8/sat_s32 of the equivalent 128-bit value.
+  // ------------------------------------------------------------------
+  function automatic heatvit_s8_t sat_s8_from_s33(input logic signed [32:0] v);
+    if (v > 33'sd127)  return 8'sd127;
+    if (v < -33'sd128) return -8'sd128;
+    return heatvit_s8_t'(v[7:0]);
+  endfunction
+
+  function automatic heatvit_s8_t sat_s8_from_s24(input logic signed [23:0] v);
+    if (v > 24'sd127)  return 8'sd127;
+    if (v < -24'sd128) return -8'sd128;
+    return heatvit_s8_t'(v[7:0]);
+  endfunction
+
+  function automatic heatvit_s8_t sat_s8_from_s40(input logic signed [39:0] v);
+    if (v > 40'sd127)  return 8'sd127;
+    if (v < -40'sd128) return -8'sd128;
+    return heatvit_s8_t'(v[7:0]);
+  endfunction
+
+  function automatic heatvit_s32_t sat_s32_from_s33(input logic signed [32:0] v);
+    if (v > 33'sd2147483647)  return 32'sd2147483647;
+    if (v < -33'sd2147483648) return -32'sd2147483648;
+    return heatvit_s32_t'(v[31:0]);
+  endfunction
+
+  function automatic heatvit_s32_t sat_s32_from_s64(input logic signed [63:0] v);
+    if (v > 64'sd2147483647)  return 32'sd2147483647;
+    if (v < -64'sd2147483648) return -32'sd2147483648;
+    return heatvit_s32_t'(v[31:0]);
+  endfunction
+
+  function automatic heatvit_q8_16_t clamp_q8_16_from_s33(
+    input logic signed [32:0] v
+  );
+    if (v > 33'sd8388607)  return 24'sd8388607;
+    if (v < -33'sd8388608) return -24'sd8388608;
+    return heatvit_q8_16_t'(v[23:0]);
+  endfunction
+
+  function automatic heatvit_q8_16_t clamp_q8_16_from_s55(
+    input logic signed [54:0] v
+  );
+    if (v > 55'sd8388607)  return 24'sd8388607;
+    if (v < -55'sd8388608) return -24'sd8388608;
+    return heatvit_q8_16_t'(v[23:0]);
+  endfunction
+
+  // P7-5 narrow rewrite of activation_q16 (bit-exact width proof):
+  //   wide = acc + bias is 33-bit exact (|wide| <= 2^32).  scale_to_exp
+  //   takes src_exp = src0+src1 (6-bit wrap) and dst_exp = -16, so
+  //   diff = -16 - src_exp in [-47..16].
+  //   diff == 0 -> clamp24(wide)
+  //   diff >  0 (<=16): round-away -> 34-bit cone -> clamp24
+  //   diff <  0: k = -diff in [1..47]; wide<<k then clamp24.  k >= 23
+  //     saturates (|wide| >= 1 -> |wide<<k| >= 2^23); k <= 22 -> 55-bit
+  //     cone (32+22 = 54 < 55, exact).  The 128-bit left-shift overflow
+  //     check in scale_to_exp_s128 is dead here: 32+47 < 127, so the
+  //     shifted value always fits its container (identical in 55 bits).
   function automatic heatvit_q8_16_t activation_q16(
     input heatvit_s32_t accum_value,
     input heatvit_s32_t bias_value
   );
-    heatvit_s128_t wide;
-    heatvit_s128_t scaled;
-    wide = $signed({{96{accum_value[31]}}, accum_value}) +
-           (bias_en ? $signed({{96{bias_value[31]}}, bias_value}) : 128'sd0);
-    scaled = scale_to_exp_s128(wide, src0_scale + src1_scale, -6'sd16);
-    if (scaled > 128'sd8388607) return 24'sd8388607;
-    if (scaled < -128'sd8388608) return -24'sd8388608;
-    return heatvit_q8_16_t'(scaled[23:0]);
+    logic signed [32:0] wide;
+    logic signed [5:0]  src_exp;
+    int diff;
+    logic [5:0]  d;
+    logic [33:0] mag_u;
+    logic [33:0] rounded;
+    logic signed [33:0] rsigned;
+    wide = $signed({accum_value[31], accum_value}) +
+           (bias_en ? $signed({bias_value[31], bias_value}) : 33'sd0);
+    src_exp = src0_scale + src1_scale;
+    diff = -16 - int'(src_exp);
+    if (diff == 0) begin
+      return clamp_q8_16_from_s33(wide);
+    end else if (diff > 0) begin
+      d = diff[5:0];  // diff in [1..16] -> d == diff
+      mag_u = (wide < 33'sd0) ? (34'h200000000 - {1'b0, wide}) : {1'b0, wide};
+      rounded = (mag_u + (34'd1 << (d - 6'd1))) >> d;
+      rsigned = (wide < 33'sd0) ? -$signed(rounded) : $signed(rounded);
+      return clamp_q8_16_from_s33(rsigned);
+    end else begin
+      if (-diff >= 23) begin
+        return (wide == 33'sd0) ? 24'sd0 :
+               ((wide < 33'sd0) ? -24'sd8388608 : 24'sd8388607);
+      end else begin
+        return clamp_q8_16_from_s55(
+          $signed({{22{wide[32]}}, wide}) <<< (-diff));
+      end
+    end
   endfunction
 
   always_comb begin
@@ -386,6 +485,7 @@ module heatvit_gemm_engine
 
   // Combinational validation and derived layout.
   logic [7:0]  v_error;
+  logic [7:0]  v_error_shallow;
   logic [3:0]  a_rows;
   logic [3:0]  b_cols [0:2];
   logic [15:0] col_global [0:2];
@@ -557,6 +657,43 @@ module heatvit_gemm_engine
     else if (!addr_ok_all) v_error = ERR_ADDRESS;
   end
 
+  // P7-5: shallow validation — the same priority-encoded descriptor checks
+  // WITHOUT the deep addr_ok_all clause.  Shallow violations drive
+  // error_valid/error_code/busy in the first S_CHECK phase (a ~12-level
+  // cone), while the full v_error settles into v_error_r for the state
+  // decision and for address errors one phase later.  When a shallow check
+  // fires, the address clause is irrelevant, so v_error_shallow equals
+  // v_error for every shallow violation.
+  always_comb begin
+    v_error_shallow = ERR_NONE;
+    if (desc_reg.opcode != OP_GEMM) v_error_shallow = ERR_OPCODE;
+    else if (desc_reg.reserved != 4'd0) v_error_shallow = ERR_DIMENSION;
+    else if (desc_reg.m == 16'd0 || desc_reg.n == 16'd0 || desc_reg.k == 16'd0)
+      v_error_shallow = ERR_DIMENSION;
+    else if (desc_reg.flags[FLAG_HEAD_MODE] && desc_reg.heads != 4'd3)
+      v_error_shallow = ERR_DIMENSION;
+    else if (!desc_reg.flags[FLAG_HEAD_MODE] && desc_reg.heads != 4'd0)
+      v_error_shallow = ERR_DIMENSION;
+    else if (desc_reg.flags[FLAG_SRC0_UNSIGNED] &&
+             !(desc_reg.flags[FLAG_HEAD_MODE] && desc_reg.heads == 4'd3))
+      v_error_shallow = ERR_DIMENSION;
+    else if (desc_reg.flags[FLAG_SRC0_CAND_MAJOR] &&
+             !(desc_reg.flags[FLAG_HEAD_MODE] && desc_reg.heads == 4'd3))
+      v_error_shallow = ERR_DIMENSION;
+    else if (desc_reg.flags[10:8] != POST_NONE &&
+             desc_reg.flags[10:8] != POST_GELU &&
+             desc_reg.flags[10:8] != POST_PLAN)
+      v_error_shallow = ERR_DIMENSION;
+    else if (desc_reg.flags[10:8] == POST_GELU &&
+             desc_reg.flags[FLAG_OUTPUT_INT32])
+      v_error_shallow = ERR_DIMENSION;
+    else if (desc_reg.flags[10:8] == POST_PLAN &&
+             desc_reg.flags[FLAG_OUTPUT_INT32])
+      v_error_shallow = ERR_DIMENSION;
+    else if (desc_reg.k > (A_BYTES / 8) || desc_reg.k > (B_BYTES / 8))
+      v_error_shallow = ERR_DIMENSION;
+  end
+
   // Load window computation (used in S_LOAD_SETUP).
   always_comb begin
     ld_addr64_c   = 64'h0000000000000000;
@@ -624,6 +761,17 @@ module heatvit_gemm_engine
   assign ld_end64_c = (ld_cover64_c < ld_region_end64_c) ? ld_cover64_c : ld_region_end64_c;
   assign ld_len_c = 16'((ld_end64_c - ld_aligned64_c) >> 3);
 
+  // P7-5 stage 1: the same cover/end/len chain re-evaluated from the
+  // registered stage-0 window math (bit-identical to ld_len_c).
+  logic [63:0] ld_cover64_p1;
+  logic [63:0] ld_end64_p1;
+  logic [63:0] ld_region_end64_p1;
+  assign ld_cover64_p1 = (ld_aligned64_r + 64'(ld_w_c_r) + 64'(ld_e_c_r) + 64'd7) &
+                         64'hFFFFFFFFFFFFFFF8;
+  assign ld_region_end64_p1 = {32'd0, ld_rbase_r} + {32'd0, ld_rbytes_r};
+  assign ld_end64_p1 = (ld_cover64_p1 < ld_region_end64_p1) ? ld_cover64_p1
+                                                            : ld_region_end64_p1;
+
   // Writeback window computation (used in S_WB_NEXT).
   always_comb begin
     wb_addr64_c = 64'h0000000000000000;
@@ -657,6 +805,17 @@ module heatvit_gemm_engine
   assign wb_region_end64_c = {32'd0, dst_region_base} + {32'd0, dst_region_bytes};
   assign wb_end64_c = (wb_cover64_c < wb_region_end64_c) ? wb_cover64_c : wb_region_end64_c;
   assign wb_len_c = 16'((wb_end64_c - wb_aligned64_c) >> 3);
+
+  // P7-5 stage 1: the same chain from the registered stage-0 window math
+  // (bit-identical to wb_len_c).
+  logic [63:0] wb_cover64_p1;
+  logic [63:0] wb_end64_p1;
+  logic [63:0] wb_region_end64_p1;
+  assign wb_cover64_p1 = (wb_addr64_r + 64'(wb_w_c_r) + 64'(wb_e_c_r) + 64'd7) &
+                         64'hFFFFFFFFFFFFFFF8;
+  assign wb_region_end64_p1 = {32'd0, wb_rbase_r} + {32'd0, wb_rbytes_r};
+  assign wb_end64_p1 = (wb_cover64_p1 < wb_region_end64_p1) ? wb_cover64_p1
+                                                            : wb_region_end64_p1;
 
   // Per-byte writeback composition: stage A computes each byte's column
   // index / lane / kind for the current beat and registers them; stage B
@@ -694,37 +853,149 @@ module heatvit_gemm_engine
     end
   end
 
+  // P7-5 narrow rewrite of gemm_out8_from_sum (bit-exact width proof):
+  //   shift = dst - src0 - src1 in [-95..95]; |sum| <= 2^32.
+  //   shift >= 0: s = shift[6:0] in [0..95] (shift < 128, so the 7-bit
+  //     slice is shift itself);
+  //     round-away = (|sum| + 2^(s-1)) >> s.
+  //       s == 0  -> sat8(sum)
+  //       s <= 32 -> 34-bit cone (|sum|+2^(s-1) < 2^33)
+  //       s == 33 -> -1 iff sum == -2^32 (|sum| == 2^32 == 2^(s-1)),
+  //                  else 0
+  //       s >= 34 -> 0                 (|sum|+2^(s-1) < 2^s)
+  //   shift <  0: k = -shift in [1..95]; wide<<k then sat8.
+  //       k >= 8  -> sign-saturates (|sum| >= 1 -> |sum<<k| >= 256)
+  //       k <= 7  -> 40-bit cone (32+7 = 39 < 40, exact)
   function automatic heatvit_s8_t gemm_out8_from_sum(
     input logic signed [32:0] sum
   );
-    heatvit_s128_t wide;
     int shift;
-    heatvit_s128_t scaled;
-    wide = $signed({{95{sum[32]}}, sum});
+    logic [6:0] s;
+    logic [33:0] mag_u;
+    logic [33:0] rounded;
     shift = int'(dst_scale) - int'(src0_scale) - int'(src1_scale);
-    if (shift >= 0) scaled = round_shift_away_s128(wide, shift[6:0]);
-    else scaled = wide <<< (-shift);
-    return sat_s8(scaled);
+    if (shift >= 0) begin
+      s = shift[6:0];
+      if (s == 7'd0) begin
+        return sat_s8_from_s33(sum);
+      end else if (s <= 7'd32) begin
+        mag_u = (sum < 33'sd0) ? (34'h200000000 - {1'b0, sum}) : {1'b0, sum};
+        rounded = (mag_u + (34'd1 << (s - 7'd1))) >> s;
+        if (sum < 33'sd0) begin
+          return (rounded > 34'd128) ? -8'sd128 :
+                 (8'sd0 - heatvit_s8_t'(rounded[7:0]));
+        end else begin
+          return (rounded > 34'd127) ? 8'sd127 : heatvit_s8_t'(rounded[7:0]);
+        end
+      end else if (s == 7'd33) begin
+        return (sum == 33'sh100000000) ? -8'sd1 : 8'sd0;
+      end else begin
+        return 8'sd0;
+      end
+    end else begin
+      if (-shift >= 8) begin
+        return (sum == 33'sd0) ? 8'sd0 :
+               ((sum < 33'sd0) ? -8'sd128 : 8'sd127);
+      end else begin
+        return sat_s8_from_s40($signed({{7{sum[32]}}, sum}) <<< (-shift));
+      end
+    end
   endfunction
 
+  // P7-5 narrow rewrite of gemm_out32_from_sum (bit-exact width proof):
+  //   src_exp = src0 + src1 (6-bit wrap); diff = dst - src_exp in [-63..62];
+  //   |sum| <= 2^32.
+  //   diff == 0 -> sat32(sum)
+  //   diff >  0: round-away by diff (d = diff[5:0] == diff since diff < 64):
+  //       d >= 34 -> 0; d == 33 -> -1 iff sum == -2^32;
+  //       d <= 32 -> 34-bit cone, then sat32.
+  //   diff <  0: k = -diff in [1..63]; sum<<k then sat32.
+  //       k >= 31 -> sign-saturates (|sum| >= 1 -> |sum<<k| >= 2^31)
+  //       k <= 30 -> 64-bit cone (32+30 = 62 < 64, exact).  The 128-bit
+  //       left-shift overflow check is dead here too (32+63 = 95 < 127).
   function automatic heatvit_s32_t gemm_out32_from_sum(
     input logic signed [32:0] sum
   );
-    heatvit_s128_t wide;
-    heatvit_s128_t scaled;
-    wide = $signed({{95{sum[32]}}, sum});
-    scaled = scale_to_exp_s128(wide, src0_scale + src1_scale, dst_scale);
-    return sat_s32(scaled);
+    logic signed [5:0] src_exp;
+    int diff;
+    logic [5:0] d;
+    logic [33:0] mag_u;
+    logic [33:0] rounded;
+    src_exp = src0_scale + src1_scale;
+    diff = int'(dst_scale) - int'(src_exp);
+    if (diff == 0) begin
+      return sat_s32_from_s33(sum);
+    end else if (diff > 0) begin
+      d = diff[5:0];
+      if (d >= 6'd34) begin
+        return 32'sd0;
+      end else if (d == 6'd33) begin
+        return (sum == 33'sh100000000) ? -32'sd1 : 32'sd0;
+      end else begin
+        mag_u = (sum < 33'sd0) ? (34'h200000000 - {1'b0, sum}) : {1'b0, sum};
+        rounded = (mag_u + (34'd1 << (d - 6'd1))) >> d;
+        if (sum < 33'sd0) begin
+          // rounded <= 2^31 (max at d == 1), so -rounded >= -2^31 and the
+          // sat_s32 collapses to the two's-complement negation.
+          return -heatvit_s32_t'(rounded[31:0]);
+        end else begin
+          return (rounded > 34'd2147483647) ? 32'sd2147483647 :
+                 heatvit_s32_t'(rounded[31:0]);
+        end
+      end
+    end else begin
+      if (-diff >= 31) begin
+        return (sum == 33'sd0) ? 32'sd0 :
+               ((sum < 33'sd0) ? -32'sd2147483648 : 32'sd2147483647);
+      end else begin
+        return sat_s32_from_s64($signed({{31{sum[32]}}, sum}) <<< (-diff));
+      end
+    end
   endfunction
 
+  // P7-5 narrow rewrite of gelu_out8_from_value (bit-exact width proof):
+  //   diff = dst - (-16) = dst + 16 in [-16..47]; |value| <= 2^23.
+  //   diff == 0 -> sat8(value)
+  //   diff >  0: round-away by diff (d == diff since diff <= 47 < 64):
+  //       d >= 25 -> 0; d == 24 -> -1 iff value == -2^23;
+  //       d <= 23 -> 24-bit cone (|value|+2^(d-1) < 2^24).
+  //   diff <  0: k = -diff in [1..16]; value<<k then sat8.
+  //       k >= 8  -> sign-saturates (|value| >= 1 -> >= 256)
+  //       k <= 7  -> 40-bit cone (23+7 = 30 < 40, exact)
   function automatic heatvit_s8_t gelu_out8_from_value(
     input logic signed [23:0] value
   );
-    heatvit_s128_t wide;
-    heatvit_s128_t scaled;
-    wide = $signed({{104{value[23]}}, value});
-    scaled = scale_to_exp_s128(wide, -6'sd16, dst_scale);
-    return sat_s8(scaled);
+    int diff;
+    logic [5:0] d;
+    logic [23:0] mag;
+    logic [23:0] rounded;
+    diff = int'(dst_scale) + 16;
+    if (diff == 0) begin
+      return sat_s8_from_s24(value);
+    end else if (diff > 0) begin
+      d = diff[5:0];
+      if (d >= 6'd25) begin
+        return 8'sd0;
+      end else if (d == 6'd24) begin
+        return (value == 24'sh800000) ? -8'sd1 : 8'sd0;
+      end else begin
+        mag = (value < 24'sd0) ? (24'h800000 - {1'b0, value}) : {1'b0, value};
+        rounded = (mag + (24'd1 << (d - 6'd1))) >> d;
+        if (value < 24'sd0) begin
+          return (rounded > 24'd128) ? -8'sd128 :
+                 (8'sd0 - heatvit_s8_t'(rounded[7:0]));
+        end else begin
+          return (rounded > 24'd127) ? 8'sd127 : heatvit_s8_t'(rounded[7:0]);
+        end
+      end
+    end else begin
+      if (-diff >= 8) begin
+        return (value == 24'sd0) ? 8'sd0 :
+               ((value < 24'sd0) ? -8'sd128 : 8'sd127);
+      end else begin
+        return sat_s8_from_s40($signed({{16{value[23]}}, value}) <<< (-diff));
+      end
+    end
   endfunction
 
   // Stage B selects the source values using the registered decode. The
@@ -865,11 +1136,15 @@ module heatvit_gemm_engine
     end
   end
 
-  // Guard input mux for per-window runtime checks.
-  assign g_base  = (state == S_WB_NEXT) ? dst_region_base : ld_region_base_c;
-  assign g_bytes = (state == S_WB_NEXT) ? dst_region_bytes : ld_region_bytes_c;
-  assign g_addr  = (state == S_WB_NEXT) ? wb_aligned64_c[31:0] : ld_aligned64_c[31:0];
-  assign g_len   = (state == S_WB_NEXT) ? wb_len_c : ld_len_c;
+  // Guard input mux for per-window runtime checks.  P7-5: both sides feed
+  // the guard from their registered stage-0/1 values, so the guard's comb
+  // cone is register-to-register.  The inputs are only sampled by g_ok_r /
+  // g_code_r during each side's stage-2 phase; the other phases may present
+  // stale registered values, which is harmless.
+  assign g_base  = (state == S_WB_NEXT) ? wb_rbase_r : ld_rbase_r;
+  assign g_bytes = (state == S_WB_NEXT) ? wb_rbytes_r : ld_rbytes_r;
+  assign g_addr  = (state == S_WB_NEXT) ? wb_addr64_r[31:0] : ld_aligned64_r[31:0];
+  assign g_len   = (state == S_WB_NEXT) ? wb_len_c_r : ld_len_r;
 
   assign cmd_ready = (state == S_IDLE);
 
@@ -919,8 +1194,26 @@ module heatvit_gemm_engine
       wb_valid_r       <= 1'b0;
       wb_exit_pipe     <= 2'b00;
       wb_rd            <= 3'd0;
-      wb_guard_phase   <= 1'b0;
-      ld_guard_phase   <= 1'b0;
+      wb_settle        <= 2'd0;
+      wb_addr64_r      <= 64'd0;
+      wb_len_c_r       <= 16'd0;
+      wb_e_c_r         <= 3'd0;
+      wb_w_c_r         <= 6'd0;
+      wb_rbase_r       <= 32'd0;
+      wb_rbytes_r      <= 32'd0;
+      g_ok_r           <= 1'b0;
+      g_code_r         <= 8'd0;
+      ld_settle        <= 2'd0;
+      ld_aligned64_r   <= 64'd0;
+      ld_e_c_r         <= 3'd0;
+      ld_w_c_r         <= 16'd0;
+      ld_rbase_r       <= 32'd0;
+      ld_rbytes_r      <= 32'd0;
+      ld_len_r         <= 16'd0;
+      ld_fill_bank_r   <= 3'd0;
+      v_error_r        <= 8'd0;
+      v_shallow_r      <= 1'b0;
+      s_check_phase    <= 1'b0;
       for (int b = 0; b < 3; b++) begin
         col_mask[b]  <= 8'hff;
         a_rd_addr[b] <= 13'd0;
@@ -964,12 +1257,22 @@ module heatvit_gemm_engine
         end
 
         S_CHECK: begin
-          if (v_error != ERR_NONE) begin
-            error_code  <= v_error;
-            error_valid <= 1'b1;
-            busy        <= 1'b0;
-            state       <= S_IDLE;
-          end else begin
+          if (!s_check_phase) begin
+            // P7-5: phase 0 registers the validation result and loads the
+            // command configuration unconditionally.  The deep
+            // desc_reg -> addr_ok_all -> v_error cone ends at v_error_r, so
+            // the config-register clock enables only decode the state.  On
+            // the error path the loaded values are never consumed (the next
+            // command reloads them).  Shallow descriptor violations pulse
+            // error_valid already in this phase (keeps the testbench's
+            // one-cycle error window); address errors pulse one phase later
+            // from the registered v_error_r.
+            s_check_phase <= 1'b1;
+            v_error_r     <= v_error;
+            v_shallow_r   <= (v_error_shallow != ERR_NONE);
+            error_valid   <= (v_error_shallow != ERR_NONE);
+            error_code    <= v_error_shallow;
+            busy          <= (v_error_shallow == ERR_NONE);
             m_eff          <= desc_reg.m;
             // In Head mode the descriptor n is the per-head width; the full
             // output width is heads * n so flag 19 can express dynamic N.
@@ -1006,25 +1309,50 @@ module heatvit_gemm_engine
             ld_bank           <= 2'd0;
             ld_idx            <= 16'd0;
             mac_active_cycles <= '0;
-            state             <= S_LOAD_SETUP;
+          end else begin
+            // Phase 1: decide from the registered validation result.
+            s_check_phase <= 1'b0;
+            if (v_error_r != ERR_NONE) begin
+              if (!v_shallow_r) begin
+                // Address error: the shallow phase stayed quiet, so pulse
+                // the registered code here.
+                error_valid <= 1'b1;
+                error_code  <= v_error_r;
+              end
+              busy  <= 1'b0;
+              state <= S_IDLE;
+            end else begin
+              state <= S_LOAD_SETUP;
+            end
           end
         end
 
-        // Load window selection with a one-cycle guard settle: the first
-        // phase registers the guard result and the derived addresses, the
-        // second phase decides from the registered values.
+        // Load window selection with a four-phase guard pipeline (P7-5):
+        // stage 0 registers the address-multiply window math, stage 1 the
+        // cover/end/len add chain, stage 2 the addr-guard compare, stage 3
+        // decides from registered values only.
         S_LOAD_SETUP: begin
-          if (!ld_guard_phase) begin
-            ld_guard_phase <= 1'b1;
-            g_ok_r   <= g_ok;
-            g_code_r <= g_code;
-            ld_addr_r <= ld_aligned64_c[31:0];
-            ld_len_r  <= ld_len_c;
-            ld_e_r    <= ld_e_c;
-            ld_w_r    <= ld_w_c;
+          case (ld_settle)
+          2'd0: begin
+            ld_settle <= 2'd1;
+            ld_aligned64_r <= ld_aligned64_c;
+            ld_e_c_r    <= ld_e_c;
+            ld_w_c_r    <= ld_w_c;
+            ld_rbase_r  <= ld_region_base_c;
+            ld_rbytes_r <= ld_region_bytes_c;
             ld_fill_bank_r <= ld_fill_bank_c;
-          end else begin
-          ld_guard_phase <= 1'b0;
+          end
+          2'd1: begin
+            ld_settle <= 2'd2;
+            ld_len_r  <= 16'((ld_end64_p1 - ld_aligned64_r) >> 3);
+          end
+          2'd2: begin
+            ld_settle <= 2'd3;
+            g_ok_r    <= g_ok;
+            g_code_r  <= g_code;
+          end
+          default: begin
+          ld_settle <= 2'd0;
           case (ld_kind)
             2'd0: begin
               if (head_mode ? (ld_bank == 2'd3) : (ld_idx == {12'd0, a_rows})) begin
@@ -1033,10 +1361,10 @@ module heatvit_gemm_engine
                 ld_idx  <= 16'd0;
               end else begin
                 if (g_ok_r) begin
-                  ld_addr <= ld_addr_r;
+                  ld_addr <= ld_aligned64_r[31:0];
                   ld_len  <= ld_len_r;
-                  ld_e    <= ld_e_r;
-                  ld_w    <= ld_w_r;
+                  ld_e    <= ld_e_c_r;
+                  ld_w    <= ld_w_c_r;
                   ld_fill_bank <= ld_fill_bank_r;
                   state   <= S_LOAD_REQ;
                 end else begin
@@ -1059,10 +1387,10 @@ module heatvit_gemm_engine
                 ld_bank <= ld_bank + 2'd1;
               end else begin
                 if (g_ok_r) begin
-                  ld_addr <= ld_addr_r;
+                  ld_addr <= ld_aligned64_r[31:0];
                   ld_len  <= ld_len_r;
-                  ld_e    <= ld_e_r;
-                  ld_w    <= ld_w_r;
+                  ld_e    <= ld_e_c_r;
+                  ld_w    <= ld_w_c_r;
                   ld_fill_bank <= ld_fill_bank_r;
                   state   <= S_LOAD_REQ;
                 end else begin
@@ -1080,10 +1408,10 @@ module heatvit_gemm_engine
                 ld_bank <= ld_bank + 2'd1;
               end else begin
                 if (g_ok_r) begin
-                  ld_addr <= ld_addr_r;
+                  ld_addr <= ld_aligned64_r[31:0];
                   ld_len  <= ld_len_r;
-                  ld_e    <= ld_e_r;
-                  ld_w    <= ld_w_r;
+                  ld_e    <= ld_e_c_r;
+                  ld_w    <= ld_w_c_r;
                   ld_fill_bank <= ld_fill_bank_r;
                   state   <= S_LOAD_REQ;
                 end else begin
@@ -1096,6 +1424,7 @@ module heatvit_gemm_engine
             end
           endcase
           end
+          endcase
         end
 
         S_LOAD_REQ: begin
@@ -1339,20 +1668,31 @@ module heatvit_gemm_engine
         end
 
         // Write-back window selection. The address guard is deep
-        // (multiplies + bounds checks), so the first phase registers the
-        // guard result and the derived addresses, and the second phase
-        // makes the decision from the registered values.
+        // Write-back window selection with the same four-phase guard
+        // pipeline as S_LOAD_SETUP (P7-5): stage 0 registers the address
+        // multiply cone, stage 1 the cover/end/len chain, stage 2 the
+        // addr-guard compare, stage 3 decides from registered values only.
         S_WB_NEXT: begin
-          if (!wb_guard_phase) begin
-            wb_guard_phase <= 1'b1;
-            g_ok_r     <= g_ok;
-            g_code_r   <= g_code;
+          case (wb_settle)
+          2'd0: begin
+            wb_settle <= 2'd1;
             wb_addr64_r <= wb_aligned64_c;
-            wb_len_c_r  <= wb_len_c;
             wb_e_c_r    <= wb_e_c;
             wb_w_c_r    <= wb_w_c;
-          end else begin
-            wb_guard_phase <= 1'b0;
+            wb_rbase_r  <= dst_region_base;
+            wb_rbytes_r <= dst_region_bytes;
+          end
+          2'd1: begin
+            wb_settle <= 2'd2;
+            wb_len_c_r <= 16'((wb_end64_p1 - wb_addr64_r) >> 3);
+          end
+          2'd2: begin
+            wb_settle <= 2'd3;
+            g_ok_r    <= g_ok;
+            g_code_r  <= g_code;
+          end
+          default: begin
+            wb_settle <= 2'd0;
             if (wb_b == 2'd3) begin
               // Advance to the next column group / row tile.
               if (head_mode) begin
@@ -1404,6 +1744,7 @@ module heatvit_gemm_engine
               wb_r <= 3'd0;
             end
           end
+          endcase
         end
 
         S_WB_REQ: begin
