@@ -5328,6 +5328,17 @@ gemm 套件全 12 场景 + tb_ffn/tb_mhsa + 全量回归全绿（见文末机器
 | u_ln stage-3 仿射 | 8 | −5.02 ns（79 级，CARRY4×62+DSP） | 拆 3a/3b/3c：DSP 积 → 96 位对齐求和 → 终移/舍入+饱和。踩坑：beta 对齐移可达 79（beta=+31、gamma−16=−48），移量容器须 7 位（6 位截断 → tb_layernorm 首字节 0/127 定位） |
 | scheduler n_r → 子模块 CE | 362 | −4.53 ns（32 级 + DSP，扇出 279 acc + 83 srow） | executor S_CHECK 双相决策：v_error 深锥寄存 v_error_r，child_sel 无条件解码，子模块 start 脉冲全部改读寄存器（n_r → desc[m] → 守卫 → v_error → CE 的组合链在 start 处截断） |
 
+**第二轮（WNS −2.207 ns / 9,846 端点）与第三轮（−1.130 ns / 66 端点）**：
+
+| 家族 | 端点 | 典型违例 | 修复 |
+| --- | ---: | ---: | --- |
+| u_ln 方差锥 | 20 | −2.21 ns（128 位 mean² + 舍入 + 减 + 钳位 + ε 单拍） | 96 位平方 + 定移舍入 + radicand 三寄存器阶段（|mean|<2^39 ⇒ 平方<2^78 精确；e2/mean² 均非负且 ≤2^46，48 位减精确） |
+| u_vector srow CE | 383 | −2.20 ns（sp_i 解码扇出 197 个寄存器使能） | 一热写使能寄存器化（sp_we_r + 寄存评分值，写落一拍后） |
+| u_vector score_q16 | 24 | −1.13 ns（128 位 scale_to_exp） | 与 activation_q16 同证收窄（34/55 位锥，k≥23 符号饱和） |
+| executor v_error | 2 | −0.40 ns（field_bytes DSP → 守卫 → v_error 单拍） | S_CHECK 三相：相 0 捕获 field-byte 积（DSP 锥止于此）、相 1 守卫+校验、相 2 决策+start |
+| u_ln stage-3c 终移 | 6 | −0.33 ns（96 位舍入加+可变移） | 3c1 寄存 {sum, 幅值, 终移} 槽位、3c2 一热加+移位+饱和。踩坑：幅值/移位/符号必须同槽位寄存（跨槽位错配 → tb_layernorm beat95 ±1 定位） |
+| selector softmax shifted_r | 7 | −0.07 ns（exp 流水 stage-1 双 DSP） | 第三轮布局余量 0.065 ns 以内，第四轮布局后自然达标，未改 RTL |
+
 **验证**：tb_requant_residual（改两级握手）、tb_layernorm、tb_ln_p5_stale、
 tb_ffn、tb_mhsa、tb_transformer_block（block13 回压）、tb_heatvit_errors
 全部 TEST_PASS；全量回归见文末机器可读结果。
@@ -5336,12 +5347,16 @@ tb_ffn、tb_mhsa、tb_transformer_block（block13 回压）、tb_heatvit_errors
 
 | 阶段 | 结果 |
 | --- | --- |
-| 综合 | 待填 |
-| place 后 | 待填 |
-| route 后 signoff | 待填 |
-| hold（min） | 待填 |
-| 布线 | 待填 |
-| 路由后资源 | 待填 |
+| 综合 | 0 黑盒、0 锁存器（SYNTH_OK） |
+| route 后 signoff | **WNS = +0.234 ns、TNS = 0、0 违例端点**（`All user specified timing constraints are met.`） |
+| hold（min） | **WHS = +0.018 ns、THS = 0**（setup+hold 双达标） |
+| 布线 | 0 未布线 / 0 部分布线（217,098 逻辑网，routing errors 0） |
+| 路由后资源 | **LUT 85,959（42.18%）**、FF 48,617（11.93%）、DSP 65、BRAM 35（较 50 MHz 时代的 118,453 LUT 再降 27%） |
+
+**结论**：100 MHz 时序收敛达成。残余违例家族共五轮清零：GEMM 引擎重定标/守卫
+（OOC 门 +0.659 ns）→ residual 两级窄化 → executor start CE → LN 方差三阶段 +
+srow 一热写使能 → score_q16 收窄 + LN 3c 槽位拆 + executor 三相位。全程逐位等价
+口径不变（tb_requant_diag 33.5M 样本 0 误差；全量回归全绿，见文末机器可读结果）。
 
 
 # 第三部分：仿真与验证指南

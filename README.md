@@ -4,7 +4,7 @@
 
 ![tag](https://img.shields.io/github/v/tag/YOUXINYANG/HeatViT?label=release)
 
-> **当前状态（2026-08-29）**
+> **当前状态（2026-08-30）**
 >
 > - ✅ **仿真闭环**：XSim 端到端逐位通过——18 个检查点与 1000 个 Logit 与纯整数 Python 黄金模型零容差一致；QAT 权重 6 轮回归全部 PASS
 > - ✅ **精度闭环**：PTQ 76.06% → QAT **77.86%**（未剪枝）；剪枝 **72.70%@93/44/37**（P4-2A λ=5，当前最优），已导出回 RTL
@@ -12,7 +12,8 @@
 > - ✅ **P7-1 bbuf→BRAM（2026-08-28）**：vector/layout 两引擎寄存器数组 → 11 个字节写使能 SDP RAM + 流入式解包；**全量综合 LUT 918,145 → 238,271（450.5% → 116.9%）**；全量逐位回归全绿
 > - ✅ **P7-2 同类数组推广（2026-08-28）**：selector 侧七模块（head_fuse/reduce_mean/selector_softmax/finalize/packager/compactor/feature_concat）寄存器数组 → SDP RAM/串行化，OOC 124,626 → 15,408 LUT（−87.6%）；**全量综合 LUT 126,459 = 62.05%，首次跨过 100% 可布线性门槛**；全量逐位回归（e2e 两轮 + 错误矩阵）全绿
 > - ✅ **P7-4 实现与 50 MHz 时序收敛（2026-08-29）**：LN/softmax 流水化 + GEMM 写回关键路径寄存器化后 place+route 0 未布线；100 MHz 实测不收敛（place 后 WNS −7.2 ns）按计划回退，**50 MHz signoff WNS +0.323 / TNS 0 / WHS +0.073**（setup+hold 双达标）；路由后 LUT 118,453（58.12%）、DSP 65、BRAM 37
-> - ⏳ **下一步**：100 MHz 攻坚（GEMM 写回 stage-B 劈级/收窄）与 P7③ MAC DSP 化（均属可选优化）
+> - ✅ **P7-5 GEMM 引擎与全片 100 MHz 时序收敛（2026-08-30）**：重定标函数四位宽证明收窄（34/40/64/55 位锥，tb_requant_diag 33.5M 样本 0 误差）+ 守卫四相流水 + S_CHECK 决策寄存（GEMM OOC 门 WNS −4.185 → **+0.659 ns**）；全片五轮清零违例家族（residual 两级窄化、LN 仿射/方差多级拆、executor 三相决策、srow 一热写使能、score_q16 收窄），**100 MHz signoff WNS +0.234 / TNS 0 / WHS +0.018**（`All user specified timing constraints are met.`）；路由后 **LUT 85,959（42.18%）**、FF 48,617、DSP 65、BRAM 35
+> - ⏳ **下一步（可选优化）**：P7③ MAC DSP 化补裕量；板级引脚约束与上板验证
 
 ## 简介
 
@@ -61,7 +62,7 @@ flowchart TD
 | P4 | 剪枝微调（STE 阈值/Package + 保持率正则） | ✅ | 剪枝 **72.70%@93/44/37** |
 | P5 | QAT 权重导出回 RTL + XSim 逐位回归 | ✅ | 6 轮全部 TEST_PASS |
 | P6 | Vivado 综合与资源统计（100 MHz） | ✅ | 可综合性通过；LUT 4.4× 超标 |
-| P7 | 资源优化（P7-1/P7-2）→ 实现 + 50 MHz 时序收敛（P7-4） | ✅ | LUT 62.05% → 路由后 58.12%；WNS +0.323 ns |
+| P7 | 资源优化（P7-1/P7-2）→ 50 MHz（P7-4）→ **100 MHz 收敛（P7-5）** | ✅ | LUT 62.05% → **42.18%**；WNS +0.234 ns@100 MHz |
 
 ## 验证结果（实测摘要）
 
@@ -97,16 +98,16 @@ flowchart TD
 
 ## 资源占用（xc7k325tfbg900-3）
 
-| 资源 | P6 | P7-1 | P7-2 | **P7-4（路由后）** | 可用 | P7-4 占用率 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Slice LUTs | 918,145 | 238,271 | 126,459 | **118,453** | 203,800 | **58.12%** ✅ |
-| Slice Registers | 229,155 | 125,273 | 47,550 | 46,834 | 407,600 | 11.49% |
-| Block RAM Tile | 12 | 26 | 37 | 37 | 445 | 8.3% |
-| DSP48E1 | 112 | 88 | 81 | 65 | 840 | 7.7% |
-| F7 / F8 Muxes | 140,822 / 64,434 | 22,973 / 7,860 | 8,360 / 2,032 | 8,155 / 2,575 | — | — |
+| 资源 | P6 | P7-1 | P7-2 | P7-4（路由后） | **P7-5（路由后）** | 可用 | P7-5 占用率 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Slice LUTs | 918,145 | 238,271 | 126,459 | 118,453 | **85,959** | 203,800 | **42.18%** ✅ |
+| Slice Registers | 229,155 | 125,273 | 47,550 | 46,834 | 48,617 | 407,600 | 11.93% |
+| Block RAM Tile | 12 | 26 | 37 | 37 | 35 | 445 | 7.9% |
+| DSP48E1 | 112 | 88 | 81 | 65 | 65 | 840 | 7.7% |
+| F7 / F8 Muxes | 140,822 / 64,434 | 22,973 / 7,860 | 8,360 / 2,032 | 8,155 / 2,575 | 8,443 / 2,807 | — | — |
 
-> P6–P7-2 为综合级数字；P7-4 为 place+route 后数字（DSP 65 系 P7-4
-> LN/softmax 流水化后综合减少）。
+> P6–P7-2 为综合级数字；P7-4/P7-5 为 place+route 后数字（DSP 65 系 P7-4
+> LN/softmax 流水化后综合减少；P7-5 的窄化重写再省 ~27% LUT）。
 
 **演进**：P6 首综合 LUT 超容量 4.4 倍（超标集中在动态字节寻址寄存器数组被
 综合成的 mux 网络）→ **P7-1**（vector/layout 两引擎 bbuf → 11 个字节写使能
@@ -115,9 +116,12 @@ SDP RAM + 流入式解包，397K/311K → 20K/4K）→ **P7-2**（selector 侧�
 LN/softmax 流水化 + GEMM 写回 staging RAM 写端口寄存器化后 place+route
 0 未布线；100 MHz 实测 place 后 WNS −7.2 ns、route 拥塞，按计划回退，
 50 MHz signoff **WNS +0.323 ns / TNS 0 / WHS +0.073 ns**，setup+hold
-双达标）。全程位精确口径不变：每步改动后全量逐位回归（含 e2e 两轮 +
-错误矩阵）全绿；全量多核综合（-Jobs 24）0 黑盒、0 锁存器。100 MHz 的
-残余差距集中在 GEMM 写回 stage-B 128 位重定标锥（后续劈级/收窄可攻）；
+双达标）→ **P7-5**（100 MHz 收敛：GEMM 引擎重定标四位宽证明收窄 + 守卫
+四相流水 + S_CHECK 决策寄存，OOC 门 WNS −4.185 → +0.659 ns；全片五轮清零
+residual/LN/executor/score_q16/srow 等违例家族，**100 MHz signoff
+WNS +0.234 ns / TNS 0 / WHS +0.018 ns**，`All user specified timing
+constraints are met.`）。全程位精确口径不变：每步改动后全量逐位回归
+（含 e2e 两轮 + 错误矩阵）全绿；全量多核综合（-Jobs 24）0 黑盒、0 锁存器。
 P7③ MAC DSP 化仍为可选裕量优化（docs §15）。
 
 ## 仓库结构
@@ -133,7 +137,7 @@ HeatViT/
 │  ├─ top/                     # 描述符 ROM、调度器、heatvit_top
 │  └─ generated/               # 198 条描述符 ROM 初始化（由工具生成）
 ├─ config/heatvit_t.json       # 固定模型与量化配置
-├─ xdc/heatvit.xdc             # 时序/IO 约束（50 MHz；非时钟 IO false path，见注释）
+├─ xdc/heatvit.xdc             # 时序/IO 约束（100 MHz；非时钟 IO false path，见注释）
 ├─ sim/                        # 自检式 Testbench、行为存储、单元向量
 ├─ verification/               # 纯整数 Python 黄金模型 + 单元测试（含 QAT 测试）
 ├─ tools/                      # 描述符/向量生成器 + PTQ 量化与 QAT 工具链（固定种子、可复现）
@@ -166,7 +170,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_python_tests.ps1
 # 5. 全套回归（foundation/gemm/transformer/selector + e2e 两轮 + 错误矩阵）
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -Suite all
 
-# 6. Vivado 综合与实现（50 MHz 时序收敛：WNS +0.323 ns；路由后 LUT 58.12%）
+# 6. Vivado 综合与实现（100 MHz 时序收敛：WNS +0.234 ns；路由后 LUT 42.18%）
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_synth.ps1 -Jobs 24
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_impl.ps1 -Jobs 24
 .\.venv\Scripts\python tools\p6\p6_summary.py
@@ -176,13 +180,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_impl.ps1 
 
 ## 范围与非目标
 
-- ✅ **已覆盖**：XSim 逐位仿真验证；真实权重 PTQ / QAT / 剪枝精度评估；QAT 权重导出与硬件逐位回归（P5）；Vivado 综合与资源统计（P6）；P7-1 / P7-2 资源优化（bbuf→SDP RAM 全量推广，LUT 450.5% → 62.05%）；P7-4 实现与 50 MHz 时序收敛（place+route 0 未布线，WNS +0.323 ns）
-- ⏳ **待办**：100 MHz 攻坚（GEMM 写回 stage-B 劈级/收窄，可选）；P7③ MAC DSP 化（可选裕量优化）
+- ✅ **已覆盖**：XSim 逐位仿真验证；真实权重 PTQ / QAT / 剪枝精度评估；QAT 权重导出与硬件逐位回归（P5）；Vivado 综合与资源统计（P6）；P7-1 / P7-2 资源优化（bbuf→SDP RAM 全量推广，LUT 450.5% → 62.05%）；P7-4 实现与 50 MHz 时序收敛（place+route 0 未布线，WNS +0.323 ns）；P7-5 GEMM 引擎与全片 100 MHz 时序收敛（WNS +0.234 / TNS 0 / WHS +0.018，LUT 42.18%）
+- ⏳ **待办**：P7③ MAC DSP 化（可选裕量优化）；板级引脚约束与上板验证（板级 DDR/MIG/PCIe/AXI 集成与主机软件）
 - ❌ **排除**：功耗、FPS 与上板验证；板级 DDR/MIG/PCIe/AXI 集成与主机软件；HeatViT-S / HeatViT-B / LV-ViT 变体；JPEG/PNG 解码、图像缩放与浮点预处理
 
 ## 文档
 
-- 📖 [`docs/heatvit.md`](docs/heatvit.md) —— 项目**唯一权威记录文档**：设计规格、实施记录、仿真与验证指南、内存与权重格式、RTL 逐模块设计说明；PTQ / QAT / P5 导出见第二部分 §13–§14（P5 见 §14.14），P6 综合与资源统计、P7-1 / P7-2 资源优化、P7-4 实现与 50 MHz 时序收敛见 §15
+- 📖 [`docs/heatvit.md`](docs/heatvit.md) —— 项目**唯一权威记录文档**：设计规格、实施记录、仿真与验证指南、内存与权重格式、RTL 逐模块设计说明；PTQ / QAT / P5 导出见第二部分 §13–§14（P5 见 §14.14），P6 综合与资源统计、P7-1 / P7-2 资源优化、P7-4 实现与 50 MHz 时序收敛、P7-5 100 MHz 收敛见 §15
 - 📄 论文 PDF：仓库根目录 `HeatViT：Hardware-Efficient Adaptive Token Pruning for Vision Transformers.pdf`
 - 🔗 论文 arXiv：[2211.08110](https://arxiv.org/abs/2211.08110)
 
