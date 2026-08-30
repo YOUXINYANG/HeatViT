@@ -126,10 +126,10 @@ module heatvit_gemm_engine
   logic [2:0]  wb_e;
   logic [5:0]  wb_w;
   logic [2:0]  wb_bi;
-  // P7-4: write-back beat path is a two-stage registered composition that
-  // fills an 8-deep staging RAM, then streams the beats out of the RAM.
-  // This breaks the old ~90-level single-cycle cone (accumulator read mux
-  // + 128-bit requant + byte assembly) into short stages.
+  // P7-5: write-back composition uses three registered stages before the
+  // staging RAM: address decode, source-value selection, then requant/pack.
+  // The added value register cuts the route-dominated MAC-bank-to-RAM cone
+  // between the scattered accumulator mux and the 128-bit requant logic.
   logic [7:0]  wb_hit_a;        // stage A comb: per-byte in-range flags
   logic [4:0]  wb_c_a [0:7];    // stage A comb: output column index per byte
   logic [1:0]  wb_lane_a [0:7]; // stage A comb: byte lane within 32-bit word
@@ -138,19 +138,28 @@ module heatvit_gemm_engine
   logic [4:0]  wb_c_r [0:7];
   logic [1:0]  wb_lane_r [0:7];
   logic [1:0]  wb_kind_r [0:7];
-  logic        wb_comp_valid_r;   // stage B has a valid beat to write
-  logic [2:0]  wb_comp_idx_r;     // beat index being composed at stage B
+  logic        wb_comp_valid_r;   // stage B has a decoded beat to select
+  logic [2:0]  wb_comp_idx_r;
+  logic [7:0]  wb_value_hit_r;
+  logic [1:0]  wb_value_lane_r [0:7];
+  logic [1:0]  wb_value_kind_r [0:7];
+  logic signed [32:0] wb_sum_c [0:7];
+  logic signed [23:0] wb_gelu_c [0:7];
+  logic [16:0] wb_plan_c [0:7];
+  logic signed [32:0] wb_sum_r [0:7];
+  logic signed [23:0] wb_gelu_r [0:7];
+  logic [16:0] wb_plan_r [0:7];
+  logic        wb_value_valid_r;  // stage C has registered values to scale
+  logic [2:0]  wb_value_idx_r;
   logic [71:0] wb_ram_wdata;      // {64-bit data, 8-bit strb}
   logic [2:0]  wb_ram_raddr;
   logic [71:0] wb_ram_rdata;
   logic        wb_valid_r;
-  logic        wb_exit_d;         // compose exit armed: last beat write captured
+  logic [1:0]  wb_exit_pipe;      // drain select/scale/write-port stages
   logic [2:0]  wb_rd;             // streaming read index
   logic [2:0]  wb_last_idx;       // last beat index (wb_len-1, clamped to 3 bits)
-  // Registered staging-RAM write port: the stage-B composition cone is deep
-  // and its routing to the scattered distributed-RAM cells was the critical
-  // path (route-dominated); registering the port collapses it to a short
-  // reg->RAM hop.
+  // Registered staging-RAM write port keeps the final scale/pack cone local
+  // to its destination RAM cells.
   logic        wb_ram_we_r;
   logic [2:0]  wb_ram_waddr_r;
   logic [71:0] wb_ram_wdata_r;
@@ -676,37 +685,69 @@ module heatvit_gemm_engine
     end
   end
 
-  function automatic heatvit_s8_t gemm_out8(input int b, input int r, input int c);
+  function automatic heatvit_s8_t gemm_out8_from_sum(
+    input logic signed [32:0] sum
+  );
     heatvit_s128_t wide;
     int shift;
     heatvit_s128_t scaled;
-    wide = $signed({{96{bank_accum[b][r][c][31]}}, bank_accum[b][r][c]}) +
-           (bias_en ? $signed({{96{bias_all[8*b + c][31]}}, bias_all[8*b + c]}) : 128'sd0);
+    wide = $signed({{95{sum[32]}}, sum});
     shift = int'(dst_scale) - int'(src0_scale) - int'(src1_scale);
     if (shift >= 0) scaled = round_shift_away_s128(wide, shift[6:0]);
     else scaled = wide <<< (-shift);
     return sat_s8(scaled);
   endfunction
 
-  function automatic heatvit_s32_t gemm_out32(input int b, input int r, input int c);
+  function automatic heatvit_s32_t gemm_out32_from_sum(
+    input logic signed [32:0] sum
+  );
     heatvit_s128_t wide;
     heatvit_s128_t scaled;
-    wide = $signed({{96{bank_accum[b][r][c][31]}}, bank_accum[b][r][c]}) +
-           (bias_en ? $signed({{96{bias_all[8*b + c][31]}}, bias_all[8*b + c]}) : 128'sd0);
+    wide = $signed({{95{sum[32]}}, sum});
     scaled = scale_to_exp_s128(wide, src0_scale + src1_scale, dst_scale);
     return sat_s32(scaled);
   endfunction
 
-  function automatic heatvit_s8_t gelu_out8(input int b, input int r, input int c);
+  function automatic heatvit_s8_t gelu_out8_from_value(
+    input logic signed [23:0] value
+  );
     heatvit_s128_t wide;
     heatvit_s128_t scaled;
-    wide = $signed({{104{gelu_buf[b][r][c][23]}}, gelu_buf[b][r][c]});
+    wide = $signed({{104{value[23]}}, value});
     scaled = scale_to_exp_s128(wide, -6'sd16, dst_scale);
     return sat_s8(scaled);
   endfunction
 
-  // Stage B: byte assembly from the registered indices, reusing the
-  // original requant functions.
+  // Stage B selects the source values using the registered decode. The
+  // 33-bit sum is exact for signed int32 accumulator + signed int32 bias.
+  always_comb begin
+    for (int j = 0; j < 8; j++) begin
+      wb_sum_c[j] = 33'sd0;
+      wb_gelu_c[j] = 24'sd0;
+      wb_plan_c[j] = 17'd0;
+      if (wb_hit_r[j]) begin
+        case (wb_kind_r[j])
+          2'd0, 2'd2: begin
+            wb_sum_c[j] =
+              $signed({bank_accum[int'(wb_b)][int'(wb_r)][int'(wb_c_r[j])][31],
+                       bank_accum[int'(wb_b)][int'(wb_r)][int'(wb_c_r[j])]}) +
+              (bias_en
+                ? $signed({bias_all[8*int'(wb_b) + int'(wb_c_r[j])][31],
+                           bias_all[8*int'(wb_b) + int'(wb_c_r[j])]})
+                : 33'sd0);
+          end
+          2'd1: begin
+            wb_gelu_c[j] = gelu_buf[int'(wb_b)][int'(wb_r)][int'(wb_c_r[j])];
+          end
+          default: begin
+            wb_plan_c[j] = plan_buf[int'(wb_b)][int'(wb_r)][int'(wb_c_r[j])];
+          end
+        endcase
+      end
+    end
+  end
+
+  // Stage C scales and packs only registered, locally placed values.
   always_comb begin
     logic [7:0]  strb;
     logic [63:0] data;
@@ -715,24 +756,24 @@ module heatvit_gemm_engine
     for (int j = 0; j < 8; j++) begin
       heatvit_s8_t  byte_value;
       heatvit_s32_t word_value;
-      if (wb_hit_r[j]) begin
+      if (wb_value_hit_r[j]) begin
         strb[j] = 1'b1;
-        case (wb_kind_r[j])
+        case (wb_value_kind_r[j])
           2'd0: begin
-            byte_value = gemm_out8(int'(wb_b), int'(wb_r), int'(wb_c_r[j]));
+            byte_value = gemm_out8_from_sum(wb_sum_r[j]);
             data[8*j +: 8] = byte_value;
           end
           2'd1: begin
-            byte_value = gelu_out8(int'(wb_b), int'(wb_r), int'(wb_c_r[j]));
+            byte_value = gelu_out8_from_value(wb_gelu_r[j]);
             data[8*j +: 8] = byte_value;
           end
           2'd2: begin
-            word_value = gemm_out32(int'(wb_b), int'(wb_r), int'(wb_c_r[j]));
-            data[8*j +: 8] = word_value[8*wb_lane_r[j] +: 8];
+            word_value = gemm_out32_from_sum(wb_sum_r[j]);
+            data[8*j +: 8] = word_value[8*wb_value_lane_r[j] +: 8];
           end
           default: begin
-            word_value = {15'd0, plan_buf[int'(wb_b)][int'(wb_r)][int'(wb_c_r[j])]};
-            data[8*j +: 8] = word_value[8*wb_lane_r[j] +: 8];
+            word_value = {15'd0, wb_plan_r[j]};
+            data[8*j +: 8] = word_value[8*wb_value_lane_r[j] +: 8];
           end
         endcase
       end
@@ -809,8 +850,8 @@ module heatvit_gemm_engine
       wb_ram_waddr_r <= 3'd0;
       wb_ram_wdata_r <= 72'd0;
     end else begin
-      wb_ram_we_r    <= (state == S_WB_COMPOSE) && wb_comp_valid_r;
-      wb_ram_waddr_r <= wb_comp_idx_r;
+      wb_ram_we_r    <= (state == S_WB_COMPOSE) && wb_value_valid_r;
+      wb_ram_waddr_r <= wb_value_idx_r;
       wb_ram_wdata_r <= wb_ram_wdata;
     end
   end
@@ -852,11 +893,19 @@ module heatvit_gemm_engine
         wb_c_r[j]    <= 5'd0;
         wb_lane_r[j] <= 2'd0;
         wb_kind_r[j] <= 2'd0;
+        wb_value_lane_r[j] <= 2'd0;
+        wb_value_kind_r[j] <= 2'd0;
+        wb_sum_r[j]  <= 33'sd0;
+        wb_gelu_r[j] <= 24'sd0;
+        wb_plan_r[j] <= 17'd0;
       end
       wb_comp_valid_r  <= 1'b0;
       wb_comp_idx_r    <= 3'd0;
+      wb_value_hit_r   <= 8'd0;
+      wb_value_valid_r <= 1'b0;
+      wb_value_idx_r   <= 3'd0;
       wb_valid_r       <= 1'b0;
-      wb_exit_d        <= 1'b0;
+      wb_exit_pipe     <= 2'b00;
       wb_rd            <= 3'd0;
       wb_guard_phase   <= 1'b0;
       ld_guard_phase   <= 1'b0;
@@ -1331,17 +1380,19 @@ module heatvit_gemm_engine
 
         S_WB_REQ: begin
           if (req_valid && req_ready) begin
-            wb_bi <= 3'd0;
-            state <= S_WB_COMPOSE;
+            wb_bi            <= 3'd0;
+            wb_comp_valid_r  <= 1'b0;
+            wb_value_valid_r <= 1'b0;
+            wb_exit_pipe     <= 2'b00;
+            state            <= S_WB_COMPOSE;
           end
         end
 
-        // Compose the burst into the staging RAM: two registered stages
-        // (stage A raw select, stage B scale/pack) at one beat per cycle.
-        // The RAM write port itself is registered, so the last beat's write
-        // lands one edge after its stage-B value is captured; the exit is
-        // therefore armed first (wb_exit_d) and the state leaves one cycle
-        // later, keeping the final RAM write ahead of the first stream read.
+        // Compose the burst into the staging RAM at one beat per cycle:
+        // A decodes byte positions, B selects and registers source values,
+        // C requants/packs, and the registered RAM port captures the result.
+        // wb_exit_pipe drains B/C/write before the synchronous RAM read is
+        // exposed to the memory master.
         S_WB_COMPOSE: begin
           wb_comp_valid_r <= (wb_bi <= wb_last_idx);
           wb_comp_idx_r   <= wb_bi;
@@ -1350,16 +1401,28 @@ module heatvit_gemm_engine
             wb_c_r[j]    <= wb_c_a[j];
             wb_lane_r[j] <= wb_lane_a[j];
             wb_kind_r[j] <= wb_kind_a[j];
+            wb_value_lane_r[j] <= wb_lane_r[j];
+            wb_value_kind_r[j] <= wb_kind_r[j];
+            wb_sum_r[j]  <= wb_sum_c[j];
+            wb_gelu_r[j] <= wb_gelu_c[j];
+            wb_plan_r[j] <= wb_plan_c[j];
           end
+          wb_value_valid_r <= wb_comp_valid_r;
+          wb_value_idx_r   <= wb_comp_idx_r;
+          wb_value_hit_r   <= wb_hit_r;
           if (wb_comp_valid_r && (wb_comp_idx_r == wb_last_idx)) begin
-            wb_exit_d        <= 1'b1;
+            wb_exit_pipe     <= 2'b01;
             wb_comp_valid_r  <= 1'b0;
             wb_bi            <= 3'd0;
-          end else if (wb_exit_d) begin
-            wb_exit_d        <= 1'b0;
+          end else if (wb_exit_pipe[0]) begin
+            wb_exit_pipe     <= 2'b10;
+            wb_comp_valid_r  <= 1'b0;
+          end else if (wb_exit_pipe[1]) begin
+            wb_exit_pipe     <= 2'b00;
             wb_rd            <= 3'd0;
             wb_valid_r       <= 1'b0;
             wb_comp_valid_r  <= 1'b0;
+            wb_value_valid_r <= 1'b0;
             state            <= S_WB_BEAT;
             wb_bi            <= 3'd0;
           end else if (wb_bi == wb_last_idx || wb_bi == 3'd7) begin
