@@ -38,3 +38,6 @@ tmp/
 
 # XSim compiled library (workspace root)
 xil_defaultlib/
+
+# Local isolated development worktrees
+.worktrees/
