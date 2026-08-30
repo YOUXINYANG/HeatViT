@@ -68,6 +68,7 @@ module heatvit_layout_engine
     S_WR_BEAT,
     S_ELEM,
     S_ELEM_DRAIN,
+    S_ELEM_DRAIN2,
     S_DONE
   } state_t;
 
@@ -541,6 +542,15 @@ module heatvit_layout_engine
         end
 
         S_ELEM_DRAIN: begin
+          // P7-5: the residual now has a two-stage pipeline, so its last
+          // output trails the last presented element by one extra cycle.
+          // The drain keeps out_ready asserted for two cycles so the
+          // trailing output is consumed before the write burst starts.
+          res_out_ready <= 1'b1;
+          state <= S_ELEM_DRAIN2;
+        end
+
+        S_ELEM_DRAIN2: begin
           res_out_ready <= 1'b1;
           wr_addr <= dst_r + {8'd0, token} * 16'd192;
           wr_len  <= 16'd192;

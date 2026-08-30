@@ -139,8 +139,9 @@ module tb_layernorm;
       out_ready = lfsr[0];
       if (out_valid && out_ready) begin
         if (out_data !== exp_out[got]) begin
-          $display("layernorm beat[%0d] mismatch: got=%0d expected=%0d",
-                   got, out_data, exp_out[got]);
+          $display("layernorm beat[%0d] mismatch: got=%0d expected=%0d scales x=%0d g=%0d b=%0d o=%0d",
+                   got, out_data, exp_out[got], cfg_x_scale, cfg_gamma_scale,
+                   cfg_beta_scale, cfg_out_scale);
           tb_fatal("layernorm output mismatch");
         end
         got++;

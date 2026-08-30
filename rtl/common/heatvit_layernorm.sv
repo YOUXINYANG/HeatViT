@@ -168,7 +168,19 @@ module heatvit_layernorm
   heatvit_s8_t     gamma3_r;
   heatvit_s8_t     beta3_r;
 
-  heatvit_s8_t     out_byte_r;       // stage3 output register
+  // P7-5: stage 3 split into 3a/3b/3c.
+  logic             s4_valid_r;
+  logic signed [31:0] product_r;     // stage3a -> stage3b
+  logic signed [6:0]  common_exp4_r;
+  logic [6:0]         shift_a_r;
+  logic [6:0]         shift_b_r;
+  heatvit_s8_t        beta4_r;
+
+  logic             s5_valid_r;
+  logic signed [95:0] sum_align_r;   // stage3b -> stage3c
+  logic signed [7:0]  final_shift_r;
+
+  heatvit_s8_t     out_byte_r;       // stage3c output register
   logic [7:0]      out_count_r;
 
   assign out_data = out_byte_r;
@@ -202,23 +214,42 @@ module heatvit_layernorm
   end
 
   // Stage 3 combinational: gamma/beta affine with scale alignment.
+  // P7-5: the original single-cycle version ran the DSP product, two
+  // 96-bit variable shifts and the final shift/round in one cone
+  // (79 levels, CARRY4=62 + DSP).  It is now split into three register
+  // stages with identical arithmetic:
+  //   3a: product = norm_q16 * gamma (DSP) + align shift amounts
+  //   3b: sum = (product << s_a) + (beta << s_b) on 96 bits
+  //   3c: final shift/round on 96 bits + sat8
   logic signed [31:0] product_w;
-  logic signed [95:0] sum_align_w;
-  logic signed [95:0] final_w;
-  int  common_exp_w;
-  int  final_shift_w;
-  heatvit_s8_t out_byte_w;
+  logic signed [6:0]  common_exp_w;
+  logic [6:0]         shift_a_w;
+  logic [6:0]         shift_b_w;
   always_comb begin
     product_w = $signed(norm_q16_r) * $signed(gamma3_r);
     common_exp_w = ((int'(gamma_scale_r) - 16) < int'(beta_scale_r))
                      ? (int'(gamma_scale_r) - 16) : int'(beta_scale_r);
-    sum_align_w = ($signed(96'(product_w)) <<< (int'(gamma_scale_r) - 16 - common_exp_w))
-                + ($signed(96'($signed(beta3_r))) <<< (int'(beta_scale_r) - common_exp_w));
-    final_shift_w = common_exp_w - int'(out_scale_r);
-    if (final_shift_w >= 0)
-      final_w = sum_align_w <<< final_shift_w;
+    // Shifts in [0..79]: beta_scale - common reaches 79 when beta_scale is
+    // +31 and gamma_scale - 16 is -48, so both need 7 bits.
+    shift_a_w = 7'(int'(gamma_scale_r) - 16 - common_exp_w);
+    shift_b_w = 7'(int'(beta_scale_r) - common_exp_w);
+  end
+
+  logic signed [95:0] sum_align_w;
+  logic signed [7:0]  final_shift_w;
+  always_comb begin
+    sum_align_w = ($signed(96'(product_r)) <<< shift_a_r)
+                + ($signed(96'($signed(beta4_r))) <<< shift_b_r);
+    final_shift_w = 8'(common_exp4_r - int'(out_scale_r));
+  end
+
+  logic signed [95:0] final_w;
+  heatvit_s8_t out_byte_w;
+  always_comb begin
+    if (final_shift_r >= 0)
+      final_w = sum_align_r <<< final_shift_r;
     else
-      final_w = round_shift_away_96(sum_align_w, -final_shift_w);
+      final_w = round_shift_away_96(sum_align_r, -final_shift_r);
     out_byte_w = sat_s8(heatvit_s128_t'(final_w));
   end
 
@@ -275,6 +306,15 @@ module heatvit_layernorm
       norm_q16_r       <= 24'sd0;
       gamma3_r         <= 8'sd0;
       beta3_r          <= 8'sd0;
+      s4_valid_r       <= 1'b0;
+      product_r        <= 32'sd0;
+      common_exp4_r    <= 7'sd0;
+      shift_a_r        <= 7'd0;
+      shift_b_r        <= 7'd0;
+      beta4_r          <= 8'sd0;
+      s5_valid_r       <= 1'b0;
+      sum_align_r      <= 96'sd0;
+      final_shift_r    <= 8'sd0;
       out_valid        <= 1'b0;
       out_byte_r       <= 8'sd0;
       out_count_r      <= 8'd0;
@@ -374,13 +414,15 @@ module heatvit_layernorm
             s1_valid_r    <= 1'b0;
             s2_valid_r    <= 1'b0;
             s3_valid_r    <= 1'b0;
+            s4_valid_r    <= 1'b0;
+            s5_valid_r    <= 1'b0;
             out_count_r   <= 8'd0;
             state         <= S_NORMALIZE;
           end
         end
         S_NORMALIZE: begin
           // Stage 0 loads channels idx=0..191; the pipeline then flushes.
-          // out_valid is the stage-3 slot's valid flag; it holds during an
+          // out_valid is the stage-3c slot's valid flag; it holds during an
           // output stall and clears on the final accepted beat.
           if (out_accept && out_count_r == 8'd191) begin
             out_valid <= 1'b0;
@@ -400,7 +442,16 @@ module heatvit_layernorm
               norm_q16_r <= norm_q16_w;
               gamma3_r   <= gamma2_r;
               beta3_r    <= beta2_r;
-              out_valid  <= s3_valid_r;
+              s4_valid_r    <= s3_valid_r;
+              product_r     <= product_w;
+              common_exp4_r <= common_exp_w;
+              shift_a_r     <= shift_a_w;
+              shift_b_r     <= shift_b_w;
+              beta4_r       <= beta3_r;
+              s5_valid_r    <= s4_valid_r;
+              sum_align_r   <= sum_align_w;
+              final_shift_r <= final_shift_w;
+              out_valid  <= s5_valid_r;
               out_byte_r <= out_byte_w;
             end
             if (out_accept) out_count_r <= out_count_r + 8'd1;

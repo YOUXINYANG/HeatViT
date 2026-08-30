@@ -102,6 +102,12 @@ module heatvit_tensor_executor
   logic        dyn_param_ok;
   logic        token_range_ok;
   logic [7:0]  v_error;
+  // P7-5: S_CHECK settles the deep validation cone into registers before
+  // the state decision, so the child start pulses and the child-register
+  // clock enables (which used to fan out from v_error / the guards) are
+  // register-driven.
+  logic [7:0]  v_error_r;
+  logic        s_check_phase;
 
   logic [63:0] src0_abs64;
   logic [63:0] src1_abs64;
@@ -1106,23 +1112,26 @@ module heatvit_tensor_executor
     endcase
   end
 
-  // Child start/command pulses.
-  assign lay_start = (state == S_CHECK) && (v_error == ERR_NONE) &&
-                     (child_sel_c == CHILD_LAYOUT);
-  assign vec_start = (state == S_CHECK) && (v_error == ERR_NONE) &&
-                     (child_sel_c == CHILD_VECTOR);
-  assign red_start = (state == S_CHECK) && (v_error == ERR_NONE) &&
-                     (child_sel_c == CHILD_REDUCE);
-  assign con_start = (state == S_CHECK) && (v_error == ERR_NONE) &&
-                     (child_sel_c == CHILD_CONCAT);
-  assign hf_start = (state == S_CHECK) && (v_error == ERR_NONE) &&
-                    (child_sel_c == CHILD_HEAD_FUSE);
-  assign fin_start = (state == S_CHECK) && (v_error == ERR_NONE) &&
-                     (child_sel_c == CHILD_SELECTOR_FINALIZE);
-  assign ss_start = (state == S_CHECK) && (v_error == ERR_NONE) &&
-                    (child_sel_c == CHILD_SELECTOR_SOFTMAX);
-  assign gemm_cmd_valid = (state == S_CHECK) && (v_error == ERR_NONE) &&
-                          (child_sel_c == CHILD_GEMM);
+  // Child start/command pulses (P7-5: driven from the registered S_CHECK
+  // phase and v_error_r, so no guard/validation cone reaches the children).
+  assign lay_start = (state == S_CHECK) && s_check_phase &&
+                     (v_error_r == ERR_NONE) && (child_sel == CHILD_LAYOUT);
+  assign vec_start = (state == S_CHECK) && s_check_phase &&
+                     (v_error_r == ERR_NONE) && (child_sel == CHILD_VECTOR);
+  assign red_start = (state == S_CHECK) && s_check_phase &&
+                     (v_error_r == ERR_NONE) && (child_sel == CHILD_REDUCE);
+  assign con_start = (state == S_CHECK) && s_check_phase &&
+                     (v_error_r == ERR_NONE) && (child_sel == CHILD_CONCAT);
+  assign hf_start = (state == S_CHECK) && s_check_phase &&
+                    (v_error_r == ERR_NONE) && (child_sel == CHILD_HEAD_FUSE);
+  assign fin_start = (state == S_CHECK) && s_check_phase &&
+                     (v_error_r == ERR_NONE) &&
+                     (child_sel == CHILD_SELECTOR_FINALIZE);
+  assign ss_start = (state == S_CHECK) && s_check_phase &&
+                    (v_error_r == ERR_NONE) &&
+                    (child_sel == CHILD_SELECTOR_SOFTMAX);
+  assign gemm_cmd_valid = (state == S_CHECK) && s_check_phase &&
+                          (v_error_r == ERR_NONE) && (child_sel == CHILD_GEMM);
 
   // Reduce axis from the descriptor: 0 candidate axis, 1 head-lane axis.
   assign red_axis = (desc_reg.param0[3:2] == REDUCE_AXIS_HEAD_LANES);
@@ -1284,6 +1293,8 @@ module heatvit_tensor_executor
     if (!rst_n) begin
       state      <= S_IDLE;
       child_sel  <= CHILD_NONE;
+      v_error_r  <= 8'd0;
+      s_check_phase <= 1'b0;
       busy       <= 1'b0;
       done       <= 1'b0;
       error_valid <= 1'b0;
@@ -1320,12 +1331,15 @@ module heatvit_tensor_executor
         end
 
         S_CHECK: begin
-          if (v_error != ERR_NONE) begin
-            error_code  <= v_error;
-            error_valid <= 1'b1;
-            busy        <= 1'b0;
-            state       <= S_IDLE;
-          end else begin
+          if (!s_check_phase) begin
+            // P7-5: phase 0 registers the validation result and decodes the
+            // child selector unconditionally.  The deep desc_reg -> guards
+            // -> v_error cone ends at v_error_r; the children are started
+            // one phase later from registered values only.  On the error
+            // path the decoded selector is never consumed (the next
+            // descriptor reloads it).
+            s_check_phase <= 1'b1;
+            v_error_r     <= v_error;
             case (desc_reg.opcode)
               OP_GEMM:          child_sel <= CHILD_GEMM;
               OP_PATCHIFY,
@@ -1342,7 +1356,19 @@ module heatvit_tensor_executor
               OP_SELECTOR_SOFTMAX:  child_sel <= CHILD_SELECTOR_SOFTMAX;
               default:          child_sel <= CHILD_NONE;
             endcase
-            state <= S_RUN;
+          end else begin
+            // Phase 1: decide from the registered validation result.  The
+            // child start pulses (lay_start/vec_start/... and
+            // gemm_cmd_valid) assert during this phase.
+            s_check_phase <= 1'b0;
+            if (v_error_r != ERR_NONE) begin
+              error_code  <= v_error_r;
+              error_valid <= 1'b1;
+              busy        <= 1'b0;
+              state       <= S_IDLE;
+            end else begin
+              state <= S_RUN;
+            end
           end
         end
 

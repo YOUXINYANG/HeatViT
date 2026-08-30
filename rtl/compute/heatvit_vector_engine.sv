@@ -81,7 +81,7 @@ module heatvit_vector_engine
   input  logic        req_r_last
 );
 
-  typedef enum logic [3:0] {
+  typedef enum logic [4:0] {
     S_IDLE,
     S_PLAN,
     S_RD_REQ,
@@ -91,6 +91,7 @@ module heatvit_vector_engine
     S_LN_OUT,
     S_ELEM,
     S_ELEM_DRAIN,
+    S_ELEM_DRAIN2,
     S_SM_PREP,
     S_SM_START,
     S_SM_IN,
@@ -735,6 +736,15 @@ module heatvit_vector_engine
         end
 
         S_ELEM_DRAIN: begin
+          // P7-5: the residual now has a two-stage pipeline, so its last
+          // output trails the last presented element by one extra cycle.
+          // The drain keeps out_ready asserted for two cycles so the
+          // trailing output is consumed before the write burst starts.
+          res_out_ready <= 1'b1;
+          state <= S_ELEM_DRAIN2;
+        end
+
+        S_ELEM_DRAIN2: begin
           res_out_ready <= 1'b1;
           wr_addr <= dst_r + {8'd0, token} * 16'd192;
           wr_len  <= 16'd192;

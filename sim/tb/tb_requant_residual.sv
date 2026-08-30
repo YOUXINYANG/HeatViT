@@ -89,7 +89,8 @@ module tb_requant_residual;
     res_aux_scale   = aux_scale;
     res_out_scale   = out_scale;
     res_out_ready   = 1'b1;
-    @(posedge clk);
+    @(posedge clk);  // fire: stage 1 latches the pair
+    @(posedge clk);  // stage 2 presents the result (P7-5 two-stage pipeline)
     #1;
     if (!res_out_valid) tb_fatal("residual: missing out_valid");
     if (res_out_value !== expected) begin
@@ -98,7 +99,8 @@ module tb_requant_residual;
     end
     res_main_valid = 1'b0;
     res_aux_valid  = 1'b0;
-    @(posedge clk);
+    @(posedge clk);  // trailing re-presentation (out_ready still asserted)
+    @(posedge clk);  // consumed -> out_valid clears
     #1;
   endtask
 
