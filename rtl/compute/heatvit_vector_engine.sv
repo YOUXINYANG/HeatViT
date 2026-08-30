@@ -180,6 +180,34 @@ module heatvit_vector_engine
 
   heatvit_q8_16_t srow [0:MAX_ROW-1];
 
+  // P7-5: srow writes use a registered one-hot enable.  The combinational
+  // sp_i decode fanning out to 197 scattered write enables used to be the
+  // full-chip worst path; the decode now ends in sp_we_r registers, and
+  // the per-row write enable is a register bit.
+  logic [MAX_ROW-1:0] sp_onehot;
+  logic [MAX_ROW-1:0] sp_we_r;
+  heatvit_q8_16_t     srow_wdata_r;
+  always_comb begin
+    sp_onehot = '0;
+    if (sp_i < MAX_ROW) sp_onehot[sp_i] = 1'b1;
+  end
+  // Byte-window extract for the current score write (shared by the
+  // S_SM_PREP stage and the registered capture).
+  logic [127:0] win_c;
+  logic [31:0]  w32_c;
+  always_comb begin
+    logic [10:0] r_cur;
+    logic [10:0] b0, b1, b2, b3;
+    win_c = {rdata_s, prev_word};
+    r_cur = (({8'd0, rd_e} + {sp_i, 2'b00} + 11'd3) >> 3);
+    b0    = {8'd0, rd_e} + {sp_i, 2'b00} + 11'd8 - {r_cur, 3'b000};
+    b1    = b0 + 11'd1;
+    b2    = b0 + 11'd2;
+    b3    = b0 + 11'd3;
+    w32_c = {win_c[8*b3 +: 8], win_c[8*b2 +: 8],
+             win_c[8*b1 +: 8], win_c[8*b0 +: 8]};
+  end
+
   // LayerNorm unit.
   logic        ln_cfg_valid;
   logic        ln_cfg_ready;
@@ -459,6 +487,8 @@ module heatvit_vector_engine
       res_main_valid <= 1'b0;
       res_aux_valid  <= 1'b0;
       res_out_ready  <= 1'b0;
+      sp_we_r        <= '0;
+      srow_wdata_r   <= 24'sd0;
     end else begin
       done        <= 1'b0;
       error_valid <= 1'b0;
@@ -472,6 +502,17 @@ module heatvit_vector_engine
       res_main_valid <= 1'b0;
       res_aux_valid  <= 1'b0;
       res_out_ready  <= 1'b0;
+
+      // P7-5: registered one-hot srow write.  The score is captured with
+      // its decode in the S_SM_PREP write cycle and lands in the srow
+      // array one cycle later, so the write enable at each register is a
+      // register bit (no combinational sp_i decode fanout).
+      for (int r = 0; r < MAX_ROW; r++) begin
+        if (sp_we_r[r]) srow[r] <= srow_wdata_r;
+      end
+      sp_we_r <= (state == S_SM_PREP && prime_r == 2'd0) ? sp_onehot : '0;
+      if (state == S_SM_PREP && prime_r == 2'd0)
+        srow_wdata_r <= score_q16($signed(w32_c));
 
       if (start) begin
         // Unconditional restart, also recovering an aborted child.
@@ -633,21 +674,9 @@ module heatvit_vector_engine
                          : (({8'd0, rd_e} + 11'd7) >> 3);
             prime_r   <= prime_r - 2'd1;
           end else begin
-            begin
-              logic [127:0] win;
-              logic [10:0]  r_cur;
-              logic [10:0]  b0, b1, b2, b3;
-              logic [31:0]  w32;
-              win   = {rdata_s, prev_word};
-              r_cur = (({8'd0, rd_e} + {sp_i, 2'b00} + 11'd3) >> 3);
-              b0    = {8'd0, rd_e} + {sp_i, 2'b00} + 11'd8 - {r_cur, 3'b000};
-              b1    = b0 + 11'd1;
-              b2    = b0 + 11'd2;
-              b3    = b0 + 11'd3;
-              w32   = {win[8*b3 +: 8], win[8*b2 +: 8],
-                       win[8*b1 +: 8], win[8*b0 +: 8]};
-              srow[sp_i] <= score_q16($signed(w32));
-            end
+            // P7-5: the score write is captured (one-hot enable + value)
+            // and lands in srow one cycle later via the registered
+            // write-enable loop at the top of this always_ff block.
             prev_word <= rdata_s;
             // Two-cycle lookahead: raddr_{k+2}, so that rdata_s during
             // write cycle k+1 already holds word(raddr_{k+1}).

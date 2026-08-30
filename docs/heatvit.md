@@ -5319,6 +5319,19 @@ gemm 套件全 12 场景 + tb_ffn/tb_mhsa + 全量回归全绿（见文末机器
 −4.185 ns / 3,975 端点）；最差路径变为 a_unsigned_reg → MAC 累加器 D 的
 7 级 90% 路由路径（OOC 布局产物）。
 
+**全片 100 MHz 首跑与第二波修复**：GEMM 收敛后全片 route 后 WNS −5.018 ns
+（21,793 违例端点），聚合出三个新家族并逐一修复（逐位等价改写）：
+
+| 家族 | 端点 | 典型违例 | 修复 |
+| --- | ---: | ---: | --- |
+| u_residual 重定标（layout/vector 两实例） | 30 | −5.00 ns（111 级，CARRY4×93） | 两级流水：级 1 对齐求和（|value|≤128 → 72 位精确），级 2 尺度变换（diff ∈ [−63..62]：72/73 位舍入锥、k≥8 直接符号饱和、k≤7 79 位左移锥）。输出延迟 +1，两引擎 S_ELEM 排水改为两拍（消化尾部再呈现） |
+| u_ln stage-3 仿射 | 8 | −5.02 ns（79 级，CARRY4×62+DSP） | 拆 3a/3b/3c：DSP 积 → 96 位对齐求和 → 终移/舍入+饱和。踩坑：beta 对齐移可达 79（beta=+31、gamma−16=−48），移量容器须 7 位（6 位截断 → tb_layernorm 首字节 0/127 定位） |
+| scheduler n_r → 子模块 CE | 362 | −4.53 ns（32 级 + DSP，扇出 279 acc + 83 srow） | executor S_CHECK 双相决策：v_error 深锥寄存 v_error_r，child_sel 无条件解码，子模块 start 脉冲全部改读寄存器（n_r → desc[m] → 守卫 → v_error → CE 的组合链在 start 处截断） |
+
+**验证**：tb_requant_residual（改两级握手）、tb_layernorm、tb_ln_p5_stale、
+tb_ffn、tb_mhsa、tb_transformer_block（block13 回压）、tb_heatvit_errors
+全部 TEST_PASS；全量回归见文末机器可读结果。
+
 **全片实现与 100 MHz 收敛（`create_clock -period 10.000`，重跑综合+实现）**：
 
 | 阶段 | 结果 |

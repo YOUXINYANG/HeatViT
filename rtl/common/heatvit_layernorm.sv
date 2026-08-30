@@ -61,6 +61,7 @@ module heatvit_layernorm
   localparam logic [3:0] S_SQRT       = 4'd4;
   localparam logic [3:0] S_RECIP      = 4'd5;
   localparam logic [3:0] S_NORMALIZE  = 4'd6;
+  localparam logic [3:0] S_VARIANCE2  = 4'd7;
   localparam logic [3:0] S_DONE       = 4'd8;
 
   localparam int D = 192;
@@ -139,6 +140,18 @@ module heatvit_layernorm
 
   assign mean_wide          = $signed({{80 {mean_q32_r[47]}}, mean_q32_r});
   assign mean_square_w      = round_shift_away_s128(mean_wide * mean_wide, 7'd32);
+  // P7-5: the variance cone (128-bit mean^2 multiply + round + subtract +
+  // clamp + epsilon add) is split into two register stages: the multiply
+  // round lands in mean_square_r, the subtract/clamp/add lands in the
+  // isqrt radicand register one cycle later.
+  logic signed [47:0] mean_square_r;
+  logic signed [47:0] variance_w2;
+  logic               variance_negative2;
+  logic [47:0]        radicand_w2;
+  assign variance_w2         = heatvit_s48_t'(e2_q32_r) - mean_square_r;
+  assign variance_negative2  = (variance_w2 < 0);
+  assign radicand_w2         = (variance_negative2 ? 48'd0 : variance_w2[47:0])
+                               + 48'd4295;
   assign variance_w         = heatvit_s128_t'(e2_q32_r) - mean_square_w;
   assign variance_negative  = (variance_w < 0);
   assign variance_clamped   = variance_negative ? 48'd0 : variance_w[47:0];
@@ -283,6 +296,7 @@ module heatvit_layernorm
       sum_x_r          <= 128'sd0;
       sum_square_r     <= 64'd0;
       mean_q32_r       <= 48'sd0;
+      mean_square_r    <= 48'sd0;
       e2_q32_r         <= 48'd0;
       variance_q32_r   <= 48'd0;
       std_q16_r        <= 24'd0;
@@ -386,9 +400,15 @@ module heatvit_layernorm
           end
         end
         S_VARIANCE: begin
-          variance_q32_r <= variance_clamped;
-          if (variance_negative) warn_negative_variance <= 1'b1;
-          isqrt_radicand <= variance_clamped + 48'd4295;
+          // P7-5 stage 1 of the variance cone: register the mean^2 round.
+          mean_square_r <= mean_square_w[47:0];
+          state         <= S_VARIANCE2;
+        end
+        S_VARIANCE2: begin
+          // P7-5 stage 2: subtract / clamp / epsilon-add from registers.
+          variance_q32_r <= variance_negative2 ? 48'd0 : variance_w2[47:0];
+          if (variance_negative2) warn_negative_variance <= 1'b1;
+          isqrt_radicand <= radicand_w2;
           isqrt_start    <= 1'b1;
           state          <= S_SQRT;
         end
