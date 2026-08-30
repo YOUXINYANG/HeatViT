@@ -958,7 +958,7 @@ module heatvit_gemm_engine
   //   diff == 0 -> sat8(value)
   //   diff >  0: round-away by diff (d == diff since diff <= 47 < 64):
   //       d >= 25 -> 0; d == 24 -> -1 iff value == -2^23;
-  //       d <= 23 -> 24-bit cone (|value|+2^(d-1) < 2^24).
+  //       d <= 23 -> 25-bit cone (|value|+2^(d-1) < 2^24).
   //   diff <  0: k = -diff in [1..16]; value<<k then sat8.
   //       k >= 8  -> sign-saturates (|value| >= 1 -> >= 256)
   //       k <= 7  -> 40-bit cone (23+7 = 30 < 40, exact)
@@ -967,8 +967,8 @@ module heatvit_gemm_engine
   );
     int diff;
     logic [5:0] d;
-    logic [23:0] mag;
-    logic [23:0] rounded;
+    logic [24:0] mag_u;
+    logic [24:0] rounded;
     diff = int'(dst_scale) + 16;
     if (diff == 0) begin
       return sat_s8_from_s24(value);
@@ -979,13 +979,14 @@ module heatvit_gemm_engine
       end else if (d == 6'd24) begin
         return (value == 24'sh800000) ? -8'sd1 : 8'sd0;
       end else begin
-        mag = (value < 24'sd0) ? (24'h800000 - {1'b0, value}) : {1'b0, value};
-        rounded = (mag + (24'd1 << (d - 6'd1))) >> d;
+        mag_u = (value < 24'sd0) ? (25'h1000000 - {1'b0, value})
+                                : {1'b0, value};
+        rounded = (mag_u + (25'd1 << (d - 6'd1))) >> d;
         if (value < 24'sd0) begin
-          return (rounded > 24'd128) ? -8'sd128 :
+          return (rounded > 25'd128) ? -8'sd128 :
                  (8'sd0 - heatvit_s8_t'(rounded[7:0]));
         end else begin
-          return (rounded > 24'd127) ? 8'sd127 : heatvit_s8_t'(rounded[7:0]);
+          return (rounded > 25'd127) ? 8'sd127 : heatvit_s8_t'(rounded[7:0]);
         end
       end
     end else begin
