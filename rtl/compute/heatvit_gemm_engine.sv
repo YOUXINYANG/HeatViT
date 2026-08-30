@@ -64,6 +64,7 @@ module heatvit_gemm_engine
     S_GELU_SETTLE,
     S_GELU_NEXT,
     S_GELU_DRAIN,
+    S_PLAN_SETTLE,
     S_PLAN_NEXT,
     S_PLAN_WAIT,
     S_WB_NEXT,
@@ -188,6 +189,12 @@ module heatvit_gemm_engine
   logic [1:0]  cb;
   logic [2:0]  cr;
   logic [2:0]  cc;
+  // Activation input pipeline.  The dynamic bank/row/column selection ends
+  // at these registers; bias addition, scale conversion and saturation run
+  // in the following stage before the GELU/PLAN unit samples the value.
+  heatvit_s32_t act_acc_r;
+  heatvit_s32_t act_bias_r;
+  logic         act_fetch_valid_r;
 
   // Tile buffer interface.
   logic [12:0]  tb_fill_addr;
@@ -253,10 +260,9 @@ module heatvit_gemm_engine
   logic        gelu_done;
   heatvit_q8_16_t gelu_in;
   heatvit_q8_16_t gelu_out;
-  // Pipelined GELU: lanes are fed back-to-back while the (gb,gr,gc)
-  // pointer advances in the same cycle, so the fed value must be
-  // latched one cycle ahead of the module's stage-0 sample.
-  heatvit_q8_16_t gelu_x_latched;
+  // Shared registered Q8.16 input.  GELU lanes are fed back-to-back while
+  // PLAN consumes the same pipeline serially.
+  heatvit_q8_16_t act_q16_r;
 
   heatvit_gelu u_gelu (
     .clk    (clk),
@@ -285,11 +291,14 @@ module heatvit_gemm_engine
     .y_out  (plan_out)
   );
 
-  function automatic heatvit_q8_16_t acc_q16(input int b, input int r, input int c);
+  function automatic heatvit_q8_16_t activation_q16(
+    input heatvit_s32_t accum_value,
+    input heatvit_s32_t bias_value
+  );
     heatvit_s128_t wide;
     heatvit_s128_t scaled;
-    wide = $signed({{96{bank_accum[b][r][c][31]}}, bank_accum[b][r][c]}) +
-           (bias_en ? $signed({{96{bias_all[8*b + c][31]}}, bias_all[8*b + c]}) : 128'sd0);
+    wide = $signed({{96{accum_value[31]}}, accum_value}) +
+           (bias_en ? $signed({{96{bias_value[31]}}, bias_value}) : 128'sd0);
     scaled = scale_to_exp_s128(wide, src0_scale + src1_scale, -6'sd16);
     if (scaled > 128'sd8388607) return 24'sd8388607;
     if (scaled < -128'sd8388608) return -24'sd8388608;
@@ -297,8 +306,8 @@ module heatvit_gemm_engine
   endfunction
 
   always_comb begin
-    gelu_in = gelu_x_latched;
-    plan_in = acc_q16(int'(gb), int'(gr), int'(gc));
+    gelu_in = act_q16_r;
+    plan_in = act_q16_r;
   end
 
   // Single-outstanding memory master.
@@ -884,8 +893,11 @@ module heatvit_gemm_engine
       cb               <= 2'd0;
       cr               <= 3'd0;
       cc               <= 3'd0;
+      act_acc_r        <= 32'sd0;
+      act_bias_r       <= 32'sd0;
+      act_fetch_valid_r <= 1'b0;
       gelu_start       <= 1'b0;
-      gelu_x_latched   <= 24'sd0;
+      act_q16_r        <= 24'sd0;
       plan_start       <= 1'b0;
       req_r_ready_r    <= 1'b0;
       wb_hit_r         <= 8'd0;
@@ -926,8 +938,15 @@ module heatvit_gemm_engine
       error_valid <= 1'b0;
       clear_accum <= 1'b0;
       accum_valid <= 1'b0;
-      gelu_start   <= 1'b0;
-      plan_start   <= 1'b0;
+      // Convert the raw value selected on the preceding cycle.  start and
+      // x_in are registered together, then sampled by the activation unit on
+      // the next edge under normal nonblocking-assignment semantics.
+      gelu_start <= act_fetch_valid_r && (post_op == POST_GELU);
+      plan_start <= act_fetch_valid_r && (post_op == POST_PLAN);
+      if (act_fetch_valid_r) begin
+        act_q16_r <= activation_q16(act_acc_r, act_bias_r);
+      end
+      act_fetch_valid_r <= 1'b0;
       req_r_ready_r <= 1'b0;
 
       if (mm_perr && state != S_IDLE) begin
@@ -1191,7 +1210,9 @@ module heatvit_gemm_engine
               gb    <= 2'd0;
               gr    <= 3'd0;
               gc    <= 3'd0;
-              state <= S_PLAN_NEXT;
+              // The final MAC partial lands one cycle after the last
+              // S_COMPUTE_ACC edge.  Raw activation fetch must wait for it.
+              state <= S_PLAN_SETTLE;
             end else begin
               wb_b  <= 2'd0;
               wb_r  <= 3'd0;
@@ -1204,6 +1225,10 @@ module heatvit_gemm_engine
 
         S_GELU_SETTLE: begin
           state <= S_GELU_NEXT;
+        end
+
+        S_PLAN_SETTLE: begin
+          state <= S_PLAN_NEXT;
         end
 
         S_GELU_NEXT: begin
@@ -1239,8 +1264,9 @@ module heatvit_gemm_engine
           end else if (b_cols[gb] == 4'd0) begin
             gb <= gb + 2'd1;
           end else begin
-            gelu_x_latched <= acc_q16(int'(gb), int'(gr), int'(gc));
-            gelu_start <= 1'b1;
+            act_acc_r         <= bank_accum[gb][gr][gc];
+            act_bias_r        <= bias_all[8*int'(gb) + int'(gc)];
+            act_fetch_valid_r <= 1'b1;
             if (gc == b_cols[gb] - 4'd1) begin
               gc <= 3'd0;
               if (gr == a_rows - 4'd1) begin
@@ -1287,8 +1313,10 @@ module heatvit_gemm_engine
           end else if (b_cols[gb] == 4'd0) begin
             gb <= gb + 2'd1;
           end else begin
-            plan_start <= 1'b1;
-            state      <= S_PLAN_WAIT;
+            act_acc_r         <= bank_accum[gb][gr][gc];
+            act_bias_r        <= bias_all[8*int'(gb) + int'(gc)];
+            act_fetch_valid_r <= 1'b1;
+            state             <= S_PLAN_WAIT;
           end
         end
 
