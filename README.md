@@ -69,11 +69,11 @@ flowchart TD
 | 项目 | 结果 |
 | --- | --- |
 | 18 个检查点 + 1000 个 Logit | 与整数黄金模型**逐字节一致**（零容差） |
-| 端到端 · 无回压（P7-4 RTL） | PASS · 193,566,541 周期 |
-| 端到端 · 伪随机回压 STALL_MASK=3（P7-4 RTL） | PASS · 217,411,063 周期 |
+| 端到端 · 无回压（P7-5 RTL） | PASS · 213,760,350 周期 |
+| 端到端 · 伪随机回压 STALL_MASK=3（P7-5 RTL） | PASS · 237,834,977 周期 |
 | QAT 权重端到端（P5）· 6 轮 | img0..2 × 无回压/回压全部 **TEST_PASS**（代表周期 230.8M / 226.4M） |
 | 错误码 1–7 / 警告位 0–2 | 10 个注入案例全部命中一次并通过 |
-| Watchdog | 850,000,000 周期（≈4× 实测最坏情况） |
+| Watchdog | 850,000,000 周期（≈3.6× 实测最坏情况） |
 | Vivado IP 审计 | `NO_MANUAL_VIVADO_IP_REQUIRED`（0 个手工 IP） |
 
 机器可读结果见 `build/reports/e2e_summary.json` 与 `build/reports/regression_summary.txt`（生成产物，不入库）。

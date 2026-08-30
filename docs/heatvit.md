@@ -43,8 +43,12 @@ mux 网络。**P7-1 / P7-2 资源优化已完成**：vector/layout 两引擎与 
 WNS = −7.2 ns、route 拥塞，残余集中在 GEMM 写回 128 位重定标锥）按计划
 回退，50 MHz signoff **WNS = +0.323 ns、TNS = 0、WHS = +0.073 ns**
 （`All user specified timing constraints are met.`），路由后资源
-LUT 118,453（58.12%）、FF 46,834、DSP 65、BRAM 37。100 MHz 攻坚与
-P7③ MAC DSP 化为后续可选优化。
+LUT 118,453（58.12%）、FF 46,834、DSP 65、BRAM 37。**P7-5 全片 100 MHz
+时序收敛已完成（2026-08-30）**：GEMM 引擎重定标函数四位宽证明收窄（OOC 门
+WNS −4.185 → +0.659 ns）后全片五轮清零 residual/LayerNorm/executor/score_q16
+/srow 等违例家族，**100 MHz signoff WNS = +0.234 ns、TNS = 0、WHS = +0.018 ns**
+（setup+hold 双达标），路由后 LUT 85,959（42.18%）；全量逐位回归全绿。
+P7③ MAC DSP 化与板级验证为后续可选工作。
 
 **关键词：** Vision Transformer；动态 Token 剪枝；定点量化；FPGA；
 SystemVerilog；描述符调度；逐位仿真验证
@@ -125,7 +129,7 @@ SystemVerilog；描述符调度；逐位仿真验证
 - 不复现 ImageNet Top-1 准确率，也不声称随机测试权重具有分类意义。
 - 不集成板级 DDR、MIG、PCIe、AXI、摄像头、显示、串口或主机软件。
 - 不执行上板、功耗测试或实测吞吐验证（P7 修正：时序收敛已纳入范围，
-  50 MHz signoff 达标，见 §15 P7-4）。
+  50 MHz signoff 达标于 P7-4，**100 MHz signoff 达标于 P7-5**，见 §15）。
 - 不支持 HeatViT-S、HeatViT-B 或 LV-ViT 变体。
 - 不实现 JPEG/PNG 解码、图像缩放和浮点均值方差预处理。
 
@@ -4949,17 +4953,19 @@ Q2 权重上 +0.34pp 的收益在 P4A 权重上转为惩罚，印证「训练越
 2023.2 综合与实现，统计资源占用；时序目标 100 MHz（`create_clock -period
 10.000`）。综合/资源统计此前被规格明确排除（§17 与 §3 全局工程约束），
 本阶段起修订为：**资源统计纳入验收口径；时序收敛以 100 MHz 为目标**。
-（P7-4 实测 100 MHz 不收敛后按计划回退，**最终收敛口径为 50 MHz**，见 P7-4。）
+（P7-4 实测 100 MHz 不收敛后按计划回退 50 MHz 签核；**P7-5 完成 100 MHz
+收敛**，见本节 P7-5。）
 
 ### 新增工具
 
 | 文件 | 作用 |
 | --- | --- |
-| `xdc/heatvit.xdc` | 时钟 + 0 延迟 IO 约束（无板级引脚，内部路径为准；P7-4 起为 50 MHz） |
+| `xdc/heatvit.xdc` | 时钟 + 0 延迟 IO 约束（无板级引脚，内部路径为准；P7-5 起为 100 MHz） |
 | `scripts/run_synthesis.tcl` / `scripts/run_vivado_synth.ps1` | 综合跑批 + 利用率报告导出 + 黑盒扫描 |
 | `scripts/run_implementation.tcl` / `scripts/run_vivado_impl.ps1` | 实现至 route_design + util/timing/power 报告 |
 | `scripts/run_opt_report.tcl` | 综合后 opt_design，取更真实的 LUT 数 |
 | `scripts/p6_pre_synth.tcl` | 综合前把描述符 `.mem` 送入 run 目录（见下） |
+| `scripts/p7c_ooc_gemm.tcl` | P7-5：GEMM 引擎 OOC 100 MHz 时序门（综合+place+route，快速反馈） |
 | `tools/p6/p6_summary.py` | 报告解析 → `build/reports/p6_summary.{txt,json}` |
 
 ### 综合前修复的两个阻塞
@@ -5046,14 +5052,15 @@ selector_softmax/finalize/packager/feature_concat/compactor（合计 ~156K）；
 ③ MAC bank 乘法 DSP 化并查 bank0 不对称（57K → ~6K + ~96 DSP，DSP 仍只
 占 ~25%）。预期总 LUT ~140–190K（15–20% 器件），达标后重跑
 synth + impl + 100 MHz 时序。每步 RTL 改动过全量逐位回归。
-（P7-4 实际收敛口径为 50 MHz：100 MHz 不收敛后按计划回退，见 P7-4。）
+（①② 已完成于 P7-1/P7-2；③ 仍为可选裕量优化。时序：P7-4 签核 50 MHz，
+P7-5 签核 **100 MHz**，见本节 P7-4/P7-5。）
 
 ### 复现命令
 
 ```powershell
 $env:HEATVIT_VIVADO_BIN = 'D:\vivado\vivado2023.2\Vivado\2023.2\bin'
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_synth.ps1 -Jobs 24   # 5h47m
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_impl.ps1 -Jobs 24    # P7-4 已运行：50 MHz 收敛（WNS +0.323 ns）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_impl.ps1 -Jobs 24    # P7-5 已运行：100 MHz 收敛（WNS +0.234 ns）
 .\.venv\Scripts\python tools\p6\p6_summary.py
 ```
 
@@ -5130,6 +5137,8 @@ P7③ MAC DSP 化（~51K）随后补齐裕量。F7/F8 mux 超标（138%/127%）�
 **结论：P7① 把 LUT 从 450.5% 降至 116.9%（−333.6pp），仍差 ~17pp 无法 place；**
 **P7②（其余引擎同类数组 ~156K）是跨过 100% 门槛的确定性下一步**，预期达标后
 LUT ≈ 100–130K（50–65%），随后 P7③ MAC DSP 化补裕量并重跑 impl + 100 MHz 时序。
+（后续落地：P7② 达标 62.05%，P7-4 先以 50 MHz 签核，**P7-5 完成 100 MHz 签核**；
+P7③ 保留为可选裕量优化。）
 
 **验证**：foundation/gemm/transformer/selector 全量回归 + e2e 无回压/回压两轮 +
 错误矩阵全部 TEST_PASS（Python 单元测试全绿）。综合脚本修复：已完成状态的
@@ -5266,10 +5275,11 @@ RAM 单元之间）。判定 100 MHz 不收敛，按计划终止并回退 50 MHz
 | 路由后资源 | LUT 118,453（58.12%）、FF 46,834（11.49%）、DSP 65、BRAM 37、LUT-as-DistRAM 116、0 黑盒 |
 
 **结论**：100 MHz 的残余差距集中在 GEMM 写回 stage-B 的 128 位重定标锥
-（后续可劈级或收窄容器位宽，属可选优化项）；50 MHz 已达成 P7-4 收敛目标，
-功能口径不变（本轮 RTL 改动后全量回归全绿）。
+（后续可劈级或收窄容器位宽）；50 MHz 已达成 P7-4 收敛目标，功能口径不变
+（本轮 RTL 改动后全量回归全绿）。**该残余差距已由 P7-5 收窄重写与全片五轮
+修复清零，100 MHz 签核达成，见下节。**
 
-### P7-5：GEMM 引擎 100 MHz 时序收敛（2026-08-30）
+### P7-5：GEMM 引擎与全片 100 MHz 时序收敛（2026-08-30）
 
 P7-4 定位的 100 MHz 残余差距全部落在 GEMM 引擎内部。为获得快速反馈，本阶段
 先建立 **OOC 时序门**（`scripts/p7c_ooc_gemm.tcl`：GEMM 引擎脱离上下文综合 +
@@ -5617,18 +5627,19 @@ Scheduler 在 Finalize 描述符完成拍原子锁存，随后被 Block 4/7/10 �
 
 | 运行 | STALL_MASK | 状态 | 周期数 |
 | --- | --- | --- | --- |
-| 无回压 | 0 | PASS | 183,286,499 |
-| 随机回压 | 3 | PASS | 207,707,228 |
+| 无回压（P7-5 RTL） | 0 | PASS | 213,760,350 |
+| 随机回压（P7-5 RTL） | 3 | PASS | 237,834,977 |
 
-（2026-08-23 P2+ GELU 流水线化后的实测值；ShiftGELU 契约 + 流水线除法
-相对旧契约基线 175.5M/198.5M 仅 +4.4%/+4.6%，中间状态串行除法版为
-225.3M/249.7M，见第二部分 §13.9。）
+（2026-08-30 P7-5 时序改写后的实测值：相比 2026-08-23 GELU 流水线版
+183.3M/207.7M 增加约 +16.6%/+14.5%，增量来自守卫四相流水、S_CHECK 多相
+决策、residual 两级与 LN 多级拆分的每窗/每命令开销——100 MHz 时钟下墙钟
+时间仍显著短于 50 MHz 时代。）
 
 实际周期数在 `TEST_PASS tb_heatvit_e2e` 之后由 TB 打印（`e2e_cycles=...`），
 并由 `run_regression.ps1` 落盘为 `build/reports/e2e_run_stall<mask>.txt`，
 最终汇入 `e2e_summary.json` 的 `runs`。Watchdog 上界按实测标定：
-`watchdog_cycles = 850,000,000` ≈ 4× 实测最坏情况（回压轮 207.7M 周期），
-在正常跑与挂死检测之间保留约 4 倍裕量。
+`watchdog_cycles = 850,000,000` ≈ 3.6× 实测最坏情况（回压轮 237.8M 周期），
+在正常跑与挂死检测之间保留约 3.6 倍裕量。
 
 ## 5. 错误与警告注入
 
@@ -5674,6 +5685,7 @@ warning 锁存在后续合法 start 时清零（case 8 已验证）。
 - [x] 最终结论仅表述“仿真逐位通过”，明确不等同于 ImageNet 准确率、时序、功耗、FPS 或上板通过。
 - [x] P3 QAT 与 P4 剪枝微调（2026-08-24 起，§14.13 小结）：P0 可微训练路径 + 位精确验证管线 + 16 项单元测试全绿；P1 训练管线冒烟通过；Q1 快速验证 32k×5（76.06% → 77.44%@5k，+1.38pp）；Q2 分段训练 128k×10（→ 77.86%@5k，累计 +1.80pp）；Q3 QAT 主干 + 冻结 Selector 剪枝评估（59.12% → 68.20%@5k，+9.08pp；剪枝代价 −16.9 → −9.7pp；计数 87.4/44/35.9 近目标）；Q4 D3 裁定（弃用训练后完整重校准：消融定位 LN 残差流毒性 −3.60pp、非 LN +0.34pp；裁定冻结表全程 + 可选终局非 LN cherry-pick；终局小集高 lr 补训 −0.66pp）；Q5 P4-1 冻结选择器剪枝微调（68.20% → 74.00%@5k，+5.80pp；未剪枝 −1.72pp；保持率上浮 99/58/47）；Q6 P4-2A 保持率正则（λ=0/1/5：计数 99/58/47 → 97/51/42 → 93/44/37，精度 74.00/73.94/72.70%；冻结选择器前沿≈72.5%@目标计数；方向 B 定价完成）；Q7 P4-2B 选择器重训（QAT 特征+镜像教师监督：重训 H 67.76%@95.5/43.8/31.7 ≈ 冻结 sup4 68.20%，B ≤ A 排序增益未兑现；阈值补偿-计数单调映射已沉淀；后续选项保留：教师 A/B / 全量 QAT / 联合微调），第二部分 §14。
 - [x] P5 导出与逐位回归（2026-08-27）：P4-2A λ=5（72.70%@93/44/37）经 `p2_export_weights --checkpoint` 导出回 RTL；修复 `heatvit_layernorm` 连续赋值陈旧尺度缺陷（含 `heatvit_gemm_engine` 同类加固与回归测试 `tb_ln_p5_stale`）；6 轮 e2e（img0..2 × STALL_MASK=0/3）逐位通过（代表周期 230.8M / 226.4M）；修复后全套回归 `-Suite all` 退出码 0；§14.14。
+- [x] P6 综合与资源统计、P7 资源优化与实现（2026-08-28 起，§15）：P7-1/P7-2 把 LUT 从 450.5% 降至 62.05%；P7-4 实现 50 MHz 签核（WNS +0.323 ns）；**P7-5 GEMM 引擎与全片 100 MHz 时序收敛（2026-08-30）**：重定标四位宽证明收窄（tb_requant_diag 33.5M 样本 0 误差）、守卫四相流水、S_CHECK 决策寄存、全片五轮清零违例家族，100 MHz signoff **WNS +0.234 / TNS 0 / WHS +0.018**，路由后 LUT 85,959（42.18%），全套回归 `-Suite all` 退出码 0（e2e 213.8M / 237.8M 周期）。
 
 ## 14. 历史文档索引
 
