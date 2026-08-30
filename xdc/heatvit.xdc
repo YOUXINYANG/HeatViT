@@ -1,10 +1,11 @@
 # HeatViT timing / IO constraints (P6 synthesis & implementation,
-# P7-4 revised IO policy).
+# P7-4 revised IO policy, P7-5 revised clock target).
 #
-# Target: 50 MHz core clock on xc7k325tfbg900-3.
-# 100 MHz attempt (P7-4): post-phys_opt WNS = -7.2 ns with the GEMM
-# write-back staging-RAM cone dominating; routing added congestion
-# (router deprioritized timing). Fell back to 50 MHz per plan.
+# Target: 100 MHz core clock on xc7k325tfbg900-3.
+# 50 MHz signoff was the P7-4 closure (WNS +0.323 ns).  P7-5 reworked the
+# GEMM engine timing (narrow requant datapaths, 4-phase guard pipeline,
+# S_CHECK settle) and re-targets 100 MHz: OOC GEMM gate WNS +0.586 ns,
+# full-chip signoff below.
 #
 # No board-level pinout exists (上板 is out of scope), so every non-clock
 # IO path is marked false: with unplaced pins the pad routes are arbitrary
@@ -15,7 +16,7 @@
 # bring-up would re-introduce per-pin IO constraints together with the
 # pin placement. Async reset rst_n keeps its recovery/removal checks.
 
-create_clock -period 20.000 -name clk [get_ports clk]
+create_clock -period 10.000 -name clk [get_ports clk]
 
 set_false_path -from [get_ports -filter {DIRECTION == IN && NAME != clk && NAME != rst_n}]
 set_false_path -to [all_outputs]

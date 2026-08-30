@@ -5269,6 +5269,68 @@ RAM 单元之间）。判定 100 MHz 不收敛，按计划终止并回退 50 MHz
 （后续可劈级或收窄容器位宽，属可选优化项）；50 MHz 已达成 P7-4 收敛目标，
 功能口径不变（本轮 RTL 改动后全量回归全绿）。
 
+### P7-5：GEMM 引擎 100 MHz 时序收敛（2026-08-30）
+
+P7-4 定位的 100 MHz 残余差距全部落在 GEMM 引擎内部。为获得快速反馈，本阶段
+先建立 **OOC 时序门**（`scripts/p7c_ooc_gemm.tcl`：GEMM 引擎脱离上下文综合 +
+place/phys_opt/route + 100 MHz 约束 + 代表时钟源 BUFGCTRL），以引擎自身的
+route 后 WNS 作为诊断口径；全片收敛仍以项目实现流程为准。门首跑 WNS −4.185 ns、
+3,975 个违例端点，聚合出三个家族：
+
+| 家族 | 端点 | 典型违例 | 根因 |
+| --- | ---: | ---: | --- |
+| 写回重定标锥 | ~40+ | −3.6..−3.2 ns（45–84 级，CARRY4×67） | 4 个 128 位容器函数（`gemm_out8_from_sum`/`gemm_out32_from_sum`/`gelu_out8_from_value`/`activation_q16`）被综合成 128 位可变移位 + 129 位舍入加锥 |
+| 装载/写回窗口守卫 | 2 | −4.19 ns（36 级，DSP×2 级联 + CARRY4×19） | 窗口地址 64 位乘 → cover/end/len 64 位加链 → addr_guard 比较全组合单拍 |
+| desc→dst_scale CE | 4 | −3.44 ns（21 级 + DSP） | S_CHECK 内配置寄存器 CE 由 `v_error == NONE` 驱动，深锥扇出到多个复制寄存器 |
+
+**RTL 修改（全部为逐位等价改写，数值通路语义不变）：**
+
+1. **重定标函数收窄（四位宽证明）**：四个函数全部改用小容器重写，语义与
+   128 位原版逐位一致（由 `tb_requant_diag` 对全部尺度三元组 × 33.5M 样本
+   实测 0 误差 + 端到端回归确认）：
+   - `gemm_out8_from_sum`：shift = dst−src0−src1 ∈ [−95..95]，|sum| ≤ 2^32。
+     shift ≥ 0 时 s = shift[6:0] ∈ [0..95]：s==0 直通；s ≤ 32 → 34 位锥
+     （(mag+2^(s−1))>>s）；s==33 → 仅 sum==−2^32 时 −1；s ≥ 34 → 0。shift < 0
+     时 k ∈ [1..95]：k ≥ 8 直接符号饱和（|sum| ≥ 1 ⇒ ≥256）；k ≤ 7 → 40 位锥。
+   - `gemm_out32_from_sum`：src_exp = src0+src1（6 位回绕），diff = dst−src_exp
+     ∈ [−63..62]：同类拆分，34 位舍入锥 / 64 位左移锥。
+   - `gelu_out8_from_value`：diff = dst+16 ∈ [−16..47]，|v| ≤ 2^23：25 位舍入
+     锥 / 40 位左移锥。踩坑：`{1'b0, value}` 是 25 位，幅值基必须取 2^24
+     （初版误用 24'h800000 把负值补码截断 → tb_ffn hidden 字节饱和成 −128，
+     由 tb_requant_diag 定位）。
+   - `activation_q16`：diff = −16−src_exp ∈ [−47..16]：34 位舍入锥 / 55 位左移
+     锥；128 位版左移溢出检查在此路径恒假（32+47 < 127），显式删除。
+2. **窗口守卫四相流水**：S_LOAD_SETUP 与 S_WB_NEXT 的守卫各拆 4 相——
+   相 0 寄存窗口地址乘法锥（ld_aligned64_r / wb_addr64_r + e/w/region），
+   相 1 从寄存器重算 cover/end/len 64 位链（ld_len_r / wb_len_c_r），相 2 由
+   寄存器输入跑 `heatvit_addr_guard` 并寄存 g_ok_r/g_code_r，相 3 决策。每相
+   均为 reg→reg，表达式与原组合链逐位相同（guard 输入改为按 state 从各侧
+   已寄存窗口值取）。窗口开销 2 → 4 周期（每图约 +7 万周期，≈0.04%）。
+3. **S_CHECK 双相决策**：v_error 深锥寄存到 v_error_r 后再决策，配置寄存器
+   在相 0 无条件加载（CE 只解码状态，深 CE 锥消失；错误路径值不被消费）。
+   浅层描述符违规（opcode/dimension 等，不含地址守卫）仍由 ~12 级浅锥在
+   相 0 直接脉冲 error_valid/error_code，保持测试台一拍错误窗口；地址错误
+   在相 1 由 v_error_r 补脉冲（错误矩阵事件驱动，1 周期延迟无影响）。
+
+**验证**：tb_requant_diag（新，33.5M 样本 0 误差）纳入 foundation 套件；
+gemm 套件全 12 场景 + tb_ffn/tb_mhsa + 全量回归全绿（见文末机器可读结果）。
+
+**OOC 时序门（最终 RTL，route 后）**：**WNS +0.659 ns、0 违例端点**（首跑
+−4.185 ns / 3,975 端点）；最差路径变为 a_unsigned_reg → MAC 累加器 D 的
+7 级 90% 路由路径（OOC 布局产物）。
+
+**全片实现与 100 MHz 收敛（`create_clock -period 10.000`，重跑综合+实现）**：
+
+| 阶段 | 结果 |
+| --- | --- |
+| 综合 | 待填 |
+| place 后 | 待填 |
+| route 后 signoff | 待填 |
+| hold（min） | 待填 |
+| 布线 | 待填 |
+| 路由后资源 | 待填 |
+
+
 # 第三部分：仿真与验证指南
 
 本节说明如何从零复现全部仿真验证（环境变量、向量生成、回归命令、日志
