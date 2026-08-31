@@ -4,16 +4,16 @@
 
 ![tag](https://img.shields.io/github/v/tag/YOUXINYANG/HeatViT?label=release)
 
-> **当前状态（2026-08-30）**
+> **当前状态（2026-08-31）**
 >
 > - ✅ **仿真闭环**：XSim 端到端逐位通过——18 个检查点与 1000 个 Logit 与纯整数 Python 黄金模型零容差一致；QAT 权重 6 轮回归全部 PASS
-> - ✅ **精度闭环**：PTQ 76.06% → QAT **77.86%**（未剪枝）；剪枝 **72.70%@93/44/37**（P4-2A λ=5，当前最优），已导出回 RTL
+> - ✅ **全量精度复核**：已部署 P4-2A λ=5 权重在 ImageNet val 50k 位精确评估为：未剪枝 **67.48%**，剪枝 **60.53%@102.2/50.6/42.4**（剪枝代价 −6.95pp）；前 5k 的 76.02% / 72.70%@93/44/37 仅保留为训练探索口径
 > - ✅ **可综合性**：Vivado 综合通过（0 黑盒、0 锁存器），LUT 从 902,658（442.9%）降至 **126,459（62.05%）**
 > - ✅ **P7-1 bbuf→BRAM（2026-08-28）**：vector/layout 两引擎寄存器数组 → 11 个字节写使能 SDP RAM + 流入式解包；**全量综合 LUT 918,145 → 238,271（450.5% → 116.9%）**；全量逐位回归全绿
 > - ✅ **P7-2 同类数组推广（2026-08-28）**：selector 侧七模块（head_fuse/reduce_mean/selector_softmax/finalize/packager/compactor/feature_concat）寄存器数组 → SDP RAM/串行化，OOC 124,626 → 15,408 LUT（−87.6%）；**全量综合 LUT 126,459 = 62.05%，首次跨过 100% 可布线性门槛**；全量逐位回归（e2e 两轮 + 错误矩阵）全绿
 > - ✅ **P7-4 实现与 50 MHz 时序收敛（2026-08-29）**：LN/softmax 流水化 + GEMM 写回关键路径寄存器化后 place+route 0 未布线；100 MHz 实测不收敛（place 后 WNS −7.2 ns）按计划回退，**50 MHz signoff WNS +0.323 / TNS 0 / WHS +0.073**（setup+hold 双达标）；路由后 LUT 118,453（58.12%）、DSP 65、BRAM 37
 > - ✅ **P7-5 GEMM 引擎与全片 100 MHz 时序收敛（2026-08-30）**：重定标函数四位宽证明收窄（34/40/64/55 位锥，tb_requant_diag 33.5M 样本 0 误差）+ 守卫四相流水 + S_CHECK 决策寄存（GEMM OOC 门 WNS −4.185 → **+0.659 ns**）；全片五轮清零违例家族（residual 两级窄化、LN 仿射/方差多级拆、executor 三相决策、srow 一热写使能、score_q16 收窄），**100 MHz signoff WNS +0.234 / TNS 0 / WHS +0.018**（`All user specified timing constraints are met.`）；路由后 **LUT 85,959（42.18%）**、FF 48,617、DSP 65、BRAM 35
-> - ⏳ **下一步（可选优化）**：P7③ MAC DSP 化补裕量；板级引脚约束与上板验证
+> - ⏳ **下一步**：全量 QAT 长训练并重新做 50k 位精确评估；板级引脚约束与上板验证；P7③ MAC DSP 化仅在板级资源/时序需要时启用
 
 ## 简介
 
@@ -21,7 +21,8 @@ HeatViT 在 Vision Transformer 推理过程中动态剪除不重要的 Token。�
 
 - `224×224×3` signed int8 输入 → Patch 嵌入（196 patch，16×16）→ CLS + 位置编码（197 tokens × 192 维）
 - 12 个 DeiT-T Transformer Block（Pre-LN，3 head × 64 维，FFN 隐藏维 768）
-- 3 个动态 Token Selector（位于 Block 4/7/10 之前）：**197 → 88 → 45 → 32**
+- 3 个动态 Token Selector（位于 Block 4/7/10 之前），目标 Token 预算：
+  **197 → 88 → 45 → 32**（当前部署权重 50k 实测均值为 102.2/50.6/42.4）
 - Final LayerNorm → 分类头（192 → 1000）→ 1000 个 signed int32 Logit + 尺度指数
 
 ## 推理数据流
@@ -31,11 +32,11 @@ flowchart TD
     A["224×224×3 int8 图像"] --> B["Patch Embedding<br/>196×768 → 196×192"]
     B --> C["+ CLS + 位置编码<br/>197 tokens × 192"]
     C --> D["Transformer Block 1–3"]
-    D --> E["Token Selector 1<br/>197 → 88"]
+    D --> E["Token Selector 1<br/>目标 197 → 88"]
     E --> F["Transformer Block 4–6"]
-    F --> G["Token Selector 2<br/>88 → 45"]
+    F --> G["Token Selector 2<br/>目标 88 → 45"]
     G --> H["Transformer Block 7–9"]
-    H --> I["Token Selector 3<br/>45 → 32"]
+    H --> I["Token Selector 3<br/>目标 45 → 32"]
     I --> J["Transformer Block 10–12"]
     J --> K["Final LayerNorm"]
     K --> L["分类头 192 → 1000"]
@@ -59,8 +60,9 @@ flowchart TD
 | P1 | RTL 实现（31 模块）：定点基础 → 存储/统一 GEMM → Transformer 数据通路 → Token Selector → 调度与端到端集成 | ✅ | XSim 端到端逐位通过 |
 | P2 | 真实 DeiT-T 权重 PTQ + Selector 监督训练（I-ViT 融合） | ✅ | PTQ **76.34%@5k** |
 | P3 | 量化感知训练（QAT：部署契约 + fake-quant） | ✅ | 未剪枝 **77.86%@5k**（+1.80pp） |
-| P4 | 剪枝微调（STE 阈值/Package + 保持率正则） | ✅ | 剪枝 **72.70%@93/44/37** |
+| P4 | 剪枝微调（STE 阈值/Package + 保持率正则） | ✅ | 剪枝 **72.70%@5k**，Token 93/44/37（探索口径） |
 | P5 | QAT 权重导出回 RTL + XSim 逐位回归 | ✅ | 6 轮全部 TEST_PASS |
+| P5-1 | 已部署 P4-2A 权重全量 50k 位精确复核 | ✅ | 未剪枝 **67.48%**；剪枝 **60.53%@102.2/50.6/42.4** |
 | P6 | Vivado 综合与资源统计（100 MHz） | ✅ | 可综合性通过；LUT 4.4× 超标 |
 | P7 | 资源优化（P7-1/P7-2）→ 50 MHz（P7-4）→ **100 MHz 收敛（P7-5）** | ✅ | LUT 62.05% → **42.18%**；WNS +0.234 ns@100 MHz |
 
@@ -78,23 +80,25 @@ flowchart TD
 
 机器可读结果见 `build/reports/e2e_summary.json` 与 `build/reports/regression_summary.txt`（生成产物，不入库）。
 
-## 精度结果（前 5k val，位精确）
+## 精度结果（位精确；5k 探索 + 50k 终局复核）
 
-| 版本 | 剪枝 | Top-1 | Token 计数（目标 88/45/32） |
-| --- | :-: | ---: | --- |
-| 本地 DeiT-T 浮点基线（全量 50k / 前 5k） | ✗ | 72.13% / 80.22% | 197/197/197 |
-| 部署契约 PTQ（I-ViT ShiftGELU 融合） | ✗ | 76.34% | — |
-| 部署契约 PTQ | ✗ | 76.06% | — |
-| **QAT（128k×10）** | ✗ | **77.86%** | — |
-| PTQ 主干 + 冻结选择器 | ✓ | 59.12% | 80.0/42.0/34.1 |
-| QAT 主干 + 冻结选择器 | ✓ | 68.20% | 87.4/44.0/35.9 |
-| P4-1 微调（λ=0） | ✓ | 74.00% | 99.1/57.6/46.6 |
-| **P4-2A λ=5（已导出回 RTL）** | ✓ | **72.70%** | **93.0/44.3/37.1** |
-| P4-2B 选择器重训 | ✓ | 67.76% | 95.5/43.8/31.7 |
+| 版本 | 口径 | 剪枝 | Top-1 | Token 计数（目标 88/45/32） |
+| --- | --- | :-: | ---: | --- |
+| 本地 DeiT-T 浮点基线 | 全量 50k / 前 5k | ✗ | 72.13% / 80.22% | 197/197/197 |
+| 部署契约 PTQ（I-ViT ShiftGELU 融合） | 前 5k | ✗ | 76.34% | — |
+| 部署契约 PTQ | 前 5k | ✗ | 76.06% | — |
+| **QAT（128k×10）** | 前 5k | ✗ | **77.86%** | — |
+| PTQ 主干 + 冻结选择器 | 前 5k | ✓ | 59.12% | 80.0/42.0/34.1 |
+| QAT 主干 + 冻结选择器 | 前 5k | ✓ | 68.20% | 87.4/44.0/35.9 |
+| P4-1 微调（λ=0） | 前 5k | ✓ | 74.00% | 99.1/57.6/46.6 |
+| P4-2A λ=5（已导出回 RTL） | 前 5k | ✗ / ✓ | 76.02% / **72.70%** | **93.0/44.3/37.1**（剪枝） |
+| P4-2B 选择器重训 | 前 5k | ✓ | 67.76% | 95.5/43.8/31.7 |
+| **P4-2A λ=5（已部署）** | **全量 50k** | ✗ | **67.48%** | 197/197/197 |
+| **P4-2A λ=5（已部署）** | **全量 50k** | ✓ | **60.53%** | **102.2/50.6/42.4** |
 
 - **量化主线**：PTQ 76.06% → QAT 77.86%（+1.80pp），距浮点基线（同 5k 子集 80.22%）−2.36pp；尺度表全程冻结 PTQ 校准表。I-ViT 融合使纯 PTQ 从 0.82% 提升至 76.34%，增益几乎全部来自 ShiftGELU。
-- **剪枝主线**：剪枝代价从 −16.9pp（PTQ）收窄至 **−5.2pp**（P4-2A，计数近目标）；λ=5 为当前诚实最优并已导出回 RTL 通过逐位回归（P5）。
-- 论文 HeatViT-T 为浮点 **71.9%**（全量 val，端到端训练）。后续精度提升方向：全量 QAT 长训练、教师蒸馏、联合微调（docs §14.13）。
+- **剪枝主线**：前 5k 上 P4-2A 的剪枝代价为 −3.32pp（76.02% → 72.70%）；全量 50k 实测为 **−6.95pp**（67.48% → 60.53%）。全量 Token 均值 102.2/50.6/42.4，分别高于目标 14.2/5.6/10.4，说明前 5k 同时高估精度并低估保留率。
+- 论文 HeatViT-T 为浮点 **71.9%**（全量 val，端到端训练）；当前已部署全量剪枝结果低 11.37pp。下一轮精度工作应以全量 QAT 长训练为主，并始终用 50k 位精确评估验收（docs §14.15）。
 
 ## 资源占用（xc7k325tfbg900-3）
 
@@ -180,13 +184,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_impl.ps1 
 
 ## 范围与非目标
 
-- ✅ **已覆盖**：XSim 逐位仿真验证；真实权重 PTQ / QAT / 剪枝精度评估；QAT 权重导出与硬件逐位回归（P5）；Vivado 综合与资源统计（P6）；P7-1 / P7-2 资源优化（bbuf→SDP RAM 全量推广，LUT 450.5% → 62.05%）；P7-4 实现与 50 MHz 时序收敛（place+route 0 未布线，WNS +0.323 ns）；P7-5 GEMM 引擎与全片 100 MHz 时序收敛（WNS +0.234 / TNS 0 / WHS +0.018，LUT 42.18%）
-- ⏳ **待办**：P7③ MAC DSP 化（可选裕量优化）；板级引脚约束与上板验证（板级 DDR/MIG/PCIe/AXI 集成与主机软件）
+- ✅ **已覆盖**：XSim 逐位仿真验证；真实权重 PTQ / QAT / 剪枝精度评估；P4-2A 已部署权重全量 50k 位精确复核（未剪枝 67.48%，剪枝 60.53%）；QAT 权重导出与硬件逐位回归（P5）；Vivado 综合与资源统计（P6）；P7-1 / P7-2 资源优化（bbuf→SDP RAM 全量推广，LUT 450.5% → 62.05%）；P7-4 实现与 50 MHz 时序收敛（place+route 0 未布线，WNS +0.323 ns）；P7-5 GEMM 引擎与全片 100 MHz 时序收敛（WNS +0.234 / TNS 0 / WHS +0.018，LUT 42.18%）
+- ⏳ **待办**：全量 QAT 长训练与 50k 复评；板级引脚约束与上板验证（板级 DDR/MIG/PCIe/AXI 集成与主机软件）；P7③ MAC DSP 化为按需裕量优化
 - ❌ **排除**：功耗、FPS 与上板验证；板级 DDR/MIG/PCIe/AXI 集成与主机软件；HeatViT-S / HeatViT-B / LV-ViT 变体；JPEG/PNG 解码、图像缩放与浮点预处理
 
 ## 文档
 
-- 📖 [`docs/heatvit.md`](docs/heatvit.md) —— 项目**唯一权威记录文档**：设计规格、实施记录、仿真与验证指南、内存与权重格式、RTL 逐模块设计说明；PTQ / QAT / P5 导出见第二部分 §13–§14（P5 见 §14.14），P6 综合与资源统计、P7-1 / P7-2 资源优化、P7-4 实现与 50 MHz 时序收敛、P7-5 100 MHz 收敛见 §15
+- 📖 [`docs/heatvit.md`](docs/heatvit.md) —— 项目**唯一权威记录文档**：设计规格、实施记录、仿真与验证指南、内存与权重格式、RTL 逐模块设计说明；PTQ / QAT / P5 导出与全量 50k 精度复核见第二部分 §13–§14（P5 见 §14.14，50k 见 §14.15），P6 综合与资源统计、P7-1 / P7-2 资源优化、P7-4 实现与 50 MHz 时序收敛、P7-5 100 MHz 收敛见 §15
 - 📄 论文 PDF：仓库根目录 `HeatViT：Hardware-Efficient Adaptive Token Pruning for Vision Transformers.pdf`
 - 🔗 论文 arXiv：[2211.08110](https://arxiv.org/abs/2211.08110)
 
