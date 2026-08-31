@@ -39,6 +39,7 @@ from tools.p2.qat_fakeq import (
     shiftgelu_float,
 )
 from tools.p2.qat_model import PARAM_NAMES, QatDeiT, exact_forward
+from tools.p2.p2_quantize import select_validation_indices
 from tools.p2.scale_table import ACTIVATION_NAMES, WEIGHT_NAMES, ScaleTable
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -51,6 +52,30 @@ MEAN_BINS_LIMIT = 3.5
 MAX_BINS_LIMIT = 45.0
 LOGITS_MEAN_REL_LIMIT = 0.05
 LOGITS_MAX_REL_LIMIT = 0.20
+
+
+class ValidationSamplingTest(unittest.TestCase):
+    def test_stratified_sampling_balances_classes_deterministically(self):
+        targets = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]
+        got = select_validation_indices(
+            targets, max_images=6, sampling="stratified", seed=17)
+        self.assertEqual(got, select_validation_indices(
+            targets, max_images=6, sampling="stratified", seed=17))
+        self.assertEqual(len(got), 6)
+        sampled_targets = [targets[i] for i in got]
+        self.assertEqual([sampled_targets.count(c) for c in range(3)],
+                         [2, 2, 2])
+        self.assertEqual(len(set(got)), 6)
+
+    def test_qat_eval_loader_honors_stratified_sampling(self):
+        from tools.p2.p2_quantize import DATA_DIR
+        if not Path(DATA_DIR).exists():
+            self.skipTest("ImageNet validation directory missing")
+        from tools.p2 import p2_qat
+        loader = p2_qat.make_eval_loader(
+            32, batch_size=32, sampling="stratified", seed=17)
+        _, labels = next(iter(loader))
+        self.assertEqual(len(set(labels.tolist())), 32)
 
 
 def make_floats(seed=20260815):

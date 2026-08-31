@@ -353,7 +353,54 @@ def calibrate_float(state, images, device, batch_size=64):
     return pick_activation_exps(hist, centers, ln_clamp_max=0)
 
 
-def make_val_loader(max_images, batch_size=1, shuffle=False):
+def select_validation_indices(targets, max_images, sampling="head",
+                              seed=20260815):
+    """Select a deterministic validation subset.
+
+    ``head`` preserves the historical first-N behavior, ``random`` draws
+    from the full validation set, and ``stratified`` round-robins over
+    independently shuffled classes so class counts differ by at most one.
+    """
+    size = len(targets)
+    if not max_images or max_images >= size:
+        return list(range(size))
+    if sampling == "head":
+        return list(range(max_images))
+    gen = torch.Generator().manual_seed(seed)
+    if sampling == "random":
+        return torch.randperm(size, generator=gen)[:max_images].tolist()
+    if sampling != "stratified":
+        raise ValueError(f"unknown validation sampling mode: {sampling}")
+
+    by_class = {}
+    for idx, target in enumerate(targets):
+        by_class.setdefault(int(target), []).append(idx)
+    shuffled = {}
+    for target in sorted(by_class):
+        indices = by_class[target]
+        order = torch.randperm(len(indices), generator=gen).tolist()
+        shuffled[target] = [indices[i] for i in order]
+
+    selected = []
+    depth = 0
+    classes = sorted(shuffled)
+    while len(selected) < max_images:
+        added = False
+        for target in classes:
+            indices = shuffled[target]
+            if depth < len(indices):
+                selected.append(indices[depth])
+                added = True
+                if len(selected) == max_images:
+                    break
+        if not added:
+            break
+        depth += 1
+    return selected
+
+
+def make_val_loader(max_images, batch_size=1, shuffle=False,
+                    sampling=None, seed=20260815):
     from torch.utils.data import DataLoader, Subset
     from torchvision import datasets, transforms
     transform = transforms.Compose([
@@ -366,12 +413,11 @@ def make_val_loader(max_images, batch_size=1, shuffle=False):
     ])
     dataset = datasets.ImageFolder(DATA_DIR, transform=transform)
     if max_images and max_images < len(dataset):
-        if shuffle:
-            gen = torch.Generator().manual_seed(20260815)
-            idx = torch.randperm(len(dataset), generator=gen)[:max_images]
-            subset = Subset(dataset, idx.tolist())
-        else:
-            subset = Subset(dataset, range(max_images))
+        mode = sampling if sampling is not None else (
+            "random" if shuffle else "head")
+        idx = select_validation_indices(dataset.targets, max_images, mode,
+                                        seed)
+        subset = Subset(dataset, idx)
     else:
         subset = dataset
     return DataLoader(subset, batch_size=batch_size, shuffle=False,

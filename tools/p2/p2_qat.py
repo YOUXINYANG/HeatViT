@@ -34,6 +34,7 @@ Usage (torch venv):
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -58,6 +59,7 @@ from tools.p2.scale_table import ScaleTable
 
 DEFAULT_TABLE = "p2_out/scale_table.json"
 DEFAULT_OUT_DIR = "p2_out/qat"
+SPOT_IMAGES = int(os.environ.get("HEATVIT_SPOT_IMAGES", "5000"))
 
 
 def pick_device(arg):
@@ -68,6 +70,13 @@ def pick_device(arg):
 
 def build_qat(floats, table, device):
     return QatDeiT(floats, table).to(device)
+
+
+def make_eval_loader(images, batch_size=1, sampling="head",
+                     seed=20260815):
+    """Build a validation loader with an explicit subset policy."""
+    return make_val_loader(images, batch_size=batch_size,
+                           sampling=sampling, seed=seed)
 
 
 def eval_val(qat, loader, device, exact=True, prune=False):
@@ -87,7 +96,8 @@ def eval_val(qat, loader, device, exact=True, prune=False):
     return 100.0 * correct / total, correct, total
 
 
-def eval_pruned_exact(qat, selector_path, images, device):
+def eval_pruned_exact(qat, selector_path, images, device, sampling="head",
+                      seed=20260815):
     """Bit-exact PRUNED Top-1 (P4): the same tensors + table + frozen
     selectors through p2_sim_ivit.forward_image_cfg(prune=True), the
     deployment contract path used by tools/p2/qat_prune_eval.py."""
@@ -97,7 +107,7 @@ def eval_pruned_exact(qat, selector_path, images, device):
     table = qat.table
     model = build_model(qat.tensors_dict(), table, device)
     load_selectors(selector_path, model, device, table)
-    loader = make_val_loader(images)
+    loader = make_eval_loader(images, sampling=sampling, seed=seed)
     correct = total = 0
     with torch.no_grad():
         for img, label in loader:
@@ -200,7 +210,13 @@ def train(args):
         return args.min_lr + 0.5 * (args.lr - args.min_lr) \
             * (1.0 + math.cos(math.pi * progress))
 
-    val_loader = make_val_loader(args.eval_images, batch_size=32)
+    val_loader = make_eval_loader(
+        args.eval_images, batch_size=32, sampling=args.eval_sampling,
+        seed=args.seed)
+    spot_loader = (make_eval_loader(SPOT_IMAGES, batch_size=32,
+                                    sampling=args.eval_sampling,
+                                    seed=args.seed)
+                   if args.spot_every > 0 and not prune_mode else None)
 
     def evaluate(epoch):
         t0 = time.time()
@@ -213,7 +229,8 @@ def train(args):
         if args.eval_prune > 0:
             t0 = time.time()
             acc_p, c_p, n_p = eval_pruned_exact(qat, sel_path,
-                                                args.eval_prune, device)
+                                                args.eval_prune, device,
+                                                args.eval_sampling, args.seed)
             parts += (f"  pruned top1={acc_p:.2f}% ({c_p}/{n_p}, "
                       f"{time.time() - t0:.0f}s)")
             print(parts)
@@ -284,7 +301,25 @@ def train(args):
         acc = evaluate(epoch + 1)
         save(out_dir / "checkpoint.pt", epoch + 1,
              epoch * steps_per_epoch + steps_per_epoch, acc)
-        if acc > best_acc:
+        is_spot = (args.spot_every > 0
+                   and ((epoch + 1) % args.spot_every == 0
+                        or epoch + 1 == args.epochs))
+        if is_spot:
+            t0 = time.time()
+            if prune_mode:
+                acc_s, c_s, n_s = eval_pruned_exact(
+                    qat, sel_path, SPOT_IMAGES, device,
+                    args.eval_sampling, args.seed)
+            else:
+                acc_s, c_s, n_s = eval_val(qat, spot_loader, device,
+                                           exact=True)
+            print(f"[spot e{epoch + 1}] {SPOT_IMAGES} top1={acc_s:.2f}% "
+                  f"({c_s}/{n_s}, {time.time() - t0:.0f}s)")
+            if acc_s > best_acc:
+                best_acc = acc_s
+                save(out_dir / "best.pt", epoch + 1,
+                     epoch * steps_per_epoch + steps_per_epoch, acc_s)
+        elif acc > best_acc:
             best_acc = acc
             save(out_dir / "best.pt", epoch + 1,
                  epoch * steps_per_epoch + steps_per_epoch, acc)
@@ -298,7 +333,8 @@ def evaluate_cmd(args):
     ckpt = torch.load(args.checkpoint, map_location="cpu",
                       weights_only=False)
     qat = build_qat(ckpt["floats"], table, device)
-    loader = make_val_loader(args.images, batch_size=32)
+    loader = make_eval_loader(args.images, batch_size=32,
+                              sampling=args.sampling, seed=args.seed)
     acc_e, c_e, n_e = eval_val(qat, loader, device, exact=True)
     print(f"[exact ] top1={acc_e:.2f}% ({c_e}/{n_e})")
     acc_t, c_t, n_t = eval_val(qat, loader, device, exact=False)
@@ -353,6 +389,14 @@ def main():
     p.add_argument("--randaug", action="store_true")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--eval-images", type=int, default=500)
+    p.add_argument("--eval-sampling",
+                   choices=("head", "random", "stratified"), default="head",
+                   help="validation subset selection for all per-epoch evals")
+    p.add_argument("--spot-every", type=int, default=0,
+                   help="every N epochs also run the 5k bit-exact spot eval "
+                        "(exact, or pruned in prune mode); best.pt tracking "
+                        "then follows the spot metric only (0 = legacy "
+                        "per-epoch metric tracking)")
     p.add_argument("--selectors", default=None,
                    help="P4: selector checkpoint (e.g. p2_out/"
                         "selectors_sup4.pt); attaches frozen float mirrors "
@@ -381,6 +425,9 @@ def main():
     p.add_argument("--table", default=DEFAULT_TABLE)
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--images", type=int, default=5000)
+    p.add_argument("--sampling", choices=("head", "random", "stratified"),
+                   default="head")
+    p.add_argument("--seed", type=int, default=20260815)
     p.set_defaults(fn=evaluate_cmd)
 
     p = sub.add_parser("recalib", help="post-training activation recalib")

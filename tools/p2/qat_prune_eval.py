@@ -78,6 +78,12 @@ def main():
     parser.add_argument("--selectors", default="p2_out/selectors_sup4.pt")
     parser.add_argument("--table", default="p2_out/scale_table.json")
     parser.add_argument("--images", type=int, default=5000)
+    parser.add_argument("--sampling", choices=("head", "random", "stratified"),
+                        default="head",
+                        help="validation subset selection (head preserves "
+                             "historical first-N results)")
+    parser.add_argument("--seed", type=int, default=20260815,
+                        help="subset seed for random/stratified sampling")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") \
@@ -89,7 +95,8 @@ def main():
     model = build_model(floats, table, device)
     load_selectors(REPO_ROOT / args.selectors, model, device, table)
 
-    loader = make_val_loader(args.images)
+    loader = make_val_loader(args.images, sampling=args.sampling,
+                             seed=args.seed)
     correct = total = 0
     counts = [0, 0, 0]
     t0 = time.time()
