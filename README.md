@@ -13,6 +13,8 @@
 > - ✅ **P7-2 同类数组推广（2026-08-28）**：selector 侧七模块（head_fuse/reduce_mean/selector_softmax/finalize/packager/compactor/feature_concat）寄存器数组 → SDP RAM/串行化，OOC 124,626 → 15,408 LUT（−87.6%）；**全量综合 LUT 126,459 = 62.05%，首次跨过 100% 可布线性门槛**；全量逐位回归（e2e 两轮 + 错误矩阵）全绿
 > - ✅ **P7-4 实现与 50 MHz 时序收敛（2026-08-29）**：LN/softmax 流水化 + GEMM 写回关键路径寄存器化后 place+route 0 未布线；100 MHz 实测不收敛（place 后 WNS −7.2 ns）按计划回退，**50 MHz signoff WNS +0.323 / TNS 0 / WHS +0.073**（setup+hold 双达标）；路由后 LUT 118,453（58.12%）、DSP 65、BRAM 37
 > - ✅ **P7-5 GEMM 引擎与全片 100 MHz 时序收敛（2026-08-30）**：重定标函数四位宽证明收窄（34/40/64/55 位锥，tb_requant_diag 33.5M 样本 0 误差）+ 守卫四相流水 + S_CHECK 决策寄存（GEMM OOC 门 WNS −4.185 → **+0.659 ns**）；全片五轮清零违例家族（residual 两级窄化、LN 仿射/方差多级拆、executor 三相决策、srow 一热写使能、score_q16 收窄），**100 MHz signoff WNS +0.234 / TNS 0 / WHS +0.018**（`All user specified timing constraints are met.`）；路由后 **LUT 85,959（42.18%）**、FF 48,617、DSP 65、BRAM 35
+> - ✅ **P8-0 性能口径汇总（2026-09-01）**：`tools/p8/perf_summary.py` 一页报告——**0.468 FPS @100 MHz**（2.14 s/图，无回压；回压轮 0.420 FPS）；理论 MAC 未剪枝 **1.26 G** / 本向量（197/100/55/28）**0.60 G**（剪枝省 52.6%）；峰值算力 19.2 GMAC/s
+> - ✅ **P8-1 微架构剖析（2026-09-01）**：e2e TB 逐描述符周期监视器 + MAC/带宽统计（RTL 零改动）——GEMM 描述符占 96.8% 周期；**全片 MAC 利用率 1.51%**（GEMM 内部 1.55%）；FFN 占 GEMM 耗时 59%；有效带宽 14.21 MB/s、零 stall；剪枝省 51.6% 周期
 > - ⏳ **下一步**：全量 QAT 长训练并重新做 50k 位精确评估；板级引脚约束与上板验证；P7③ MAC DSP 化仅在板级资源/时序需要时启用
 
 ## 简介
@@ -65,6 +67,7 @@ flowchart TD
 | P5-1 | 已部署 P4-2A 权重全量 50k 位精确复核 | ✅ | 未剪枝 **67.48%**；剪枝 **60.53%@102.2/50.6/42.4** |
 | P6 | Vivado 综合与资源统计（100 MHz） | ✅ | 可综合性通过；LUT 4.4× 超标 |
 | P7 | 资源优化（P7-1/P7-2）→ 50 MHz（P7-4）→ **100 MHz 收敛（P7-5）** | ✅ | LUT 62.05% → **42.18%**；WNS +0.234 ns@100 MHz |
+| P8 | RTL 性能剖析（P8-0 汇总 / P8-1 微架构剖析） | ✅ | **0.468 FPS@100 MHz**；MAC 利用率 1.51%；剪枝省 51.6% 周期 |
 
 ## 验证结果
 
@@ -112,6 +115,20 @@ flowchart TD
 
 > P6–P7-2 为综合级数字；P7-4/P7-5 为 place+route 后数字（DSP 65 系 P7-4
 > LN/softmax 流水化后综合减少；P7-5 的窄化重写再省 ~27% LUT）。
+
+## 性能剖析（P8，2026-09-01）
+
+| 指标 | 值 | 口径 |
+| --- | --- | --- |
+| 吞吐 @100 MHz | **0.468 FPS**（2.14 s/图）/ 0.420 FPS（回压） | e2e 实测周期换算 |
+| 全片 MAC 利用率 | **1.51%**（GEMM 内部 1.55%） | RTL `mac_active` 计数器 vs 192 MAC/拍峰值 |
+| 周期去向 | GEMM 描述符 96.8%（FFN 59% · QKV 21% · 注意力 12% · 投影 7%） | 逐描述符监视器 |
+| 有效带宽 | 14.21 MB/s（0.134 B/拍，零 stall） | 顶层外存接口统计 |
+| 剪枝收益 | 周期 −51.6%、理论 MAC −52.6%（1.26 G → 0.60 G） | 197-token 全量换算 vs 实测 |
+
+> 结论：单执行器架构面积高效（LUT 42.18%），代价是吞吐受限——GEMM
+> 引擎约 95% 周期花在 tile 装载/控制而非累加。详见 docs §16 与
+> `build/reports/perf_profile.txt` / `perf_summary.txt`。
 
 ## 仓库结构
 
@@ -211,13 +228,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_regression.ps1 -
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_synth.ps1 -Jobs 24
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_impl.ps1 -Jobs 24
 .\.venv\Scripts\python tools\p6\p6_summary.py
+
+# 7. 性能剖析（P8：一页汇总 + 带监视器的 e2e 剖析）
+.\.venv\Scripts\python tools\p8\perf_summary.py
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_xsim.ps1 -Top tb_heatvit_e2e -PlusArgs '+VECTOR_DIR=build/vectors/e2e +STALL_MASK=0'
+.\.venv\Scripts\python tools\p8\perf_parse_log.py
 ```
 
 > 只有显式加 `-RegenerateVectors` 才会重新生成端到端向量，防止失败重跑时误换期望值。全套回归预计时长：端到端两轮各约 35–40 分钟，其余套件分钟级到二十余分钟；成功输出 `TEST_PASS <Top>`。QAT 训练/评估/导出命令见 docs 第二部分 §14 与第三部分 §9。
 
 ## 文档
 
-- 📖 [`docs/heatvit.md`](docs/heatvit.md) —— 项目**唯一权威记录文档**：设计规格、实施记录、仿真与验证指南、内存与权重格式、RTL 逐模块设计说明；PTQ / QAT / P5 导出与全量 50k 精度复核见第二部分 §13–§14（P5 见 §14.14，50k 见 §14.15），P6 综合与资源统计、P7-1 / P7-2 资源优化、P7-4 实现与 50 MHz 时序收敛、P7-5 100 MHz 收敛见 §15
+- 📖 [`docs/heatvit.md`](docs/heatvit.md) —— 项目**唯一权威记录文档**：设计规格、实施记录、仿真与验证指南、内存与权重格式、RTL 逐模块设计说明；PTQ / QAT / P5 导出与全量 50k 精度复核见第二部分 §13–§14（P5 见 §14.14，50k 见 §14.15），P6 综合与资源统计、P7-1 / P7-2 资源优化、P7-4 实现与 50 MHz 时序收敛、P7-5 100 MHz 收敛见 §15，P8 性能剖析见 §16
 - 📄 论文 PDF：仓库根目录 `HeatViT：Hardware-Efficient Adaptive Token Pruning for Vision Transformers.pdf`
 - 🔗 论文 arXiv：[2211.08110](https://arxiv.org/abs/2211.08110)
 

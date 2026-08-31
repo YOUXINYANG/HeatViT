@@ -190,6 +190,25 @@ module tb_heatvit_e2e;
   int selector_done_count;
   logic [7:0] seen_n [0:2];
 
+  // ---------------------------------------------------------------
+  // P8-1 performance monitor (TB-only, non-synthesizable): per-
+  // descriptor latency profile plus MAC-activity, external-memory
+  // traffic and busy duty statistics. All hierarchical probes read
+  // RTL internals; the RTL itself is unchanged.
+  // ---------------------------------------------------------------
+  logic [15:0] perf_idx;
+  logic [7:0]  perf_op;
+  logic [63:0] perf_start_cyc;
+  logic [63:0] mac_active_total [0:2];
+  logic [63:0] mem_cmd_beats;
+  logic [63:0] mem_rd_bytes;
+  logic [63:0] mem_wr_bytes;
+  logic [63:0] mem_rd_beats;
+  logic [63:0] mem_wr_beats;
+  logic [63:0] mem_cmd_stalls;
+  logic [63:0] busy_cycles;
+  logic [63:0] perf_desc_count;
+
   task automatic load_segment(
     input logic [1:0]  seg,
     input int          bytes,
@@ -379,12 +398,85 @@ module tb_heatvit_e2e;
       tb_fatal("selector token counts mismatch");
     end
 
+    $display("perf_sum cycles=%0d busy=%0d desc=%0d mac_total=%0d/%0d/%0d cmd_beats=%0d rd_bytes=%0d wr_bytes=%0d rd_beats=%0d wr_beats=%0d cmd_stall=%0d",
+             cycle_count, busy_cycles, perf_desc_count,
+             mac_active_total[0], mac_active_total[1], mac_active_total[2],
+             mem_cmd_beats, mem_rd_bytes, mem_wr_bytes,
+             mem_rd_beats, mem_wr_beats, mem_cmd_stalls);
     $display("TEST_PASS tb_heatvit_e2e");
     $display("e2e_cycles=%0d", cycle_count);
     $finish;
   end
 
   always @(posedge clk) cycle_count <= cycle_count + 64'd1;
+
+  // ---------------------------------------------------------------
+  // P8-1 monitor logic.
+  // ---------------------------------------------------------------
+  initial begin
+    perf_idx        = 16'd0;
+    perf_op         = 8'd0;
+    perf_start_cyc  = 64'd0;
+    for (int p = 0; p < 3; p++) mac_active_total[p] = 64'd0;
+    mem_cmd_beats   = 64'd0;
+    mem_rd_bytes    = 64'd0;
+    mem_wr_bytes    = 64'd0;
+    mem_rd_beats    = 64'd0;
+    mem_wr_beats    = 64'd0;
+    mem_cmd_stalls  = 64'd0;
+    busy_cycles     = 64'd0;
+    perf_desc_count = 64'd0;
+  end
+
+  // Descriptor accept: latch index/opcode/start cycle.  The scheduler
+  // presents the index together with exec_desc_valid, so this capture
+  // is unambiguous even though the done-time print happens later.
+  always @(posedge clk) begin
+    if (rst_n && dut.u_scheduler.exec_desc_valid &&
+        dut.u_scheduler.exec_desc_ready) begin
+      perf_idx       = dut.u_scheduler.current_desc_index;
+      perf_op        = dut.u_scheduler.exec_desc.opcode;
+      perf_start_cyc = cycle_count;
+    end
+  end
+
+  // Descriptor done: print the profile line and, for GEMM descriptors,
+  // accumulate the per-bank MAC-active counters while they still hold
+  // this descriptor's totals (they reset at the next GEMM start).
+  always @(posedge clk) begin
+    if (rst_n && dut.u_executor.done) begin
+      $display("perf_desc idx=%0d op=%0d start=%0d end=%0d dur=%0d mac=%0d/%0d/%0d",
+               perf_idx, perf_op, perf_start_cyc, cycle_count,
+               cycle_count - perf_start_cyc,
+               dut.u_executor.gemm_mac_active[0],
+               dut.u_executor.gemm_mac_active[1],
+               dut.u_executor.gemm_mac_active[2]);
+      if (perf_op == OP_GEMM) begin
+        for (int p = 0; p < 3; p++)
+          mac_active_total[p] = mac_active_total[p] +
+                                {32'd0, dut.u_executor.gemm_mac_active[p]};
+      end
+      perf_desc_count = perf_desc_count + 64'd1;
+    end
+  end
+
+  // External memory traffic + busy duty at the top-level interface.
+  always @(posedge clk) begin
+    if (rst_n) begin
+      if (mem_cmd_valid && mem_cmd_ready) begin
+        mem_cmd_beats = mem_cmd_beats + 64'd1;
+        if (mem_cmd_write) mem_wr_bytes = mem_wr_bytes + {48'd0, mem_cmd_len};
+        else               mem_rd_bytes = mem_rd_bytes + {48'd0, mem_cmd_len};
+      end
+      if (mem_cmd_valid && !mem_cmd_ready)
+        mem_cmd_stalls = mem_cmd_stalls + 64'd1;
+      if (mem_r_valid && mem_r_ready)
+        mem_rd_beats = mem_rd_beats + 64'd1;
+      if (mem_w_valid && mem_w_ready)
+        mem_wr_beats = mem_wr_beats + 64'd1;
+      if (busy) busy_cycles = busy_cycles + 64'd1;
+    end
+  end
 
 
   always_ff @(posedge clk) begin

@@ -65,7 +65,7 @@ SystemVerilog；描述符调度；逐位仿真验证
   as-built 实施记录（含接口裁定、踩坑与验收证据），以及 P2 真实权重
   精度验证（§13）、P3 量化感知训练 QAT / P4 剪枝微调、P5 权重导出
   逐位回归与全量 50k 精度复核（§14，P5 见 §14.14，50k 见 §14.15）、
-  P6 Vivado 综合与资源统计（§15）
+  P6 Vivado 综合与资源统计（§15）、P8 RTL 性能剖析（§16）
 - **第三部分 仿真与验证指南**：环境准备、向量生成、回归套件、日志与
   失败定位、预计时长
 - **第四部分 内存与权重格式**：四区域映射、逐张量布局、尺度表、`.mem`
@@ -5426,6 +5426,148 @@ tb_ffn、tb_mhsa、tb_transformer_block（block13 回压）、tb_heatvit_errors
 （OOC 门 +0.659 ns）→ residual 两级窄化 → executor start CE → LN 方差三阶段 +
 srow 一热写使能 → score_q16 收窄 + LN 3c 槽位拆 + executor 三相位。全程逐位等价
 口径不变（tb_requant_diag 33.5M 样本 0 误差；全量回归全绿，见文末机器可读结果）。
+
+## 16. 阶段 9：RTL 性能剖析（P8，2026-09-01）
+
+P8 回答一个问题：**设计跑起来之后的真实性能画像是什么**——吞吐（FPS）、
+计算利用率（MAC）、访存带宽与占用率、以及它们在各阶段的分布。口径上严格
+区分三类「MAC 数」：ROM 静态几何（编译期）、动态维度解析（运行期 token
+数）、RTL 计数器实测（尾块掩码后真实有效 MAC）。工具链在 `tools/p8/`。
+
+### 16.1 口径定义与工具
+
+| 指标 | 定义 | 来源 |
+| --- | --- | --- |
+| 周期数 | e2e 无回压 / 伪随机回压两轮实测 | `p7_5_e2e_summary.json` |
+| FPS | 100 MHz ÷ 周期数 | 同上换算 |
+| 理论 MAC（未剪枝） | Σ m·n·k，动态 M/N/K 按「全程 197 token」解析 | 描述符 ROM + `tools/p8/_perf_common.eff_mnk` |
+| 理论 MAC（本向量） | 同上，动态维度按 e2e 实测 token 数 197/100/55/28 解析 | 同上 |
+| 有效 MAC（实测） | Σ mac_active_cycles × 64（3 bank × 8×8，尾块掩码后） | e2e TB 监视器采样 `u_executor.gemm_mac_active` |
+| MAC 利用率 | 有效 MAC ÷ (总周期 × 192 峰值) | 实测 |
+| 带宽 | 顶层外存接口命令字节数 ÷ 周期数 × 100 MHz | e2e TB 监视器统计 |
+
+动态维度解析与 RTL `S_CHECK` 逐条一致：`DYN_M` 按 `param0[1:0]` 取
+`tokens`（模式 0）或 `tokens−1`（模式 1），`DYN_N`/`DYN_K` 直接取当前
+token 数（`heatvit_tensor_executor.sv` §S_CHECK）。
+
+**工具**：
+
+```powershell
+# P8-0 一页汇总（无需仿真；解析 ROM + e2e JSON + P7-5 util/timing 报告）
+.\.venv\Scripts\python tools\p8\perf_summary.py     # -> build/reports/perf_summary.{json,txt}
+
+# P8-1 剖析（先跑一轮带监视器的 e2e，再解析日志）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_xsim.ps1 -Top tb_heatvit_e2e -PlusArgs '+VECTOR_DIR=build/vectors/e2e +STALL_MASK=0'
+.\.venv\Scripts\python tools\p8\perf_parse_log.py    # -> build/reports/perf_profile.{json,txt}
+```
+
+监视器为 TB-only 非综合逻辑（`tb_heatvit_e2e.sv` P8-1 段）：在
+`scheduler.exec_desc_valid && exec_desc_ready` 拍锁存描述符起拍，在
+`executor.done` 拍打印 `perf_desc idx/op/start/end/dur/mac`，GEMM 描述符
+同时累加三 bank 的 `mac_active_cycles`（计数器在下一 GEMM 命令开始时才
+清零，done 拍采样即本描述符总量）；顶层外存接口统计命令 beat、读/写字节、
+stall 拍与 busy 占空比。RTL 零改动。
+
+### 16.2 一页汇总（P8-0，2026-09-01）
+
+| 指标 | 值 |
+| --- | --- |
+| 端到端周期（无回压 / 回压） | 213,760,350 / 237,834,977 |
+| 吞吐 @100 MHz | **0.468 FPS**（2.14 s/图）/ 0.420 FPS（2.38 s/图） |
+| 峰值算力 | 192 MAC/拍 = **19.2 GMAC/s**（3 bank × 8×8 int8） |
+| 理论 MAC · 未剪枝（全程 197 token） | **1.26 G** |
+| 理论 MAC · 本向量（197/100/55/28） | **0.60 G**（剪枝省 52.6%） |
+| 有效 MAC · RTL 实测 | **0.619 G**（= 理论 +3.4% 尾块掩码损耗，§16.3） |
+| 资源（route 后，P7-5） | LUT 85,959（42.18%）、FF 48,617、DSP 65、BRAM 35 |
+| 时序 | WNS +0.234 ns / TNS 0（MET） |
+| 功耗（参考） | 0.543 W total / 0.381 W dynamic（vectorless，P7-4 设计，低置信） |
+
+> 一页汇总命令输出见 `build/reports/perf_summary.txt`；机器可读
+> `perf_summary.json`。理论 MAC 的「未剪枝」口径用全程 197 token 解析动态
+> 维度，代表不剪枝的等权计算量；「本向量」按 e2e 实测保留数解析。
+
+### 16.3 微架构剖析（P8-1，2026-09-01）
+
+带监视器的 e2e 无回压轮实测（`+STALL_MASK=0`，213,760,350 周期，
+TEST_PASS）：197 条执行描述符逐条记录了起止周期与 MAC 活动计数。
+GEMM 描述符占总周期 **96.8%**——整机时间几乎全部在 GEMM 引擎内。
+
+**总体指标：**
+
+| 指标 | 值 | 说明 |
+| --- | --- | --- |
+| MAC 利用率（全片） | **1.51%** | 0.619 G ÷ (213.8M × 192)；与理论几何差 +3.4% 为尾块掩码损耗 |
+| MAC 利用率（GEMM 内部） | **1.55%** | GEMM 描述符周期里只有 1.55% 拍在累加 |
+| 有效带宽 | 14.21 MB/s | 读 28.64 MB + 写 1.74 MB = 30.38 MB/图，0.134 B/拍 |
+| 命令 stall | 0 | 无回压轮，外存接口零等待（最理想情形） |
+| busy 占空比 | 100% | 全周期忙，无流水空泡（单图串行执行） |
+
+**逐阶段周期分布**（同 token 数的三个 Block 完全同周期）：
+
+| 阶段 | 周期数 | 占比 | GEMM 占比 |
+| --- | ---: | ---: | ---: |
+| patch（3 描述符） | 9,573,053 | 4.48% | 98.6% |
+| block_01–03（197 token，各 36,193,721） | 108,581,163 | 50.80% | 96.8% |
+| selector_01 | 1,605,655 | 0.75% | 87.8% |
+| block_04–06（100 token，各 17,096,310） | 51,288,930 | 24.00% | 97.4% |
+| selector_02 | 832,526 | 0.39% | 87.0% |
+| block_07–09（55 token，各 8,842,243） | 26,526,729 | 12.41% | 97.7% |
+| selector_03 | 460,448 | 0.22% | 85.1% |
+| block_10–12（28 token，各 4,809,996） | 14,429,988 | 6.75% | 98.1% |
+| final_ln | 22,686 | 0.01% | — |
+| logits 头 | 434,374 | 0.20% | 100% |
+
+**GEMM 类耗时分解**（全部 69 条 GEMM 描述符合计 207.5M 周期）：
+
+| GEMM 类 | 周期 | 占 GEMM | 活跃 MAC 拍 | 类内利用率 |
+| --- | ---: | ---: | ---: | ---: |
+| FFN 下投影（768→192） | 64,847,605 | 31.26% | 3,170,304 | 4.89% |
+| FFN 上投影（192→768） | 58,194,156 | 28.05% | 2,709,504 | 4.66% |
+| QKV（192→576） | 42,826,716 | 20.64% | 2,032,128 | 4.75% |
+| 输出投影（576→192） | 14,275,644 | 6.88% | 677,376 | 4.74% |
+| Attention×V | 13,766,436 | 6.64% | 494,784 | 3.59% |
+| Attention 分数 | 10,977,462 | 5.29% | 494,784 | 4.51% |
+| Selector GEMM | 2,144,976 | 1.03% | 69,930 | 3.26% |
+| 分类头 | 434,374 | 0.21% | 24,192 | 5.57% |
+
+单 Block（197 token，36.19M 周期）的组成：QKV 7.30M → 注意力分数
+2.68M → softmax 0.65M → Attention×V 3.23M → 投影 2.43M → FFN 上
+9.93M → FFN 下 9.45M；LN/residual/unpack/concat 合计约 0.5M（1.4%）。
+**GEMM 引擎每 tile 步实测约 12k 周期，而纯计算只需约 1k 拍**——引擎
+~95% 时间花在 tile 装载、ping-pong 与 burst 协议上，而非累加。
+
+**剪枝的周期收益（换算）**：若 12 个 Block 全部以 197 token 执行，仅
+Block 部分即需 12 × 36.19M = 434.3M 周期（全图约 442M）；实测
+213.8M → **剪枝省 51.6% 周期**，与理论 MAC 节省 52.6% 一致——剪枝
+收益几乎 1:1 转化为周期收益。
+
+### 16.4 结论与后续方向
+
+**结论**：性能画像与架构预期完全一致——描述符驱动单执行器把面积压到
+LUT 42.18%（时序收敛 100 MHz），代价是**吞吐受限**：0.468 FPS、
+全片 MAC 利用率 1.51%、GEMM 内部仅 1.55% 拍在计算。瓶颈不在外存
+带宽（14.21 MB/s、零 stall），而在 GEMM 引擎的 tile 级访存/控制
+开销与「一次一个描述符」的串行执行。
+
+**后续方向（P9 候选，按证据强度排序）**：
+
+1. **GEMM tile 循环效率**：每 tile 步 12k 周期 vs 理论 ~1k，第一优先
+   深挖 S_LOAD/burst 结构（更长的 burst、tile 预取、A/B 双缓冲深度），
+   这是纯 RTL 内优化，不增面积目标、不依赖板级。
+2. **描述符流水/多引擎**：单执行器串行是 1.5% 利用率的直接原因；
+   双 executor 或 GEMM 与 vector/layout 引擎并行可显著提升，但面积
+   会明显上升——与「硬件高效」目标需要权衡论证。
+3. **fmax 扫频（P8-2）**：当前 100 MHz 为唯一签核点，约束扫频
+   125/150/200 MHz 可画出频率-吞吐曲线；P7③ MAC DSP 化仅在需要时启用。
+4. **SAIF 功耗（P8-3）**：现有功耗参考为 vectorless 低置信；用带监视
+   器的 e2e 导出 SAIF 可得到真实能效（J/图、GMAC/s/W）。
+5. **上板（P8-4）**：板级引脚约束 + MIG DDR3 后，真实 DDR 延迟会让
+   GEMM 更慢（回压轮 +11.3% 已给出量级），实测 FPS/功耗与逐位复验。
+
+机器可读结果：`build/reports/perf_profile.json`（逐阶段 + 指标）与
+`perf_summary.json`（口径汇总）；文本页 `perf_profile.txt` /
+`perf_summary.txt`。监视器为 TB-only，RTL 零改动；e2e 仿真本轮
+45.9 分钟 CPU（与原预计 35–40 分钟一致）。
 
 
 # 第三部分：仿真与验证指南
