@@ -5823,6 +5823,54 @@ graph TD
   heatvit_div_arbiter --> heatvit_udiv
 ```
 
+#### ASCII 文本层次图（含简注）
+
+```text
+heatvit                              # Vivado 工程顶层封装；纯端口转发
+└── heatvit_top                      # 系统协议顶层：start/busy/done、错误/警告与中止控制
+    ├── heatvit_scheduler             # 逐条调度固定操作描述符，维护 Token/Package 状态
+    │   └── heatvit_descriptor_rom    # 预生成的固定描述符只读存储器
+    │
+    └── heatvit_tensor_executor       # 解析 opcode 并向对应计算子引擎分发操作
+        ├── heatvit_mem_master        # Executor 的外部存储 burst 访问主机
+        ├── heatvit_addr_guard ×4     # 源/辅助/目标地址的区域越界预检查
+        │
+        ├── heatvit_gemm_engine       # 统一矩阵乘：Patch、QKV、Attention、FFN、分类头
+        │   ├── heatvit_mem_master    # GEMM 专用外存访问主机
+        │   ├── heatvit_addr_guard ×4 # GEMM 输入、权重、Bias、输出的地址检查
+        │   ├── heatvit_tile_buffer   # 矩阵分块缓存
+        │   │   └── heatvit_sdp_ram   # 可综合简单双端口 RAM
+        │   ├── heatvit_mac_bank ×8   # 8×8 int8 乘加累积阵列
+        │   ├── heatvit_gelu          # FFN 使用的定点 ShiftGELU 激活
+        │   ├── heatvit_plan_sigmoid  # 分段线性定点 Sigmoid 后处理
+        │   └── heatvit_sdp_ram       # GEMM 写回暂存 RAM
+        │
+        ├── heatvit_layout_engine     # 转置、重排等 Tensor 布局变换
+        │   └── heatvit_residual      # 残差加法与定点重定标
+        │
+        ├── heatvit_vector_engine     # LayerNorm、Softmax、Residual 等向量算子
+        │   ├── heatvit_layernorm     # 两遍定点 LayerNorm
+        │   │   └── heatvit_isqrt     # LayerNorm 标准差所需的整数平方根
+        │   ├── heatvit_softmax_attention # Attention 矩阵行 Softmax
+        │   │   └── heatvit_softmax_core  # Softmax 的指数与归一化核心
+        │   ├── heatvit_residual      # 向量路径中的残差加法
+        │   └── heatvit_sdp_ram ×5    # 向量运算中间结果缓存
+        │
+        ├── heatvit_reduce_mean       # Selector 的 Token/Head 特征均值规约
+        ├── heatvit_feature_concat    # 拼接局部和全局 Selector 特征
+        ├── heatvit_head_fuse         # 融合三个 Attention Head 的 Token 分数
+        ├── heatvit_selector_softmax  # 计算 Keep/Prune 二分类概率
+        │   └── heatvit_softmax_selector # Selector 专用短行 Softmax
+        │       └── heatvit_softmax_core  # 共享 Softmax 基础核心
+        ├── heatvit_selector_finalize # 剪枝决策、压缩与 Package Token 编排
+        │   ├── heatvit_token_compactor # 稳定压缩保留 Token
+        │   ├── heatvit_token_packager  # 将剪除 Token 加权合成为 Package Token
+        │   └── heatvit_sdp_ram         # Selector 分数与中间 Token 缓存
+        │
+        └── heatvit_div_arbiter       # 共享除法资源的请求仲裁
+            └── heatvit_udiv          # 可综合无符号整数除法器
+```
+
 要点：
 
 - **两级控制**：`heatvit_top` 只做协议（启动/错误/中止/状态锁存），计算全部下沉到
@@ -7541,7 +7589,6 @@ packager 发 `div_start`，把 Package 行写到输出 slot `kept+1`，最终状
 
 本部分所有「L 行号」引用以当前提交（2026-08-22）为准；修改代码时请同步
 更新对应小节。若代码与本文冲突，以代码为准（见本部分开头定位说明）。
-
 
 
 
