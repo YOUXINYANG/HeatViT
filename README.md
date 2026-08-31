@@ -66,7 +66,7 @@ flowchart TD
 | P6 | Vivado 综合与资源统计（100 MHz） | ✅ | 可综合性通过；LUT 4.4× 超标 |
 | P7 | 资源优化（P7-1/P7-2）→ 50 MHz（P7-4）→ **100 MHz 收敛（P7-5）** | ✅ | LUT 62.05% → **42.18%**；WNS +0.234 ns@100 MHz |
 
-## 验证结果（实测摘要）
+## 验证结果
 
 | 项目 | 结果 |
 | --- | --- |
@@ -80,7 +80,7 @@ flowchart TD
 
 机器可读结果见 `build/reports/e2e_summary.json` 与 `build/reports/regression_summary.txt`（生成产物，不入库）。
 
-## 精度结果（位精确；5k 探索 + 50k 终局复核）
+## 精度结果
 
 | 版本 | 口径 | 剪枝 | Top-1 | Token 计数（目标 88/45/32） |
 | --- | --- | :-: | ---: | --- |
@@ -100,7 +100,7 @@ flowchart TD
 - **剪枝主线**：前 5k 上 P4-2A 的剪枝代价为 −3.32pp（76.02% → 72.70%）；全量 50k 实测为 **−6.95pp**（67.48% → 60.53%）。全量 Token 均值 102.2/50.6/42.4，分别高于目标 14.2/5.6/10.4，说明前 5k 同时高估精度并低估保留率。
 - 论文 HeatViT-T 为浮点 **71.9%**（全量 val，端到端训练）；当前已部署全量剪枝结果低 11.37pp。下一轮精度工作应以全量 QAT 长训练为主，并始终用 50k 位精确评估验收（docs §14.15）。
 
-## 资源占用（xc7k325tfbg900-3）
+## 资源占用（基于 Xilinx FPGA xc7k325tfbg900-3）
 
 | 资源 | P6 | P7-1 | P7-2 | P7-4（路由后） | **P7-5（路由后）** | 可用 | P7-5 占用率 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -112,21 +112,6 @@ flowchart TD
 
 > P6–P7-2 为综合级数字；P7-4/P7-5 为 place+route 后数字（DSP 65 系 P7-4
 > LN/softmax 流水化后综合减少；P7-5 的窄化重写再省 ~27% LUT）。
-
-**演进**：P6 首综合 LUT 超容量 4.4 倍（超标集中在动态字节寻址寄存器数组被
-综合成的 mux 网络）→ **P7-1**（vector/layout 两引擎 bbuf → 11 个字节写使能
-SDP RAM + 流入式解包，397K/311K → 20K/4K）→ **P7-2**（selector 侧七模块
-同类推广，OOC 124,626 → 15,408 LUT）→ **P7-4**（实现与 50 MHz 时序收敛：
-LN/softmax 流水化 + GEMM 写回 staging RAM 写端口寄存器化后 place+route
-0 未布线；100 MHz 实测 place 后 WNS −7.2 ns、route 拥塞，按计划回退，
-50 MHz signoff **WNS +0.323 ns / TNS 0 / WHS +0.073 ns**，setup+hold
-双达标）→ **P7-5**（100 MHz 收敛：GEMM 引擎重定标四位宽证明收窄 + 守卫
-四相流水 + S_CHECK 决策寄存，OOC 门 WNS −4.185 → +0.659 ns；全片五轮清零
-residual/LN/executor/score_q16/srow 等违例家族，**100 MHz signoff
-WNS +0.234 ns / TNS 0 / WHS +0.018 ns**，`All user specified timing
-constraints are met.`）。全程位精确口径不变：每步改动后全量逐位回归
-（含 e2e 两轮 + 错误矩阵）全绿；全量多核综合（-Jobs 24）0 黑盒、0 锁存器。
-P7③ MAC DSP 化仍为可选裕量优化（docs §15）。
 
 ## 仓库结构
 
@@ -229,12 +214,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_vivado_impl.ps1 
 ```
 
 > 只有显式加 `-RegenerateVectors` 才会重新生成端到端向量，防止失败重跑时误换期望值。全套回归预计时长：端到端两轮各约 35–40 分钟，其余套件分钟级到二十余分钟；成功输出 `TEST_PASS <Top>`。QAT 训练/评估/导出命令见 docs 第二部分 §14 与第三部分 §9。
-
-## 范围与非目标
-
-- ✅ **已覆盖**：XSim 逐位仿真验证；真实权重 PTQ / QAT / 剪枝精度评估；P4-2A 已部署权重全量 50k 位精确复核（未剪枝 67.48%，剪枝 60.53%）；QAT 权重导出与硬件逐位回归（P5）；Vivado 综合与资源统计（P6）；P7-1 / P7-2 资源优化（bbuf→SDP RAM 全量推广，LUT 450.5% → 62.05%）；P7-4 实现与 50 MHz 时序收敛（place+route 0 未布线，WNS +0.323 ns）；P7-5 GEMM 引擎与全片 100 MHz 时序收敛（WNS +0.234 / TNS 0 / WHS +0.018，LUT 42.18%）
-- ⏳ **待办**：全量 QAT 长训练与 50k 复评；板级引脚约束与上板验证（板级 DDR/MIG/PCIe/AXI 集成与主机软件）；P7③ MAC DSP 化为按需裕量优化
-- ❌ **排除**：功耗、FPS 与上板验证；板级 DDR/MIG/PCIe/AXI 集成与主机软件；HeatViT-S / HeatViT-B / LV-ViT 变体；JPEG/PNG 解码、图像缩放与浮点预处理
 
 ## 文档
 
