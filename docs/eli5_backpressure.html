@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>HeatViT：什么是回压？</title>
+<style>
+  body { margin: 0; background: #f4f7fb; color: #172033; font: 20px/1.65 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 40px auto; padding: 0 24px 48px; }
+  .card { background: white; border-radius: 20px; padding: 28px; margin-top: 22px; box-shadow: 0 8px 24px #15243a12; }
+  .flow { display: flex; align-items: center; gap: 14px; font-size: 42px; justify-content: center; margin: 22px 0; }
+  .wait { color: #bd4a2d; font-weight: 700; text-align: center; font-size: 28px; }
+  .go { color: #238447; font-weight: 700; text-align: center; font-size: 28px; }
+  strong { color: #1f5fbf; }
+</style>
+<main>
+  <h1>“回压”就是：先等等</h1>
+  <div class="card">
+    <p>把 HeatViT 想成一个<strong>做题的小机器人</strong>。它算题时，经常要从“仓库”（外部存储）拿材料，也要把结果放回仓库。</p>
+    <div class="flow"><span>🤖</span><span>→</span><span>📦</span></div>
+    <p>🤖 是计算电路，📦 是存储器。</p>
+  </div>
+  <div class="card">
+    <h2>仓库忙的时候</h2>
+    <p>仓库有时正在整理东西，不能马上收货或发货。它就举牌说：“<strong>现在忙，请等一下。</strong>”</p>
+    <p class="wait">⏸️ 机器人暂停，不换下一份材料</p>
+    <p>这个“让前面的人先等一等”的动作，就叫<strong>回压</strong>。</p>
+  </div>
+  <div class="card">
+    <h2>不暂停会怎样？</h2>
+    <p>机器人若继续跑，材料可能被弄丢、拿错，或同一份结果写两次。所以它必须把手里的东西拿稳，等仓库说“可以了”。</p>
+    <p class="go">✅ 仓库准备好 → 继续传一份数据</p>
+  </div>
+  <div class="card">
+    <h2>项目为什么要测试它？</h2>
+    <p>真实硬件的存储器并不总是很快。项目故意让仓库随机“忙一下”，检查 HeatViT 是否仍能算出完全相同的答案。</p>
+    <p><strong>无回压</strong>＝仓库永远不忙，最快。<br><strong>有回压</strong>＝仓库偶尔忙，要多等几拍，较慢但答案不能变。</p>
+  </div>
+</main>
+</html>
