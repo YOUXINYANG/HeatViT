@@ -464,7 +464,10 @@ def token_selector(tokens: torch.Tensor, package_present: bool,
         stats, p.hw_w1, p.hw_b1, s.activation_exp(f"s{idx}_stats_out"),
         s.weight_exp(f"s{idx}_hw_w1"),
         s.activation_exp(f"s{idx}_hw_hidden_out"))
-    hw_acc = hw_hidden.to(torch.float64) @ p.hw_w2.to(torch.float64).T \
+    # NOTE: the selector payload stores hw_w2 already transposed
+    # (p2_train_selector saves Linear.weight.t()); the RTL, the golden model
+    # and QatSelector all consume it directly.  Do NOT transpose here again.
+    hw_acc = hw_hidden.to(torch.float64) @ p.hw_w2.to(torch.float64) \
         + p.hw_b2.to(torch.float64)
     hw_q16 = requant(hw_acc.round().to(torch.int64),
                      s.activation_exp(f"s{idx}_hw_hidden_out")
