@@ -319,7 +319,7 @@ def train(args):
                 best_acc = acc_s
                 save(out_dir / "best.pt", epoch + 1,
                      epoch * steps_per_epoch + steps_per_epoch, acc_s)
-        elif acc > best_acc:
+        elif args.spot_every == 0 and acc > best_acc:
             best_acc = acc
             save(out_dir / "best.pt", epoch + 1,
                  epoch * steps_per_epoch + steps_per_epoch, acc)
