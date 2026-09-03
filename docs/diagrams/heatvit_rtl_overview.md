@@ -1,0 +1,32 @@
+# HeatViT RTL Overview
+
+```mermaid
+%% HeatViT RTL overview: compact basic hardware implementation framework.
+flowchart TB
+  HOST["Host / External Memory<br/>Image · Weights · Logits"]
+
+  subgraph RTL["HeatViT RTL Inference Engine"]
+    direction TB
+    TOP["heatvit_top<br/>Control / Status"]
+
+    subgraph CORE["Descriptor-driven Execution"]
+      direction LR
+      ROM["Descriptor ROM"] <--> SCH["Scheduler"] --> EXEC["Tensor Executor"]
+      EXEC <--> BUF["Scratch / Tile Buffer"]
+      EXEC <--> MEM["Memory Master"]
+    end
+
+    subgraph MODEL["HeatViT Model Dataflow"]
+      direction LR
+      IN["INT8 Image"] --> PATCH["Patch + CLS + Position"]
+      PATCH --> ENC["12× Transformer Encoder<br/>3× Dynamic Token Selector"]
+      ENC --> LN["Final LayerNorm"] --> HEAD["Classifier"] --> OUT["INT32 Logits"]
+    end
+
+    TOP --> SCH
+    EXEC -. "Run operators" .-> ENC
+  end
+
+  HOST <--> TOP
+  HOST <--> MEM
+```
